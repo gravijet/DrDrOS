@@ -45,8 +45,17 @@ BR2_TARGET_ROOTFS_CPIO_GZIP=y
 BR2_TARGET_GENERIC_HOSTNAME="drdros"
 BR2_TARGET_GENERIC_ISSUE="Welcome to DrDrOS"
 
-# ─── Notes on what's intentionally *not* here ───────────────────────────
-# BusyBox (BR2_PACKAGE_BUSYBOX) and BusyBox init (BR2_INIT_BUSYBOX) are
-# Buildroot defaults → enabled automatically. We keep them for the first
-# boot test, then replace with drdr-init / DrDrShell / DrDrEdit in the
-# next phases via a BR2_EXTERNAL overlay tree.
+# ─── Init system ────────────────────────────────────────────────────────
+# Disable Buildroot's default BusyBox init; the kernel will run /init
+# from the initramfs, and our BR2_EXTERNAL package installs drdr-init
+# there as the very first userland process (PID 1).
+# BR2_INIT_BUSYBOX is not set
+BR2_INIT_NONE=y
+
+# ─── DrDrOS userland packages (from BR2_EXTERNAL) ───────────────────────
+# `make ... BR2_EXTERNAL=$(pwd)/buildroot/external defconfig` makes
+# these options available; otherwise they're silently ignored.
+BR2_PACKAGE_DRDR_INIT=y
+
+# BusyBox itself stays enabled so we still have /bin/sh + standard
+# coreutils — drdr-init currently exec()'s /bin/sh for Tier 2.
