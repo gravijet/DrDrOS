@@ -5,6 +5,8 @@ target/
 # Buildroot output lives INSIDE the buildroot/upstream/ submodule, which
 # manages its own .gitignore (output/, dl/, etc.). Our .gitmodules sets
 # `ignore = dirty` so those build artefacts never appear in `git status`.
+# scripts/build-buildroot.sh symlinks final images here for qemu.sh:
+buildroot/images/
 
 # ISO build artefacts.
 iso/build/

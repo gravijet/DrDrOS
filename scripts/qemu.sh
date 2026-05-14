@@ -17,7 +17,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGES="$REPO_ROOT/buildroot/upstream/output/images"
+# scripts/build-buildroot.sh symlinks the latest build artefacts here.
+IMAGES="$REPO_ROOT/buildroot/images"
 KERNEL="$IMAGES/bzImage"
 INITRD="$IMAGES/rootfs.cpio.gz"
 
