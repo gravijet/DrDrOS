@@ -1,0 +1,52 @@
+# DrDrOS Buildroot configuration (drdros_defconfig)
+#
+# Kconfig syntax:  BR2_OPTION=y   (enable)   |   BR2_OPTION="value"   (set string)
+#                  # BR2_OPTION is not set    (explicitly disable a default-on option)
+# Anything not listed defaults to "off".
+#
+# To apply this defconfig:
+#     make -C buildroot/upstream BR2_DEFCONFIG=$(pwd)/buildroot/drdros_defconfig defconfig
+# Then to build everything (kernel + rootfs):
+#     make -C buildroot/upstream
+# Output lands in buildroot/upstream/output/images/.
+#
+# To minimise this file after future Kconfig edits:
+#     make -C buildroot/upstream \
+#         BR2_DEFCONFIG=$(pwd)/buildroot/drdros_defconfig savedefconfig
+# (Note: savedefconfig strips comments. This file is hand-maintained for clarity.)
+
+# ─── Target architecture ────────────────────────────────────────────────
+# DrDrOS targets x86_64 PCs from the last 20 years.
+BR2_x86_64=y
+
+# ─── Toolchain ──────────────────────────────────────────────────────────
+# Buildroot will compile its own cross-compiler from source on the first
+# `make` run (~10–20 minutes once, cached afterwards). We pick the musl C
+# library: ~600 KB instead of glibc's ~30 MB, and friendly to static linking.
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+
+# ─── Linux kernel ───────────────────────────────────────────────────────
+# Build the kernel from upstream sources, starting from the standard
+# `arch/x86/configs/x86_64_defconfig`. This includes many drivers we don't
+# need — we'll add a kernel fragment to trim it down in a later step.
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_USE_DEFCONFIG=y
+BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
+
+# ─── Root filesystem ────────────────────────────────────────────────────
+# Ship the rootfs as a gzipped cpio archive (initramfs). The Linux kernel
+# unpacks this straight into RAM at boot — no disk needed, ever. Skip the
+# default-on tarball rootfs since we never use it.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# ─── System identity ────────────────────────────────────────────────────
+BR2_TARGET_GENERIC_HOSTNAME="drdros"
+BR2_TARGET_GENERIC_ISSUE="Welcome to DrDrOS"
+
+# ─── Notes on what's intentionally *not* here ───────────────────────────
+# BusyBox (BR2_PACKAGE_BUSYBOX) and BusyBox init (BR2_INIT_BUSYBOX) are
+# Buildroot defaults → enabled automatically. We keep them for the first
+# boot test, then replace with drdr-init / DrDrShell / DrDrEdit in the
+# next phases via a BR2_EXTERNAL overlay tree.

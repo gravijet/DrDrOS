@@ -2,10 +2,9 @@
 target/
 **/*.rs.bk
 
-# Buildroot output is huge (downloaded sources + cross-compiled trees).
-buildroot/output/
-buildroot/dl/
-buildroot/.config.old
+# Buildroot output lives INSIDE the buildroot/upstream/ submodule, which
+# manages its own .gitignore (output/, dl/, etc.). Our .gitmodules sets
+# `ignore = dirty` so those build artefacts never appear in `git status`.
 
 # ISO build artefacts.
 iso/build/
