@@ -1,0 +1,25 @@
+# drdr-demo — small binary that exercises the full Phase 3 stack:
+# framebuffer + bitmap font + widget framework + evdev input.
+#
+# Not a DrDrOS component proper — this is a "does the GUI work?" probe
+# that runs against /dev/fb0 + /dev/input/eventN on a real (or QEMU)
+# Linux box.
+
+[package]
+name        = "drdr-demo"
+description = "DrDrUI showcase — focusable menu rendered on /dev/fb0 from evdev input."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-demo"
+path = "src/main.rs"
+
+[dependencies]
+drdr-fb   = { path = "../drdr-fb" }
+drdr-font = { path = "../drdr-font" }
+drdr-ui   = { path = "../drdr-ui" }

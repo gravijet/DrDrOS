@@ -1,31 +1,34 @@
-//! drdr-ui — DrDrUI, the DrDrOS GUI framework (Tier 1).
+//! drdr-ui — DrDrUI, the DrDrOS GUI framework (Tier 2).
 //!
 //! A small immediate-mode widget framework that paints directly onto a
 //! [`drdr_fb::Framebuffer`] using [`drdr_font`]'s 8×16 bitmap glyphs.
 //! No X11. No Wayland. No widget tree, no retained scene graph —
 //! widgets are drawn in one pass per frame.
 //!
-//! Tier 1 ships the bare essentials:
+//! Tier 2 (this file) ships:
 //!
 //!   - [`Rect`] — a region of pixels (x, y, w, h).
 //!   - [`Theme`] — the palette every widget reads from.
-//!   - [`Widget`] — a trait every drawable thing implements.
-//!   - [`Label`], [`Button`], [`Frame`] — three primitive widgets.
+//!   - [`Widget`] — a trait every drawable thing implements, with
+//!     [`draw`](Widget::draw) and the new [`handle_event`](Widget::handle_event)
+//!     + [`is_focusable`](Widget::is_focusable) hooks.
+//!   - [`Label`], [`Button`] (with a `clicked` flag flipped by Enter /
+//!     Space when focused), [`Frame`] (titled box).
 //!   - [`VBox`], [`HBox`] — two layout containers.
-//!
-//! There's no input handling yet — Tier 2 wires a Linux evdev reader
-//! that turns key presses into widget events. The pure draw pass shipped
-//! here is enough for boot screens, splash windows, and static panels.
+//!   - [`input`] module with [`KeyReader`], [`Event`], [`KeyCode`],
+//!     [`EventResponse`] — opens `/dev/input/eventN` and decodes raw
+//!     evdev records into framework events.
 //!
 //! Coordinate system: (0, 0) is the top-left pixel; +x goes right, +y
 //! goes down — same as the framebuffer underneath.
 
+pub mod input;
+
 use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
-// Re-export framebuffer primitives so a single `use drdr_ui::*` is
-// enough for an app to draw widgets onto a Framebuffer it built.
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
+pub use input::{Event, EventResponse, KeyCode, KeyReader};
 
 // ─── Geometry ────────────────────────────────────────────────────────
 
@@ -97,9 +100,22 @@ impl Theme {
 ///
 /// `preferred_size` returns the natural size in pixels — used by layout
 /// containers to decide how much space to grant each child.
+///
+/// `handle_event` lets widgets react to input. The default just passes
+/// the event through (`Passthrough`); only widgets that participate in
+/// input override it. `is_focusable` declares whether the widget should
+/// appear in the focus traversal order — Label says no, Button says yes.
 pub trait Widget {
     fn draw(&self, fb: &mut Framebuffer, bounds: Rect, theme: &Theme);
     fn preferred_size(&self) -> (u32, u32);
+
+    fn handle_event(&mut self, _event: &Event) -> EventResponse {
+        EventResponse::Passthrough
+    }
+
+    fn is_focusable(&self) -> bool {
+        false
+    }
 }
 
 // ─── Primitive widgets ───────────────────────────────────────────────
@@ -128,19 +144,30 @@ impl Widget for Label {
 }
 
 /// A bordered button. `focused = true` paints with the theme's accent.
+/// `clicked` flips to true on Enter / Space when focused — the app reads
+/// and clears it on each frame.
 pub struct Button {
     pub text: String,
     pub focused: bool,
+    pub clicked: bool,
 }
 
 impl Button {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), focused: false }
+        Self { text: text.into(), focused: false, clicked: false }
     }
 
     pub fn focused(mut self, on: bool) -> Self {
         self.focused = on;
         self
+    }
+
+    /// One-shot read of the click flag — returns true at most once per
+    /// activation, clearing the flag so subsequent frames don't repeat.
+    pub fn take_click(&mut self) -> bool {
+        let was = self.clicked;
+        self.clicked = false;
+        was
     }
 }
 
@@ -165,6 +192,23 @@ impl Widget for Button {
         let w = GLYPH_WIDTH * self.text.chars().count() as u32 + 12;
         let h = GLYPH_HEIGHT + 8;
         (w, h)
+    }
+
+    fn handle_event(&mut self, event: &Event) -> EventResponse {
+        if !self.focused {
+            return EventResponse::Passthrough;
+        }
+        match event {
+            Event::Key(KeyCode::Enter | KeyCode::Space) => {
+                self.clicked = true;
+                EventResponse::Consumed
+            }
+            _ => EventResponse::Passthrough,
+        }
+    }
+
+    fn is_focusable(&self) -> bool {
+        true
     }
 }
 
