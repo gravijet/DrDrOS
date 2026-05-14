@@ -13,3 +13,7 @@ license.workspace      = true
 [[bin]]
 name = "drdr-edit"
 path = "src/main.rs"
+
+[dependencies]
+# Tier 2: full-screen modal editor uses the shared raw-mode helpers.
+drdr-tty = { path = "../drdr-tty" }

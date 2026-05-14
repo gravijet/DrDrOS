@@ -17,7 +17,6 @@
 
 mod interactive;
 mod list;
-mod tty;
 
 use std::env;
 use std::path::PathBuf;

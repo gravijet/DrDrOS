@@ -19,7 +19,7 @@ use std::fs::{self, FileType, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::tty::{read_key, term_size, Key, RawMode};
+use drdr_tty::{read_key, term_size, Key, RawMode};
 
 /// Single entry in the list view.
 struct Entry {
