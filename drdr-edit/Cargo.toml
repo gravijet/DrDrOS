@@ -1,0 +1,15 @@
+# drdr-edit — DrDrEdit, the DrDrOS in-RAM text editor.
+
+[package]
+name        = "drdr-edit"
+description = "DrDrEdit: keyboard-driven text editor; buffers live entirely in RAM."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-edit"
+path = "src/main.rs"

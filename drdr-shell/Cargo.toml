@@ -1,0 +1,15 @@
+# drdr-shell — DrDrShell, the DrDrOS interactive command shell.
+
+[package]
+name        = "drdr-shell"
+description = "DrDrShell: custom shell with pipes, redirects, history, and autocomplete."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-shell"
+path = "src/main.rs"

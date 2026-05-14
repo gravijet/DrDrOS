@@ -1,0 +1,48 @@
+# DrDrOS — Cargo workspace root.
+#
+# A "workspace" lets many Rust packages (crates) live in one repo and share
+# one build cache, one Cargo.lock, and one set of dependency versions.
+# Every DrDr component below is its own crate; the workspace ties them
+# together so `cargo build` from this directory builds the whole OS userland.
+
+[workspace]
+resolver = "3"
+members = [
+    "drdr-init",
+    "drdr-shell",
+    "drdr-edit",
+    "drdr-files",
+    "drdr-ui",
+    "drdr-net",
+    "drdr-font",
+]
+
+# Shared metadata. Each crate inherits these via `field.workspace = true`,
+# so we never have to repeat version / edition / author / repo in seven files.
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+authors      = ["gravijet"]
+repository   = "https://github.com/gravijet/DrDrOS"
+license      = "MIT OR Apache-2.0"
+
+# Release builds are tuned for the smallest, fastest binaries possible
+# because the entire OS lives in RAM and every byte costs us boot time.
+#   opt-level = "z"      → optimise for size (z = zealous)
+#   lto = true           → link-time optimisation: inline across crates
+#   codegen-units = 1    → one big compilation unit lets LLVM see everything
+#   strip = true         → drop debug symbols from the final binary
+#   panic = "abort"      → on panic, terminate immediately (no stack unwind →
+#                          smaller binary, fine for an OS)
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+# Dev builds: prioritise fast compile times so we iterate quickly.
+[profile.dev]
+opt-level = 0
+debug     = true

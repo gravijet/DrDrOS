@@ -1,0 +1,16 @@
+# drdr-font — DrDrFont, the DrDrOS bitmap font renderer.
+# Library crate consumed by drdr-ui (and anyone else that needs text).
+
+[package]
+name        = "drdr-font"
+description = "DrDrFont: hand-drawn bitmap font + glyph renderer for the framebuffer."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_font"
+path = "src/lib.rs"

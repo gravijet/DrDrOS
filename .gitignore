@@ -1,0 +1,23 @@
+# Cargo / Rust build output — generated, never committed.
+target/
+**/*.rs.bk
+
+# Buildroot output is huge (downloaded sources + cross-compiled trees).
+buildroot/output/
+buildroot/dl/
+buildroot/.config.old
+
+# ISO build artefacts.
+iso/build/
+iso/*.iso
+
+# Editor and IDE noise.
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS noise.
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+# drdr-files — DrDrFiles, the DrDrOS keyboard-driven file manager.
+
+[package]
+name        = "drdr-files"
+description = "DrDrFiles: directory browsing, file operations, keyboard navigation."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-files"
+path = "src/main.rs"
