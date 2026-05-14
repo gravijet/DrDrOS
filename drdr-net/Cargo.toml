@@ -1,0 +1,16 @@
+# drdr-net — DrDrNet, the DrDrOS custom binary network protocol.
+# Library crate exposing client + server primitives for other DrDr apps.
+
+[package]
+name        = "drdr-net"
+description = "DrDrNet: custom binary network protocol (not HTTP) + TCP helpers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_net"
+path = "src/lib.rs"

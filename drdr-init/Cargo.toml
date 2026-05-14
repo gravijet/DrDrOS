@@ -1,0 +1,17 @@
+# drdr-init — DrDrOS custom init system (PID 1).
+# Runs as the FIRST userland process after the Linux kernel finishes booting.
+# Its job is to bring up the framebuffer, draw the splash, and launch DrDrShell.
+
+[package]
+name        = "drdr-init"
+description = "Custom PID 1 that boots DrDrOS instead of a normal Linux login."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-init"
+path = "src/main.rs"

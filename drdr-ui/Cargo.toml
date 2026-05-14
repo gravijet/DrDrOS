@@ -1,0 +1,16 @@
+# drdr-ui — DrDrUI, the DrDrOS GUI framework.
+# Library crate: other crates import it for windows, widgets, focus, drawing.
+
+[package]
+name        = "drdr-ui"
+description = "DrDrUI: framebuffer-based GUI framework (windows, widgets, focus, theme)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_ui"
+path = "src/lib.rs"
