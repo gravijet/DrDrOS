@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | Phase 1 — Foundation |
+| **Status** | Phase 2 — Core Apps (Tier 1 of each shipped) |
 
 ---
 
@@ -81,10 +81,14 @@ everything above it is ours.
 
 ## Roadmap
 
-- [ ] **Phase 1 — Foundation**
-      Cargo workspace · Buildroot config · drdr-init · framebuffer primitives
-- [ ] **Phase 2 — Core applications**
-      DrDrShell · DrDrEdit · DrDrFiles
+- [x] **Phase 1 — Foundation**
+      Cargo workspace · Buildroot 2026.02.1 vendored · drdr-init Tier 2 (mounts +
+      framebuffer splash) · drdr-ui::fb primitives · drdr-font 8×16 bitmaps ·
+      BR2_EXTERNAL package recipe · `scripts/qemu.sh` runner
+      *(first QEMU boot pending — local fs mount blocks Buildroot exec bits)*
+- [~] **Phase 2 — Core applications**
+      DrDrShell Tier 1 · DrDrEdit Tier 1 · DrDrFiles Tier 1 (all host-runnable).
+      Tier 2 next: pipes/redirects/history · raw-mode TTY navigation
 - [ ] **Phase 3 — GUI framework**
       DrDrUI · DrDrFont · DrDrTheme (dark, minimal)
 - [ ] **Phase 4 — Network & protocols**
@@ -94,27 +98,38 @@ everything above it is ours.
 
 ---
 
-## Building (preview)
-
-> Real instructions land at the end of Phase 1. For now, just sanity-check
-> that the workspace compiles:
+## Building
 
 ```sh
+# Compile every crate in the workspace.
 cargo build --workspace
+
+# Cross-compile drdr-init for the rootfs (needed once you wire it into Buildroot).
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl -p drdr-init
+
+# Build the Linux kernel + initramfs via the vendored Buildroot.
+make -C buildroot/upstream \
+     BR2_DEFCONFIG=$(pwd)/buildroot/drdros_defconfig \
+     BR2_EXTERNAL=$(pwd)/buildroot/external \
+     defconfig
+make -C buildroot/upstream
+
+# Boot the resulting bzImage + rootfs.cpio.gz in QEMU.
+scripts/qemu.sh             # GTK window + serial mirrored to stdio
+scripts/qemu.sh --headless  # serial-only
+scripts/qemu.sh --kvm       # add KVM acceleration if /dev/kvm exists
 ```
 
-Later phases will add:
+## Running the core apps on the host
+
+DrDrShell / DrDrEdit / DrDrFiles are happy on a regular Linux box —
+useful for trying them out before the QEMU pipeline is fully wired.
 
 ```sh
-# Build the kernel + rootfs (Phase 1)
-make -C buildroot drdros_defconfig
-make -C buildroot
-
-# Package the bootable ISO (Phase 5)
-./iso/build.sh
-
-# Test in QEMU (any phase)
-qemu-system-x86_64 -accel kvm -m 512M -cdrom drdros.iso
+cargo run -q -p drdr-shell                     # interactive REPL
+cargo run -q -p drdr-files -- -a /tmp          # list /tmp incl. dotfiles
+cargo run -q -p drdr-edit  -- notes.txt        # ed-style line editor
 ```
 
 ---
@@ -125,4 +140,8 @@ Dual-licensed under **MIT OR Apache-2.0** — pick whichever fits your project.
 
 ---
 
-*Built by [@gravijet](https://github.com/gravijet).*
+*Built by [@gravijet](https://github.com/gravijet) and Claude.*
+<span style="background:#000;color:#000;cursor:pointer;" 
+  onclick="this.style.color='#fff'">
+  Claude did basically everything.
+</span>
