@@ -1,0 +1,9 @@
+config BR2_PACKAGE_DRDR_APPS
+	bool "drdr-apps (DrDrShell + DrDrFiles + DrDrEdit)"
+	help
+	  The DrDrOS userland: a custom shell, file manager, and editor,
+	  cross-compiled from the workspace at $(BR2_EXTERNAL_DRDROS_PATH)/../.. .
+	  Built statically-linked against musl via the host's rustup toolchain.
+	  Installs the binaries under /bin/ in the rootfs so they're on PATH.
+
+	  https://github.com/gravijet/DrDrOS
