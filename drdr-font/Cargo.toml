@@ -14,3 +14,8 @@ license.workspace      = true
 [lib]
 name = "drdr_font"
 path = "src/lib.rs"
+
+[dependencies]
+# We borrow Framebuffer + Pixel from drdr-ui so the glyph renderer can
+# paint directly onto the same surface the rest of the UI uses.
+drdr-ui = { path = "../drdr-ui" }

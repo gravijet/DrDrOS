@@ -31,6 +31,9 @@ version = "0.1.0"
 [[package]]
 name = "drdr-font"
 version = "0.1.0"
+dependencies = [
+ "drdr-ui",
+]
 
 [[package]]
 name = "drdr-init"
@@ -50,6 +53,9 @@ version = "0.1.0"
 [[package]]
 name = "drdr-ui"
 version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "libc"
