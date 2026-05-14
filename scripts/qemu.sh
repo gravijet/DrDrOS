@@ -36,6 +36,7 @@ DISPLAY_ARGS=(-display gtk -vga std)
 SERIAL_ARGS=(-serial stdio)
 APPEND="console=tty0 console=ttyS0 loglevel=4"
 ACCEL=()
+ISO_PATH=""
 
 # Parse flags.
 for arg in "$@"; do
@@ -52,12 +53,32 @@ for arg in "$@"; do
                 echo "warning: /dev/kvm not present, skipping --kvm" >&2
             fi
             ;;
+        --iso)
+            ISO_PATH="$REPO_ROOT/iso/drdros.iso"
+            ;;
         *)
-            echo "usage: $0 [--headless] [--kvm]" >&2
+            echo "usage: $0 [--headless] [--kvm] [--iso]" >&2
             exit 2
             ;;
     esac
 done
+
+# --iso boots from the GRUB ISO instead of -kernel/-initrd, so we
+# exercise the full boot chain like real hardware does.
+if [[ -n $ISO_PATH ]]; then
+    if [[ ! -f $ISO_PATH ]]; then
+        echo "error: $ISO_PATH not found — run iso/build.sh first" >&2
+        exit 1
+    fi
+    echo "[qemu.sh] booting from ISO $ISO_PATH"
+    exec qemu-system-x86_64 \
+        "${ACCEL[@]}" \
+        -m 256M \
+        -cdrom "$ISO_PATH" \
+        -boot d \
+        "${DISPLAY_ARGS[@]}" \
+        "${SERIAL_ARGS[@]}"
+fi
 
 echo "[qemu.sh] booting $KERNEL + $INITRD"
 exec qemu-system-x86_64 \
