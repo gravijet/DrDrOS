@@ -9,7 +9,8 @@
 ################################################################################
 
 DRDR_APPS_VERSION  = 0.1.0
-DRDR_APPS_SITE     = $(BR2_EXTERNAL_DRDROS_PATH)/../..
+DRDR_SRC_MIRROR   ?= $(HOME)/.cache/drdros-src
+DRDR_APPS_SITE     = $(DRDR_SRC_MIRROR)
 DRDR_APPS_SITE_METHOD = local
 DRDR_APPS_LICENSE  = MIT OR Apache-2.0
 DRDR_APPS_LICENSE_FILES = LICENSE-MIT LICENSE-APACHE

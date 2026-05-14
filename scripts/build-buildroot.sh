@@ -24,6 +24,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BR="${BR:-$HOME/.cache/drdros-buildroot}"
 DEFCONFIG="$REPO_ROOT/buildroot/drdros_defconfig"
 EXTERNAL="$REPO_ROOT/buildroot/external"
+# Buildroot's `local` site method rsyncs DRDR_*_SITE every build. The
+# real repo lives on NTFS and may contain corrupted output/ trees from
+# killed builds, so we maintain a clean ext4 mirror and point the
+# recipes at it (DRDR_*_SITE in buildroot/external/package/*.mk).
+SRC_MIRROR="${SRC_MIRROR:-$HOME/.cache/drdros-src}"
 
 # Clone Buildroot at the pinned tag if the build dir doesn't exist.
 if [[ ! -d $BR ]]; then
@@ -31,6 +36,24 @@ if [[ ! -d $BR ]]; then
     git clone --depth=1 --branch 2026.02.1 \
         https://git.buildroot.net/buildroot "$BR"
 fi
+
+# Sync the Rust workspace into the ext4 mirror, excluding things that
+# would balloon the rsync (buildroot/upstream's own output, the cargo
+# target dir, git metadata). Each Buildroot run will rsync this mirror
+# into output/build/drdr-*; keeping it slim makes that step fast.
+sync_mirror() {
+    echo "[build-buildroot] syncing $REPO_ROOT → $SRC_MIRROR"
+    mkdir -p "$SRC_MIRROR"
+    rsync -a --delete \
+        --exclude '.git' \
+        --exclude 'target' \
+        --exclude 'buildroot/upstream/output' \
+        --exclude 'buildroot/upstream/dl' \
+        --exclude 'buildroot/images' \
+        --exclude 'iso/build' \
+        --exclude 'iso/*.iso' \
+        "$REPO_ROOT/" "$SRC_MIRROR/"
+}
 
 cd "$BR"
 
@@ -40,6 +63,7 @@ case "$target" in
         make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" "$target"
         ;;
     all|"")
+        sync_mirror
         # Defconfig first if .config is missing.
         if [[ ! -f .config ]]; then
             make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" defconfig
