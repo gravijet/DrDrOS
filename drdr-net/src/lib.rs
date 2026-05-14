@@ -272,6 +272,138 @@ impl<'a> Decoder<'a> {
     }
 }
 
+// ─── Codec trait + primitive impls ───────────────────────────────────
+
+/// Self-describing wire encoding for a Rust type.
+///
+/// Implementors decide how their fields map to the byte stream — the
+/// trait only requires that the encoding round-trips through [`Encoder`]
+/// and [`Decoder`]. There's no `#[derive(Codec)]` proc macro yet; types
+/// hand-roll the two methods (it's usually 4-6 lines).
+pub trait Codec: Sized {
+    fn encode(&self, enc: &mut Encoder);
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError>;
+}
+
+impl Codec for u8 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_u8(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_u8() }
+}
+impl Codec for u16 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_u16(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_u16() }
+}
+impl Codec for u32 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_u32(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_u32() }
+}
+impl Codec for u64 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_u64(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_u64() }
+}
+impl Codec for i32 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_i32(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_i32() }
+}
+impl Codec for i64 {
+    fn encode(&self, enc: &mut Encoder) { enc.write_i64(*self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> { dec.read_i64() }
+}
+impl Codec for bool {
+    fn encode(&self, enc: &mut Encoder) { enc.write_u8(if *self { 1 } else { 0 }); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(dec.read_u8()? != 0)
+    }
+}
+impl Codec for String {
+    fn encode(&self, enc: &mut Encoder) { enc.write_str(self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_str().map(|s| s.to_owned())
+    }
+}
+impl Codec for Vec<u8> {
+    fn encode(&self, enc: &mut Encoder) { enc.write_bytes(self); }
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_bytes().map(|b| b.to_vec())
+    }
+}
+
+/// Pack a `Codec` value into a fresh `Vec<u8>`. Handy for cooking up
+/// frame payloads in one expression: `Frame::new(KIND, pack(&msg))`.
+pub fn pack<T: Codec>(value: &T) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    value.encode(&mut enc);
+    enc.into_bytes()
+}
+
+/// Unpack a `Codec` value from a slice, erroring if the slice has
+/// trailing bytes (catches schema mismatches early).
+pub fn unpack<T: Codec>(bytes: &[u8]) -> Result<T, DecodeError> {
+    let mut dec = Decoder::new(bytes);
+    let value = T::decode(&mut dec)?;
+    if !dec.is_empty() {
+        // Treat trailing bytes as a schema bug: the caller asked for one
+        // value but the wire has more. UnexpectedEof is the wrong name
+        // — use LengthMismatch which more accurately captures it.
+        return Err(DecodeError::LengthMismatch {
+            declared: 0,
+            available: dec.remaining(),
+        });
+    }
+    Ok(value)
+}
+
+// ─── Conn — typed framed stream ──────────────────────────────────────
+
+/// Wraps any Read+Write duplex stream (TcpStream, UnixStream, an
+/// in-memory pipe, …) and offers send/recv methods at two levels:
+///
+///   - `send_frame` / `recv_frame` — raw [`Frame`]s
+///   - `send_typed` / `recv_typed` — a `kind` byte plus a [`Codec`] payload
+///
+/// `Conn` owns the underlying stream so it can flush after every send.
+/// If you need to keep the stream for other purposes, hand the trait
+/// object across the boundary instead of using `Conn`.
+pub struct Conn<S: Read + Write> {
+    stream: S,
+}
+
+impl<S: Read + Write> Conn<S> {
+    pub fn new(stream: S) -> Self {
+        Self { stream }
+    }
+
+    /// Give back the inner stream (e.g. to drop it explicitly).
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    pub fn send_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        write_frame(&mut self.stream, frame)?;
+        self.stream.flush()
+    }
+
+    pub fn recv_frame(&mut self) -> io::Result<Frame> {
+        read_frame(&mut self.stream)
+    }
+
+    /// Send a typed message with the given `kind` byte. The payload is
+    /// encoded via the [`Codec`] impl.
+    pub fn send_typed<T: Codec>(&mut self, kind: u8, msg: &T) -> io::Result<()> {
+        self.send_frame(&Frame::new(kind, pack(msg)))
+    }
+
+    /// Receive the next frame and decode its payload as `T`. Returns
+    /// the frame's `kind` byte alongside so the caller can demultiplex.
+    /// Schema mismatches surface as `InvalidData`.
+    pub fn recv_typed<T: Codec>(&mut self) -> io::Result<(u8, T)> {
+        let frame = self.recv_frame()?;
+        let value = unpack::<T>(&frame.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok((frame.kind, value))
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -362,5 +494,128 @@ mod tests {
         let mut dec = Decoder::new(&got.payload);
         assert_eq!(dec.read_u32().unwrap(), 7);
         assert_eq!(dec.read_str().unwrap(), "gravijet");
+    }
+
+    // ─── Tier 2: Codec + Conn ────────────────────────────────────────
+
+    // A typical request struct that consumers would hand-roll a Codec for.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Join {
+        user_id: u32,
+        username: String,
+    }
+
+    impl Codec for Join {
+        fn encode(&self, enc: &mut Encoder) {
+            self.user_id.encode(enc);
+            self.username.encode(enc);
+        }
+        fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            Ok(Self {
+                user_id: u32::decode(dec)?,
+                username: String::decode(dec)?,
+            })
+        }
+    }
+
+    #[test]
+    fn codec_pack_unpack_primitives() {
+        for v in [0u32, 1, 42, u32::MAX] {
+            assert_eq!(unpack::<u32>(&pack(&v)).unwrap(), v);
+        }
+        for v in [true, false] {
+            assert_eq!(unpack::<bool>(&pack(&v)).unwrap(), v);
+        }
+        let s = "DrDrOS".to_string();
+        assert_eq!(unpack::<String>(&pack(&s)).unwrap(), s);
+    }
+
+    #[test]
+    fn codec_custom_type_roundtrip() {
+        let join = Join { user_id: 7, username: "gravijet".into() };
+        let bytes = pack(&join);
+        let back: Join = unpack(&bytes).unwrap();
+        assert_eq!(join, back);
+    }
+
+    #[test]
+    fn unpack_rejects_trailing_bytes() {
+        // Encode a u32, then append junk.
+        let mut bytes = pack(&42u32);
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        match unpack::<u32>(&bytes).unwrap_err() {
+            DecodeError::LengthMismatch { available, .. } => assert_eq!(available, 2),
+            other => panic!("expected LengthMismatch, got {other:?}"),
+        }
+    }
+
+    /// In-memory duplex pipe used by the Conn tests. Two halves; each
+    /// half writes into a shared VecDeque that the other half reads.
+    /// Synchronous and single-threaded — fine for testing protocol
+    /// round-trips without bringing in tokio or std::net.
+    struct Pipe {
+        send: std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<u8>>>,
+        recv: std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<u8>>>,
+    }
+
+    fn pipe_pair() -> (Pipe, Pipe) {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+        let a = Rc::new(RefCell::new(VecDeque::new()));
+        let b = Rc::new(RefCell::new(VecDeque::new()));
+        (
+            Pipe { send: a.clone(), recv: b.clone() },
+            Pipe { send: b, recv: a },
+        )
+    }
+
+    impl io::Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.send.borrow_mut().extend(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    impl io::Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut q = self.recv.borrow_mut();
+            let n = q.len().min(buf.len());
+            for slot in buf[..n].iter_mut() {
+                *slot = q.pop_front().unwrap();
+            }
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipe empty"));
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn conn_roundtrip_typed_message() {
+        let (client, server) = pipe_pair();
+        let mut client = Conn::new(client);
+        let mut server = Conn::new(server);
+
+        client.send_typed(/* kind=JOIN */ 1, &Join { user_id: 9, username: "ada".into() })
+            .unwrap();
+
+        let (kind, msg): (u8, Join) = server.recv_typed().unwrap();
+        assert_eq!(kind, 1);
+        assert_eq!(msg, Join { user_id: 9, username: "ada".into() });
+    }
+
+    #[test]
+    fn conn_schema_mismatch_is_invalid_data() {
+        // Send a frame with a payload too short to decode as `Join`.
+        let (client, server) = pipe_pair();
+        let mut client = Conn::new(client);
+        let mut server = Conn::new(server);
+
+        // Just a u32, no string — Join::decode expects both.
+        client.send_typed(1, &42u32).unwrap();
+        let err = server.recv_typed::<Join>().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
