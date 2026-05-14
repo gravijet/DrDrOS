@@ -16,6 +16,6 @@ name = "drdr_font"
 path = "src/lib.rs"
 
 [dependencies]
-# We borrow Framebuffer + Pixel from drdr-ui so the glyph renderer can
-# paint directly onto the same surface the rest of the UI uses.
-drdr-ui = { path = "../drdr-ui" }
+# Borrows Framebuffer + Pixel from drdr-fb so glyphs paint directly
+# onto the same surface every other layer uses.
+drdr-fb = { path = "../drdr-fb" }

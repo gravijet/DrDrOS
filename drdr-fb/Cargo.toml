@@ -1,0 +1,22 @@
+# drdr-fb — low-level framebuffer access for DrDrOS.
+#
+# This is the bottom of the rendering stack: opens /dev/fb0, mmaps the
+# pixel memory, exposes `put_pixel` / `fill_rect` / `clear`. Both
+# drdr-font (glyphs) and drdr-ui (widgets) build on top.
+
+[package]
+name        = "drdr-fb"
+description = "DrDrOS framebuffer primitives — open /dev/fb0, paint pixels."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_fb"
+path = "src/lib.rs"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["ioctl", "mman"] }

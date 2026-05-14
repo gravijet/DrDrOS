@@ -28,6 +28,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "drdr-fb"
+version = "0.1.0"
+dependencies = [
+ "nix",
+]
+
+[[package]]
 name = "drdr-files"
 version = "0.1.0"
 dependencies = [
@@ -38,15 +45,15 @@ dependencies = [
 name = "drdr-font"
 version = "0.1.0"
 dependencies = [
- "drdr-ui",
+ "drdr-fb",
 ]
 
 [[package]]
 name = "drdr-init"
 version = "0.1.0"
 dependencies = [
+ "drdr-fb",
  "drdr-font",
- "drdr-ui",
  "nix",
 ]
 
@@ -69,7 +76,8 @@ dependencies = [
 name = "drdr-ui"
 version = "0.1.0"
 dependencies = [
- "nix",
+ "drdr-fb",
+ "drdr-font",
 ]
 
 [[package]]

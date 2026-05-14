@@ -20,8 +20,8 @@
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
-use drdr_ui::{Framebuffer, Pixel};
 use nix::mount::{MsFlags, mount};
 
 fn main() {

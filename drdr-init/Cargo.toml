@@ -19,5 +19,5 @@ path = "src/main.rs"
 [dependencies]
 nix = { version = "0.31.3", features = ["mount"] }
 # Tier 2: open /dev/fb0 and paint the boot splash before exec.
-drdr-ui   = { path = "../drdr-ui" }
+drdr-fb   = { path = "../drdr-fb" }
 drdr-font = { path = "../drdr-font" }

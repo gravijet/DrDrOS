@@ -16,4 +16,7 @@ name = "drdr_ui"
 path = "src/lib.rs"
 
 [dependencies]
-nix = { version = "0.31.3", features = ["ioctl", "mman"] }
+# Widget framework paints onto drdr-fb's framebuffer and renders text
+# via drdr-font's bitmap glyphs.
+drdr-fb   = { path = "../drdr-fb" }
+drdr-font = { path = "../drdr-font" }
