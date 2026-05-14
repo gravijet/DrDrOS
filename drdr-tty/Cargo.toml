@@ -1,0 +1,22 @@
+# drdr-tty — shared termios raw-mode + key decoding for DrDrOS apps.
+# Used by drdr-files (interactive browser) and drdr-edit (modal editor).
+# Phase 3's evdev-backed input layer will replace this for binaries that
+# move to the framebuffer; until then, this is the one place the termios
+# work lives.
+
+[package]
+name        = "drdr-tty"
+description = "Termios raw-mode + key decoder shared by DrDrOS terminal apps."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_tty"
+path = "src/lib.rs"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["term"] }

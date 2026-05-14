@@ -1,45 +1,49 @@
-//! drdr-edit — DrDrEdit, the DrDrOS text editor (Tier 1).
+//! drdr-edit — DrDrEdit, the DrDrOS text editor (Tier 2).
 //!
-//! Tier 1 is a line-oriented editor in the spirit of `ed(1)`: every command
-//! is one letter, the document lives entirely in RAM, and nothing touches
-//! disk until the user explicitly runs `w`. The model is intentionally
-//! minimal so the read-mutate-write cycle is small enough to hold in your
-//! head.
+//! Tier 2 promotes the editor from line-oriented (`ed`-style) to a
+//! full-screen modal editor in the vi tradition:
 //!
-//! Commands (each on its own line):
+//!   - **NORMAL** mode for navigation and structural edits.
+//!   - **INSERT** mode for typing characters into the buffer.
 //!
-//!     p              print all lines (with line numbers)
-//!     p N            print line N
-//!     p N,M          print lines N..=M
-//!     a N            append: insert new lines AFTER line N, end with '.'
-//!                    (a 0 inserts at the very top of the file)
-//!     i N            insert: same as `a` but BEFORE line N
-//!     c N            change: replace line N with new lines, end with '.'
-//!     d N            delete line N
-//!     d N,M          delete lines N..=M
-//!     s N TEXT       set: replace line N with the single line TEXT
-//!     w              write to the original path
-//!     w FILE         write-as to FILE
-//!     q              quit (errors if unsaved; use Q to override)
-//!     Q              quit, discarding unsaved changes
-//!     =              status (line count, modified flag, path)
-//!     h              help
+//! Like `drdr-files -i`, all rendering is direct ANSI escape sequences,
+//! and the terminal is reset by the [`RawMode`] RAII guard from
+//! `drdr-tty` on every exit path — panics included.
 //!
-//! Tier 2 swaps this for a termios raw-mode full-screen editor; Tier 3
-//! (Phase 3) replaces stdin with framebuffer-driven input.
+//! NORMAL keys
+//! ───────────
+//!   h / Left      move left           j / Down  move down
+//!   k / Up        move up             l / Right move right
+//!   0  / Home     start of line       $ / End   end of line
+//!   G             jump to last line
+//!   i             enter INSERT at cursor
+//!   a             enter INSERT one column after cursor
+//!   A             enter INSERT at end of line
+//!   o             open new line below + INSERT
+//!   O             open new line above + INSERT
+//!   x             delete the char under the cursor
+//!   s             save (write to file)
+//!   q             quit (refuses if unsaved)
+//!   !             force-quit, discarding unsaved changes
+//!   ?             show help overlay
 //!
-//! Usage:
+//! INSERT keys
+//! ───────────
+//!   Esc           back to NORMAL
+//!   Enter         split line at cursor
+//!   Backspace     delete previous char (joins lines at column 0)
+//!   any char      insert at cursor
 //!
-//!     drdr-edit [FILE]
-//!
-//! If FILE exists it is loaded; if it does not, the editor starts empty
-//! and the file is created on the first `w`.
+//! ASCII-only for Tier 2; Tier 3 will add UTF-8 width handling along
+//! with the framebuffer port.
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use drdr_tty::{read_key, term_size, Key, RawMode};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -57,384 +61,403 @@ fn main() -> ExitCode {
         }
     };
 
-    print_intro(&state);
+    let _raw = match RawMode::enter() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("drdr-edit: failed to enter raw mode: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    let mut stdout = io::stdout();
-    let mut line = String::new();
-
-    loop {
-        let _ = write!(stdout, "drdred> ");
-        let _ = stdout.flush();
-
-        line.clear();
-        match handle.read_line(&mut line) {
-            Ok(0) => {
-                // EOF — treat like 'q'; bail if unsaved.
-                println!();
-                if state.modified {
-                    eprintln!("drdred: unsaved changes (use Q to discard, w to save)");
-                    return ExitCode::from(1);
-                }
-                return ExitCode::SUCCESS;
-            }
-            Ok(_) => {}
+    let exit = loop {
+        let (rows, cols) = term_size();
+        if let Err(e) = render(&state, rows, cols) {
+            eprintln!("drdr-edit: render: {e}");
+            break ExitCode::from(1);
+        }
+        let key = match read_key() {
+            Ok(k) => k,
             Err(e) => {
-                eprintln!("drdred: read error: {e}");
-                return ExitCode::from(1);
+                eprintln!("drdr-edit: read: {e}");
+                break ExitCode::from(1);
             }
+        };
+        match state.mode {
+            Mode::Normal => match handle_normal(&mut state, key) {
+                NormalOutcome::Continue => {}
+                NormalOutcome::Quit(c) => break c,
+            },
+            Mode::Insert => handle_insert(&mut state, key),
         }
+    };
 
-        let cmd = line.trim_end_matches('\n').to_string();
-        match execute(&mut state, &cmd, &mut handle) {
-            ControlFlow::Continue => {}
-            ControlFlow::Quit(code) => return code,
-        }
+    drop(_raw); // explicit restore before the return so the message is on a clean line.
+    if let Some(msg) = state.farewell.take() {
+        println!("{msg}");
     }
+    exit
 }
 
-fn print_intro(state: &State) {
-    match &state.path {
-        Some(p) if state.created => {
-            println!("drdr-edit: starting new file {} ({} lines)", p.display(), state.lines.len());
-        }
-        Some(p) => {
-            println!("drdr-edit: loaded {} ({} lines)", p.display(), state.lines.len());
-        }
-        None => {
-            println!("drdr-edit: in-memory buffer ({} lines) — `w FILE` to save somewhere", state.lines.len());
-        }
-    }
-    println!("Type `h` for help, `q` to quit.");
+// ─── State ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Insert,
 }
 
-/// All editor state. `lines` is the document; `modified` is set true on
-/// every mutation and cleared on a successful `w`. `created` records
-/// whether we started from an empty buffer (so the intro line is honest).
 struct State {
     path: Option<PathBuf>,
     lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize, // char index within the row
+    top_row: usize,    // viewport scroll
+    mode: Mode,
     modified: bool,
-    created: bool,
+    /// Sticky status line message; cleared on next keystroke.
+    message: Option<String>,
+    /// Final note printed AFTER raw mode is restored (e.g. "saved X bytes").
+    farewell: Option<String>,
 }
 
 impl State {
     fn load(path: Option<PathBuf>) -> io::Result<Self> {
-        let Some(ref p) = path else {
-            return Ok(Self { path, lines: Vec::new(), modified: false, created: true });
+        let lines = match &path {
+            Some(p) => match fs::read_to_string(p) {
+                Ok(text) => split_lines(&text),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => vec![String::new()],
+                Err(e) => return Err(e),
+            },
+            None => vec![String::new()],
         };
-        match fs::read_to_string(p) {
-            Ok(text) => {
-                let lines = if text.is_empty() {
-                    Vec::new()
-                } else {
-                    // Split on '\n'; if the file ends with a newline,
-                    // `split` leaves a trailing empty string we trim,
-                    // matching how editors usually treat trailing EOL.
-                    let mut v: Vec<String> = text.split('\n').map(String::from).collect();
-                    if v.last().is_some_and(|s| s.is_empty()) {
-                        v.pop();
-                    }
-                    v
-                };
-                Ok(Self { path, lines, modified: false, created: false })
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Ok(Self { path, lines: Vec::new(), modified: false, created: true })
-            }
-            Err(e) => Err(e),
+        Ok(Self {
+            path,
+            lines,
+            cursor_row: 0,
+            cursor_col: 0,
+            top_row: 0,
+            mode: Mode::Normal,
+            modified: false,
+            message: None,
+            farewell: None,
+        })
+    }
+
+    fn current_line_len(&self) -> usize {
+        self.lines.get(self.cursor_row).map(|s| s.chars().count()).unwrap_or(0)
+    }
+
+    fn clamp_cursor(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
         }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        // In Normal mode the cursor sits ON a char, so max col == len-1.
+        // In Insert mode the cursor sits BETWEEN chars, so max col == len.
+        let line_len = self.current_line_len();
+        let max_col = match self.mode {
+            Mode::Normal => line_len.saturating_sub(1),
+            Mode::Insert => line_len,
+        };
+        self.cursor_col = self.cursor_col.min(max_col);
     }
 }
 
-/// What the command dispatcher wants the main loop to do next.
-enum ControlFlow {
+fn split_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    if lines.last().is_some_and(|s| s.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+// ─── NORMAL mode ─────────────────────────────────────────────────────
+
+enum NormalOutcome {
     Continue,
     Quit(ExitCode),
 }
 
-/// Execute a single command line. `input` is passed in because some
-/// commands (`a`, `i`, `c`) read additional lines until a lone `.`.
-fn execute(state: &mut State, cmd: &str, input: &mut impl BufRead) -> ControlFlow {
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
-        return ControlFlow::Continue;
-    }
-
-    // Split the first whitespace-delimited token off as the verb. The
-    // rest is the argument string, which individual handlers parse.
-    let (verb, rest) = match cmd.split_once(char::is_whitespace) {
-        Some((v, r)) => (v, r.trim_start()),
-        None => (cmd, ""),
-    };
-
-    match verb {
-        "p" => cmd_print(state, rest),
-        "a" => cmd_insert(state, rest, InsertWhere::After, input),
-        "i" => cmd_insert(state, rest, InsertWhere::Before, input),
-        "c" => cmd_change(state, rest, input),
-        "d" => cmd_delete(state, rest),
-        "s" => cmd_set(state, rest),
-        "w" => cmd_write(state, rest),
-        "q" => {
+fn handle_normal(state: &mut State, key: Key) -> NormalOutcome {
+    state.message = None;
+    match key {
+        Key::Char('h') | Key::Left => {
+            state.cursor_col = state.cursor_col.saturating_sub(1);
+        }
+        Key::Char('l') | Key::Right => {
+            let max = state.current_line_len().saturating_sub(1);
+            if state.cursor_col < max {
+                state.cursor_col += 1;
+            }
+        }
+        Key::Char('k') | Key::Up => {
+            state.cursor_row = state.cursor_row.saturating_sub(1);
+            state.clamp_cursor();
+        }
+        Key::Char('j') | Key::Down => {
+            if state.cursor_row + 1 < state.lines.len() {
+                state.cursor_row += 1;
+            }
+            state.clamp_cursor();
+        }
+        Key::Char('0') | Key::Home => state.cursor_col = 0,
+        Key::Char('$') | Key::End => {
+            state.cursor_col = state.current_line_len().saturating_sub(1);
+        }
+        Key::Char('G') => {
+            state.cursor_row = state.lines.len() - 1;
+            state.clamp_cursor();
+        }
+        Key::Char('i') => state.mode = Mode::Insert,
+        Key::Char('a') => {
+            if !state.lines[state.cursor_row].is_empty() {
+                state.cursor_col += 1;
+            }
+            state.mode = Mode::Insert;
+        }
+        Key::Char('A') => {
+            state.cursor_col = state.current_line_len();
+            state.mode = Mode::Insert;
+        }
+        Key::Char('o') => {
+            let row = state.cursor_row;
+            state.lines.insert(row + 1, String::new());
+            state.cursor_row = row + 1;
+            state.cursor_col = 0;
+            state.mode = Mode::Insert;
+            state.modified = true;
+        }
+        Key::Char('O') => {
+            let row = state.cursor_row;
+            state.lines.insert(row, String::new());
+            state.cursor_col = 0;
+            state.mode = Mode::Insert;
+            state.modified = true;
+        }
+        Key::Char('x') => {
+            let line = &mut state.lines[state.cursor_row];
+            let n_chars = line.chars().count();
+            if n_chars == 0 {
+                return NormalOutcome::Continue;
+            }
+            let byte = char_index_to_byte(line, state.cursor_col);
+            let next_byte = next_char_boundary(line, byte);
+            line.replace_range(byte..next_byte, "");
+            state.modified = true;
+            if state.cursor_col >= n_chars - 1 {
+                state.cursor_col = (n_chars - 1).saturating_sub(1);
+            }
+            state.clamp_cursor();
+        }
+        Key::Char('s') => save(state),
+        Key::Char('q') => {
             if state.modified {
-                eprintln!("drdred: unsaved changes (use Q to discard, w to save)");
+                state.message = Some("unsaved changes — `s` to save, `!` to force-quit".into());
             } else {
-                return ControlFlow::Quit(ExitCode::SUCCESS);
+                return NormalOutcome::Quit(ExitCode::SUCCESS);
             }
         }
-        "Q" => return ControlFlow::Quit(ExitCode::SUCCESS),
-        "=" => cmd_status(state),
-        "h" | "?" => cmd_help(),
-        other => eprintln!("drdred: unknown command '{other}' (try `h`)"),
+        Key::Char('!') => return NormalOutcome::Quit(ExitCode::SUCCESS),
+        Key::Char('?') => show_help(state),
+        _ => {}
     }
-    ControlFlow::Continue
+    NormalOutcome::Continue
 }
 
-// ─── Commands ────────────────────────────────────────────────────────
-
-fn cmd_print(state: &State, rest: &str) {
-    let (start, end) = match parse_range(rest, state.lines.len()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("drdred: p: {e}");
-            return;
-        }
-    };
-    if state.lines.is_empty() {
-        println!("(empty buffer)");
+fn save(state: &mut State) {
+    let Some(path) = state.path.clone() else {
+        state.message = Some("no filename — start drdr-edit with a path to save".into());
         return;
-    }
-    // `lines` is 0-indexed, the user thinks in 1-indexed line numbers, so
-    // we translate at the boundary. `start..=end` is inclusive — matches
-    // ed's convention.
-    let width = digit_count(state.lines.len());
-    for (idx, line) in state.lines[start - 1..end].iter().enumerate() {
-        let n = start + idx;
-        println!("{n:>width$}  {line}", width = width);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum InsertWhere {
-    Before,
-    After,
-}
-
-fn cmd_insert(state: &mut State, rest: &str, where_: InsertWhere, input: &mut impl BufRead) {
-    let pos_arg = match parse_line_number(rest, state.lines.len(), where_) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("drdred: insert: {e}");
-            return;
-        }
     };
-    let insert_at = match where_ {
-        InsertWhere::Before => pos_arg.saturating_sub(1),
-        InsertWhere::After => pos_arg,
-    };
-    let new_lines = match read_until_dot(input) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("drdred: insert: read error: {e}");
-            return;
-        }
-    };
-    if new_lines.is_empty() {
-        return;
-    }
-    state.lines.splice(insert_at..insert_at, new_lines);
-    state.modified = true;
-}
-
-fn cmd_change(state: &mut State, rest: &str, input: &mut impl BufRead) {
-    let n = match parse_existing_line(rest, state.lines.len()) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("drdred: c: {e}");
-            return;
-        }
-    };
-    let new_lines = match read_until_dot(input) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("drdred: c: read error: {e}");
-            return;
-        }
-    };
-    // Replace line n-1 with the collected lines. An empty replacement is
-    // a delete; we allow it on purpose.
-    state.lines.splice(n - 1..n, new_lines);
-    state.modified = true;
-}
-
-fn cmd_delete(state: &mut State, rest: &str) {
-    if rest.is_empty() {
-        eprintln!("drdred: d: line number required");
-        return;
-    }
-    let (start, end) = match parse_range(rest, state.lines.len()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("drdred: d: {e}");
-            return;
-        }
-    };
-    state.lines.drain(start - 1..end);
-    state.modified = true;
-}
-
-fn cmd_set(state: &mut State, rest: &str) {
-    // s N TEXT — split off the first whitespace-delimited token as N.
-    let (n_str, text) = match rest.split_once(char::is_whitespace) {
-        Some((a, b)) => (a, b),
-        None => {
-            eprintln!("drdred: s: usage: s N TEXT");
-            return;
-        }
-    };
-    let n = match parse_existing_line(n_str, state.lines.len()) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("drdred: s: {e}");
-            return;
-        }
-    };
-    state.lines[n - 1] = text.to_string();
-    state.modified = true;
-}
-
-fn cmd_write(state: &mut State, rest: &str) {
-    let target: PathBuf = if rest.is_empty() {
-        match &state.path {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("drdred: w: no filename — use `w FILE`");
-                return;
-            }
-        }
-    } else {
-        PathBuf::from(rest)
-    };
-
-    // Reconstruct the file: every line joined by '\n', plus a trailing
-    // newline so the file is POSIX-tidy.
     let mut body = state.lines.join("\n");
     if !body.is_empty() {
         body.push('\n');
     }
-    match fs::write(&target, body.as_bytes()) {
+    match fs::write(&path, body.as_bytes()) {
         Ok(()) => {
-            println!("wrote {} ({} lines, {} bytes)", target.display(), state.lines.len(), body.len());
             state.modified = false;
-            // Adopt the new path so subsequent `w` (no arg) re-saves here.
-            state.path = Some(target);
+            state.message = Some(format!(
+                "wrote {} ({} lines, {} bytes)",
+                path.display(),
+                state.lines.len(),
+                body.len()
+            ));
         }
-        Err(e) => eprintln!("drdred: w: {}: {e}", target.display()),
+        Err(e) => state.message = Some(format!("save: {e}")),
     }
 }
 
-fn cmd_status(state: &State) {
-    let path = state.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<no file>".into());
-    println!("{} lines, {}, path: {}",
-        state.lines.len(),
-        if state.modified { "modified" } else { "saved" },
-        path,
+fn show_help(state: &mut State) {
+    state.message = Some(
+        "NORMAL: h/j/k/l move · i/a/A insert · o/O open · x del · s save · q quit · ! force"
+            .into(),
     );
 }
 
-fn cmd_help() {
-    println!("DrDrEdit Tier 1 commands:");
-    println!("  p [N|N,M]      print all / line / range");
-    println!("  a N            append lines after line N (end with '.')");
-    println!("  i N            insert lines before line N (end with '.')");
-    println!("  c N            change (replace) line N with new lines");
-    println!("  d N[,M]        delete line / range");
-    println!("  s N TEXT       set line N to TEXT");
-    println!("  w [FILE]       save to original path / FILE");
-    println!("  q              quit (refuses if unsaved)");
-    println!("  Q              quit, discarding unsaved changes");
-    println!("  =              show line count, modified flag, path");
-    println!("  h              this help");
-}
+// ─── INSERT mode ─────────────────────────────────────────────────────
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-/// Read lines from `input` until a line containing exactly "." appears.
-/// The terminator line itself is not included. EOF before "." treats the
-/// collected lines as final input.
-fn read_until_dot(input: &mut impl BufRead) -> io::Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = input.read_line(&mut buf)?;
-        if n == 0 {
-            return Ok(out);
+fn handle_insert(state: &mut State, key: Key) {
+    state.message = None;
+    match key {
+        Key::Escape => {
+            state.mode = Mode::Normal;
+            // Vi convention: leaving insert moves cursor one left, but
+            // never past the line start.
+            state.cursor_col = state.cursor_col.saturating_sub(1);
+            state.clamp_cursor();
         }
-        let trimmed = buf.trim_end_matches('\n').to_string();
-        if trimmed == "." {
-            return Ok(out);
+        Key::Enter => {
+            let row = state.cursor_row;
+            let line = state.lines[row].clone();
+            let byte = char_index_to_byte(&line, state.cursor_col);
+            let (left, right) = line.split_at(byte);
+            state.lines[row] = left.to_string();
+            state.lines.insert(row + 1, right.to_string());
+            state.cursor_row = row + 1;
+            state.cursor_col = 0;
+            state.modified = true;
         }
-        out.push(trimmed);
+        Key::Backspace => {
+            if state.cursor_col > 0 {
+                let line = &mut state.lines[state.cursor_row];
+                let target_col = state.cursor_col - 1;
+                let start = char_index_to_byte(line, target_col);
+                let end = char_index_to_byte(line, state.cursor_col);
+                line.replace_range(start..end, "");
+                state.cursor_col = target_col;
+                state.modified = true;
+            } else if state.cursor_row > 0 {
+                // Join this line onto the previous.
+                let prev = state.lines.remove(state.cursor_row);
+                state.cursor_row -= 1;
+                state.cursor_col = state.lines[state.cursor_row].chars().count();
+                state.lines[state.cursor_row].push_str(&prev);
+                state.modified = true;
+            }
+        }
+        Key::Char(c) => {
+            let line = &mut state.lines[state.cursor_row];
+            let byte = char_index_to_byte(line, state.cursor_col);
+            line.insert(byte, c);
+            state.cursor_col += 1;
+            state.modified = true;
+        }
+        _ => {}
     }
 }
 
-/// Parse "p" range argument: "" → whole file, "N" → single line, "N,M" → range.
-/// Returns 1-based inclusive (start, end), validated against `len`.
-fn parse_range(rest: &str, len: usize) -> Result<(usize, usize), String> {
-    if rest.is_empty() {
-        if len == 0 {
-            return Err("buffer is empty".into());
-        }
-        return Ok((1, len));
-    }
-    let (a, b) = match rest.split_once(',') {
-        Some((a, b)) => (a.trim(), b.trim()),
-        None => (rest, rest),
+// ─── Rendering ───────────────────────────────────────────────────────
+
+fn render(state: &State, rows: u16, cols: u16) -> io::Result<()> {
+    let body_rows = rows.saturating_sub(2).max(1) as usize; // top status + bottom status
+    let top = compute_top(state.cursor_row, state.top_row, body_rows, state.lines.len());
+
+    let mut buf = String::with_capacity(8 * 1024);
+    buf.push_str("\x1b[2J\x1b[H");
+
+    // Top status line.
+    let path_label = state
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<no file>".into());
+    let mode_label = match state.mode {
+        Mode::Normal => "NORMAL",
+        Mode::Insert => "INSERT",
     };
-    let start = parse_existing_line(a, len)?;
-    let end = parse_existing_line(b, len)?;
-    if start > end {
-        return Err(format!("range out of order: {start} > {end}"));
-    }
-    Ok((start, end))
-}
+    let modified = if state.modified { " ●" } else { "" };
+    let header = format!(" DrDrEdit · {mode_label} · {path_label}{modified}");
+    buf.push_str("\x1b[7m");
+    pad_line(&mut buf, &header, cols);
+    buf.push_str("\x1b[0m\r\n");
 
-/// Parse a 1-based line number that refers to an existing line.
-fn parse_existing_line(s: &str, len: usize) -> Result<usize, String> {
-    let n: usize = s.parse().map_err(|_| format!("not a line number: '{s}'"))?;
-    if n == 0 || n > len {
-        return Err(format!("line {n} out of range (1..={len})"));
-    }
-    Ok(n)
-}
-
-/// Parse a line number for `a`/`i` where the bounds are slightly different:
-/// `a 0` is "insert at the very top", and `a N` past the end means "append
-/// at the end", which we clamp.
-fn parse_line_number(s: &str, len: usize, where_: InsertWhere) -> Result<usize, String> {
-    if s.is_empty() {
-        return Err("line number required".into());
-    }
-    let n: usize = s.parse().map_err(|_| format!("not a line number: '{s}'"))?;
-    match where_ {
-        InsertWhere::After => {
-            if n > len {
-                return Err(format!("line {n} out of range (0..={len})"));
+    // Body. One line per row in the viewport; ~ for rows past EOF.
+    for i in 0..body_rows {
+        let idx = top + i;
+        if idx < state.lines.len() {
+            let line = &state.lines[idx];
+            pad_line(&mut buf, line, cols);
+        } else {
+            buf.push('~');
+            for _ in 1..cols as usize {
+                buf.push(' ');
             }
-            Ok(n)
         }
-        InsertWhere::Before => {
-            if n == 0 || n > len.max(1) {
-                return Err(format!("line {n} out of range (1..={})", len.max(1)));
-            }
-            Ok(n)
-        }
+        buf.push_str("\r\n");
+    }
+
+    // Bottom status line.
+    let pos = format!(" L{}:C{}", state.cursor_row + 1, state.cursor_col + 1);
+    let footer = match &state.message {
+        Some(msg) => format!("{pos}  {msg}"),
+        None => format!("{pos}  press ? for help"),
+    };
+    buf.push_str("\x1b[7m");
+    pad_line(&mut buf, &footer, cols);
+    buf.push_str("\x1b[0m");
+
+    // Position the cursor at its logical spot in the viewport. ANSI
+    // CUP uses 1-based row/col coords.
+    let screen_row = (state.cursor_row - top) as u16 + 2; // +1 for header, +1 for 1-based.
+    let screen_col = state.cursor_col as u16 + 1;
+    buf.push_str(&format!("\x1b[{screen_row};{screen_col}H"));
+    // Show the cursor (RawMode hid it on entry).
+    buf.push_str("\x1b[?25h");
+
+    let mut out = io::stdout().lock();
+    out.write_all(buf.as_bytes())?;
+    out.flush()
+}
+
+fn compute_top(cursor: usize, top: usize, body: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if cursor < top {
+        cursor
+    } else if cursor >= top + body {
+        cursor + 1 - body
+    } else {
+        top
     }
 }
 
-fn digit_count(n: usize) -> usize {
-    if n == 0 { 1 } else { (n as f64).log10().floor() as usize + 1 }
+fn pad_line(out: &mut String, line: &str, cols: u16) {
+    let mut written = 0;
+    for c in line.chars() {
+        if written + 1 > cols as usize {
+            break;
+        }
+        out.push(c);
+        written += 1;
+    }
+    for _ in written..cols as usize {
+        out.push(' ');
+    }
+}
+
+// ─── Char-index ↔ byte-index helpers ─────────────────────────────────
+// We expose the cursor as a char index because that's what users mean
+// by "column N". String mutation needs byte indices, so the helpers
+// convert between them.
+
+fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+fn next_char_boundary(s: &str, byte_idx: usize) -> usize {
+    if byte_idx >= s.len() {
+        return s.len();
+    }
+    s[byte_idx..]
+        .char_indices()
+        .nth(1)
+        .map(|(b, _)| byte_idx + b)
+        .unwrap_or(s.len())
 }

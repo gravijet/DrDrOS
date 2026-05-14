@@ -15,6 +15,6 @@ name = "drdr-files"
 path = "src/main.rs"
 
 [dependencies]
-# Tier 2: termios raw mode for interactive navigation. `term` feature
-# enables nix::sys::termios on Unix.
-nix = { version = "0.31.3", features = ["term"] }
+# Shared raw-mode + key decoder lives in its own crate so drdr-edit can
+# use the same code without duplication.
+drdr-tty = { path = "../drdr-tty" }

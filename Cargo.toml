@@ -15,6 +15,7 @@ members = [
     "drdr-ui",
     "drdr-net",
     "drdr-font",
+    "drdr-tty",
 ]
 
 # Shared metadata. Each crate inherits these via `field.workspace = true`,
