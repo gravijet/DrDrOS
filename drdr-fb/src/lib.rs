@@ -132,14 +132,24 @@ impl Pixel {
     pub const BLUE:  Self = Self::rgb(0, 0, 255);
 }
 
-/// A live handle to the Linux framebuffer. Drop releases the mmap and
-/// closes the file descriptor automatically — RAII the whole way.
+/// Where the pixel bytes live. `Mmap` is the production case — the
+/// kernel exposes /dev/fb0 as memory we map directly. `Heap` is a
+/// Vec-backed buffer used by host-side tests and the `write_ppm`
+/// snapshot path — no kernel, no framebuffer device required.
+enum Backend {
+    Mmap {
+        _fd: OwnedFd,
+        ptr: NonNull<u8>,
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+/// A pixel surface. Production constructor [`Framebuffer::open`] mmaps
+/// /dev/fb0; [`Framebuffer::in_memory`] backs the same API with a
+/// heap-allocated buffer so widget tests can run anywhere.
 pub struct Framebuffer {
-    // Keeps the fd alive so the mmap remains valid until we drop. The
-    // mapping itself survives an fd close, but holding it documents intent.
-    _fd: OwnedFd,
-    map: NonNull<u8>,
-    map_len: usize,
+    backend: Backend,
 
     /// Visible width in pixels.
     pub width: u32,
@@ -192,14 +202,63 @@ impl Framebuffer {
         .map_err(io::Error::from)?;
 
         Ok(Self {
-            _fd: fd,
-            map: map_ptr.cast(),
-            map_len,
+            backend: Backend::Mmap {
+                _fd: fd,
+                ptr: map_ptr.cast(),
+                len: map_len,
+            },
             width: vinfo.xres,
             height: vinfo.yres,
             bpp: vinfo.bits_per_pixel,
             pitch: finfo.line_length,
         })
+    }
+
+    /// Create a heap-backed framebuffer of `width × height` pixels at
+    /// 32 bits-per-pixel. Same API as a real /dev/fb0 — useful for unit
+    /// tests, golden-image snapshots, and rendering previews on systems
+    /// that don't have a framebuffer device.
+    pub fn in_memory(width: u32, height: u32) -> Self {
+        let pitch = width.saturating_mul(4);
+        let bytes = (pitch as usize).saturating_mul(height as usize);
+        Self {
+            backend: Backend::Heap(vec![0u8; bytes]),
+            width,
+            height,
+            bpp: 32,
+            pitch,
+        }
+    }
+
+    /// Write the framebuffer's contents to `path` as a binary PPM (P6)
+    /// image. PPM is the simplest image format that any viewer (GIMP,
+    /// ImageMagick, browsers via extension, Eye of GNOME) opens out of
+    /// the box — handy for diffing renders without spinning up QEMU.
+    pub fn write_ppm(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(path)?;
+        // Header: magic + WxH + max channel value.
+        writeln!(file, "P6")?;
+        writeln!(file, "{} {}", self.width, self.height)?;
+        writeln!(file, "255")?;
+
+        // Body: one RGB triplet per pixel, top-left to bottom-right.
+        // Source layout is 32bpp BGRA; we transpose to RGB on the fly.
+        let buf = self.buffer_ro();
+        let pitch = self.pitch as usize;
+        let mut row = Vec::with_capacity(self.width as usize * 3);
+        for y in 0..self.height as usize {
+            row.clear();
+            for x in 0..self.width as usize {
+                let i = y * pitch + x * 4;
+                let b = buf[i];
+                let g = buf[i + 1];
+                let r = buf[i + 2];
+                row.extend_from_slice(&[r, g, b]);
+            }
+            file.write_all(&row)?;
+        }
+        Ok(())
     }
 
     /// Set a single pixel. Out-of-bounds coordinates are silently ignored.
@@ -238,25 +297,44 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
-    /// Mutable view over the mmap'd framebuffer bytes.
+    /// Mutable view over the framebuffer bytes — mmap or heap.
     fn buffer(&mut self) -> &mut [u8] {
-        // SAFETY: `self.map` was returned by mmap with `self.map_len`
-        // bytes of valid, writable memory shared with the kernel. The
-        // mapping outlives this borrow because it's tied to `self`. We
-        // require `&mut self`, so the borrow checker rules out aliased
-        // slices.
-        unsafe { std::slice::from_raw_parts_mut(self.map.as_ptr(), self.map_len) }
+        match &mut self.backend {
+            // SAFETY: `ptr` was returned by mmap with `len` bytes of
+            // valid, writable memory shared with the kernel. The mapping
+            // outlives this borrow because it's tied to `self`. `&mut
+            // self` rules out aliased slices.
+            Backend::Mmap { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
+            },
+            Backend::Heap(v) => v.as_mut_slice(),
+        }
+    }
+
+    /// Read-only view, for snapshot / encode paths.
+    fn buffer_ro(&self) -> &[u8] {
+        match &self.backend {
+            // SAFETY: same invariants as `buffer` — but `&self` is enough
+            // since we only hand out a `&[u8]`.
+            Backend::Mmap { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts(ptr.as_ptr(), *len)
+            },
+            Backend::Heap(v) => v.as_slice(),
+        }
     }
 }
 
 impl Drop for Framebuffer {
     fn drop(&mut self) {
-        // SAFETY: we unmap exactly the region we created in `open`. After
-        // this point no method runs on `self`, so the now-dangling pointer
-        // is never read again.
-        unsafe {
-            let _ = munmap(self.map.cast(), self.map_len);
+        if let Backend::Mmap { ptr, len, .. } = &self.backend {
+            // SAFETY: we unmap exactly the region we created in `open`.
+            // After this point no method runs on `self`, so the now-
+            // dangling pointer is never read again.
+            unsafe {
+                let _ = munmap(ptr.cast(), *len);
+            }
+            // _fd's own Drop closes the file descriptor.
         }
-        // _fd's own Drop closes the file descriptor.
+        // Heap backend has nothing to release — Vec drops itself.
     }
 }

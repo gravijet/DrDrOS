@@ -1,13 +1,21 @@
-//! drdr-demo — exercise the Phase 3 stack against a real framebuffer
-//! and keyboard. Opens `/dev/fb0`, opens the evdev device the user passes,
-//! draws a focusable menu, and reacts to key presses.
+//! drdr-demo — exercise the Phase 3 stack three ways.
 //!
-//! Usage:
+//! 1. Real framebuffer + evdev keyboard (the production case):
 //!
-//!     drdr-demo --kbd /dev/input/event3
-//!     drdr-demo --kbd /dev/input/event3 --fb /dev/fb0
+//!        drdr-demo --kbd /dev/input/event3
+//!        drdr-demo --kbd /dev/input/event3 --fb /dev/fb0
 //!
-//! Keys:
+//! 2. Render-once snapshot to a PPM file (no device access — runs on
+//!    any host with cargo):
+//!
+//!        drdr-demo --ppm out.ppm
+//!        drdr-demo --ppm out.ppm --focus 2
+//!
+//!    The PPM can be opened in GIMP / Eye of GNOME / any browser with a
+//!    PPM extension. Handy for visually diff'ing widget layouts without
+//!    booting QEMU.
+//!
+//! Keys (interactive mode):
 //!     Tab / ↓ / j   focus next button
 //!     Shift+Tab / ↑ / k   focus previous
 //!     Enter / Space   activate the focused button
@@ -34,6 +42,20 @@ fn main() -> ExitCode {
         }
     };
 
+    // PPM snapshot mode — no framebuffer device, no keyboard. Renders
+    // one frame at a fixed resolution into a heap-backed Framebuffer.
+    if let Some(path) = &args.ppm_path {
+        return run_ppm_snapshot(path, args.initial_focus);
+    }
+
+    let kbd_path = match &args.kbd_path {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("drdr-demo: --kbd is required for interactive mode (or pass --ppm FILE)");
+            return ExitCode::from(2);
+        }
+    };
+
     let mut fb = match Framebuffer::open(&args.fb_path) {
         Ok(f) => f,
         Err(e) => {
@@ -42,10 +64,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut keys = match KeyReader::open(&args.kbd_path) {
+    let mut keys = match KeyReader::open(&kbd_path) {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("drdr-demo: open {}: {e}", args.kbd_path);
+            eprintln!("drdr-demo: open {kbd_path}: {e}");
             return ExitCode::from(1);
         }
     };
@@ -58,7 +80,7 @@ fn main() -> ExitCode {
         Button::new("Quit"),
     ];
     let title = Label::new("DrDrOS demo — Tab moves focus, Enter activates, Esc quits");
-    let mut focus = 0usize;
+    let mut focus = args.initial_focus.min(buttons.len() - 1);
     buttons[focus].focused = true;
 
     loop {
@@ -142,34 +164,74 @@ fn draw_frame(fb: &mut Framebuffer, theme: &Theme, title: &Label, buttons: &[But
     }
 }
 
+/// Render one frame of the menu into a heap-backed Framebuffer and
+/// dump it to `path` as PPM. Returns an ExitCode for main.
+fn run_ppm_snapshot(path: &str, initial_focus: usize) -> ExitCode {
+    let mut fb = Framebuffer::in_memory(1024, 768);
+    let theme = Theme::DRDR;
+    let mut buttons = vec![
+        Button::new("Files"),
+        Button::new("Edit"),
+        Button::new("Shell"),
+        Button::new("Quit"),
+    ];
+    let focus = initial_focus.min(buttons.len() - 1);
+    buttons[focus].focused = true;
+    let title = Label::new("DrDrOS — Phase 3 widget snapshot");
+
+    draw_frame(&mut fb, &theme, &title, &buttons);
+
+    match fb.write_ppm(path) {
+        Ok(()) => {
+            eprintln!("drdr-demo: wrote {path} ({}x{} pixels)", fb.width, fb.height);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("drdr-demo: write_ppm {path}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 // ─── Argv ────────────────────────────────────────────────────────────
 
 struct Args {
     fb_path: String,
-    kbd_path: String,
+    kbd_path: Option<String>,
+    ppm_path: Option<String>,
+    initial_focus: usize,
 }
 
 fn parse_args(mut argv: Vec<String>) -> Result<Args, String> {
     let _ = argv.drain(..1);
     let mut fb_path = String::from("/dev/fb0");
     let mut kbd_path: Option<String> = None;
+    let mut ppm_path: Option<String> = None;
+    let mut initial_focus: usize = 0;
 
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--fb" => {
-                fb_path = argv
-                    .get(i + 1)
-                    .cloned()
+                fb_path = argv.get(i + 1).cloned()
                     .ok_or_else(|| "--fb needs a path".to_string())?;
                 i += 2;
             }
             "--kbd" => {
-                kbd_path = Some(
-                    argv.get(i + 1)
-                        .cloned()
-                        .ok_or_else(|| "--kbd needs a path".to_string())?,
-                );
+                kbd_path = Some(argv.get(i + 1).cloned()
+                    .ok_or_else(|| "--kbd needs a path".to_string())?);
+                i += 2;
+            }
+            "--ppm" => {
+                ppm_path = Some(argv.get(i + 1).cloned()
+                    .ok_or_else(|| "--ppm needs a path".to_string())?);
+                i += 2;
+            }
+            "--focus" => {
+                let raw = argv.get(i + 1)
+                    .ok_or_else(|| "--focus needs a number".to_string())?;
+                initial_focus = raw.parse()
+                    .map_err(|_| format!("--focus: not a number: '{raw}'"))?;
                 i += 2;
             }
             "-h" | "--help" => {
@@ -180,16 +242,23 @@ fn parse_args(mut argv: Vec<String>) -> Result<Args, String> {
         }
     }
 
-    let kbd_path = kbd_path.ok_or_else(|| "--kbd /dev/input/eventN is required".to_string())?;
-    Ok(Args { fb_path, kbd_path })
+    Ok(Args { fb_path, kbd_path, ppm_path, initial_focus })
 }
 
 fn print_help() {
     println!("drdr-demo — DrDrUI Tier 2 showcase");
     println!();
-    println!("Usage: drdr-demo --kbd /dev/input/eventN [--fb /dev/fb0]");
+    println!("Interactive (real framebuffer + keyboard):");
+    println!("  drdr-demo --kbd /dev/input/eventN [--fb /dev/fb0]");
     println!();
-    println!("Keys: Tab/↓/j next · Shift+Tab/↑/k previous · Enter/Space activate · Esc/q quit");
+    println!("Snapshot (no device, writes a PPM image — works on any host):");
+    println!("  drdr-demo --ppm OUT.ppm [--focus N]");
+    println!();
+    println!("Interactive keys:");
+    println!("  Tab / ↓ / j         focus next");
+    println!("  Shift+Tab / ↑ / k   focus previous");
+    println!("  Enter / Space       activate the focused button");
+    println!("  Esc / q             quit");
     println!();
     println!("/dev/fb0 needs the `video` group; /dev/input/eventN needs `input`.");
 }
