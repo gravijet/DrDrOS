@@ -1,0 +1,12 @@
+config BR2_PACKAGE_DRDR_INIT
+	bool "drdr-init (DrDrOS PID 1)"
+	help
+	  drdr-init is DrDrOS's custom PID 1. It mounts /proc, /sys, /dev,
+	  paints the framebuffer splash, then exec()s the shell. Replaces
+	  BusyBox init when BR2_INIT_NONE=y.
+
+	  Cross-compiled from the workspace at $(BR2_EXTERNAL_DRDROS_PATH)/../..
+	  using the host's rustup toolchain (target x86_64-unknown-linux-musl).
+	  Buildroot's musl is not used — the rustup target ships its own.
+
+	  https://github.com/gravijet/DrDrOS

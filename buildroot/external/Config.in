@@ -1,0 +1,9 @@
+# Top-level Kconfig for the DRDROS BR2_EXTERNAL tree.
+# Buildroot sources this file from its main Config.in when
+# BR2_EXTERNAL=$(pwd)/buildroot/external is passed at configure time.
+
+menu "DrDrOS packages"
+
+source "$BR2_EXTERNAL_DRDROS_PATH/package/drdr-init/Config.in"
+
+endmenu
