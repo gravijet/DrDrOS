@@ -1,0 +1,6 @@
+[submodule "buildroot/upstream"]
+	path = buildroot/upstream
+	url = https://git.buildroot.net/buildroot
+	# `dirty` hides Buildroot's untracked build artefacts (output/, dl/)
+	# from our `git status`, while still tracking the pinned commit.
+	ignore = dirty
