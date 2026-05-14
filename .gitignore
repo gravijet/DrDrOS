@@ -8,7 +8,8 @@ target/
 # scripts/build-buildroot.sh symlinks final images here for qemu.sh:
 buildroot/images/
 
-# ISO build artefacts.
+# ISO build artefacts — iso/build/ is the staging dir grub-mkrescue
+# wants; iso/drdros.iso is the final output.
 iso/build/
 iso/*.iso
 
