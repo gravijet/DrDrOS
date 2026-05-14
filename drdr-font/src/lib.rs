@@ -12,7 +12,7 @@
 //! That keeps drdr-font tiny, copyright-clean, and inspectable: every
 //! pixel of DrDrOS's UI is something we drew on purpose.
 
-use drdr_ui::{Framebuffer, Pixel};
+use drdr_fb::{Framebuffer, Pixel};
 
 /// Glyph width in pixels. The renderer hard-codes this — it's the width
 /// of a single byte's bit pattern, and shifting strides by 8 is cheap.

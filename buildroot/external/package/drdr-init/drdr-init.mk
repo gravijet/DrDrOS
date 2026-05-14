@@ -17,8 +17,12 @@ DRDR_INIT_SITE_METHOD = local
 DRDR_INIT_LICENSE  = MIT OR Apache-2.0
 # DRDR_INIT_LICENSE_FILES is left unset until we ship LICENSE texts.
 
-# Where cargo drops the cross-compiled binary.
-DRDR_INIT_BIN = $(DRDR_INIT_SITE)/target/x86_64-unknown-linux-musl/release/drdr-init
+# Where cargo drops the cross-compiled binary. .cargo/config.toml at the
+# repo root redirects target-dir to $HOME/.cache/drdros-target (the
+# in-tree target/ dir doesn't work on NTFS — build scripts lose exec
+# bits). Override DRDR_INIT_TARGET_DIR if you've moved the cache.
+DRDR_INIT_TARGET_DIR ?= $(HOME)/.cache/drdros-target
+DRDR_INIT_BIN = $(DRDR_INIT_TARGET_DIR)/x86_64-unknown-linux-musl/release/drdr-init
 
 define DRDR_INIT_BUILD_CMDS
 	cd $(DRDR_INIT_SITE) && \
