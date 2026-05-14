@@ -48,13 +48,29 @@ fn main() {
         Err(e) => println!("[drdr-init] no framebuffer splash: {e} (continuing)"),
     }
 
-    println!("[drdr-init] handing control to /bin/sh...");
-
-    // exec() replaces THIS process image with /bin/sh. On success it never
-    // returns — the calling process ceases to exist. The only way we reach
-    // the line after is if exec failed (e.g. /bin/sh missing).
-    let err = Command::new("/bin/sh").exec();
-    eprintln!("[drdr-init] FATAL: could not exec /bin/sh: {err}");
+    // Prefer DrDrShell when it's installed; fall back to BusyBox /bin/sh
+    // for early-bring-up boots where drdr-apps isn't in the rootfs yet.
+    let shells: &[&str] = &["/bin/drdr-shell", "/bin/sh"];
+    let mut last_err: Option<std::io::Error> = None;
+    for shell in shells {
+        if !std::path::Path::new(shell).exists() {
+            continue;
+        }
+        println!("[drdr-init] handing control to {shell}...");
+        // exec() replaces THIS process image. On success it never returns —
+        // the calling process ceases to exist. We only reach the line
+        // below if exec failed (e.g. the binary is corrupt).
+        let err = Command::new(shell).exec();
+        eprintln!("[drdr-init] could not exec {shell}: {err}");
+        last_err = Some(err);
+    }
+    eprintln!(
+        "[drdr-init] FATAL: no shell could be executed (last error: {})",
+        last_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no shell found".into())
+    );
 
     // PID 1 must NEVER exit (the kernel panics if it does), so if we get
     // here, park the thread forever instead of returning from main().

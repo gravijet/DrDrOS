@@ -56,6 +56,8 @@ BR2_INIT_NONE=y
 # `make ... BR2_EXTERNAL=$(pwd)/buildroot/external defconfig` makes
 # these options available; otherwise they're silently ignored.
 BR2_PACKAGE_DRDR_INIT=y
+BR2_PACKAGE_DRDR_APPS=y
 
 # BusyBox itself stays enabled so we still have /bin/sh + standard
-# coreutils — drdr-init currently exec()'s /bin/sh for Tier 2.
+# coreutils as a fallback. drdr-init tries /bin/drdr-shell first and
+# falls back to /bin/sh if our shell hasn't been installed.
