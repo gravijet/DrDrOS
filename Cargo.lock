@@ -39,6 +39,8 @@ dependencies = [
 name = "drdr-init"
 version = "0.1.0"
 dependencies = [
+ "drdr-font",
+ "drdr-ui",
  "nix",
 ]
 

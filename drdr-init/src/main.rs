@@ -1,23 +1,27 @@
-//! drdr-init — PID 1 for DrDrOS (Tier 1: console boot, no framebuffer yet).
+//! drdr-init — PID 1 for DrDrOS (Tier 2: framebuffer splash + shell).
 //!
 //! When the Linux kernel finishes booting it unpacks our initramfs into RAM
 //! and runs `/init` as process ID 1 — that's us. As PID 1 we are responsible
 //! for everything userland: mounting pseudo-filesystems, reaping orphans,
 //! and launching the program the human actually interacts with.
 //!
-//! This tier does the minimum useful work:
+//! Tier 2 work:
 //!   1. Mount /proc, /sys, /dev (three virtual filesystems the rest of
 //!      userland expects to find).
-//!   2. Print a banner so we can confirm we ran.
-//!   3. exec() into /bin/sh, replacing ourselves with the shell — the
-//!      shell now lives as PID 1 and we no longer need to reap zombies.
+//!   2. Print a console banner so serial-only setups still see us.
+//!   3. Open /dev/fb0 and paint the boot splash with DrDrFont. Failures
+//!      here are non-fatal — headless QEMU and serial-only boots simply
+//!      skip the splash.
+//!   4. exec() into /bin/sh, replacing ourselves with the shell.
 //!
-//! Tier 2 (Phase 1 finale): draw the framebuffer splash before exec.
-//! Tier 3 (Phase 2):        exec drdr-shell instead of /bin/sh.
+//! Tier 3 (Phase 2): exec drdr-shell instead of /bin/sh, keep PID 1
+//! around as a supervisor that reaps orphans and respawns the shell.
 
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
+use drdr_ui::{Framebuffer, Pixel};
 use nix::mount::{MsFlags, mount};
 
 fn main() {
@@ -36,6 +40,13 @@ fn main() {
     mount_pseudo("sysfs", "/sys", "sysfs", common);
     // /dev MUST allow device nodes (that's its whole point), so only NOSUID.
     mount_pseudo("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID);
+
+    // Paint the splash. Any failure here just logs and continues — we still
+    // want the shell on headless / serial-only boots where there's no fb0.
+    match draw_splash("/dev/fb0") {
+        Ok(()) => println!("[drdr-init] framebuffer splash painted"),
+        Err(e) => println!("[drdr-init] no framebuffer splash: {e} (continuing)"),
+    }
 
     println!("[drdr-init] handing control to /bin/sh...");
 
@@ -66,6 +77,44 @@ fn print_banner() {
     println!("  ║                                                          ║");
     println!("  ╚══════════════════════════════════════════════════════════╝");
     println!();
+}
+
+/// Open the framebuffer at `path` and paint the DrDrOS splash on it.
+///
+/// Layout (all coordinates relative to the screen's top-left):
+///   - whole screen filled with a deep blue background
+///   - one centred line: "DrDrOS booting..."  (white on blue, 2× scale via
+///     extra padding cells — actually drawn at 1× for Phase 1)
+///   - one centred sub-line below: "Phase 1"
+///
+/// The function is intentionally cheap (no animation, no timer): PID 1
+/// hits exec() within milliseconds of returning, so the splash is the
+/// *last* thing the framebuffer shows before the shell takes the console.
+fn draw_splash(path: &str) -> std::io::Result<()> {
+    let mut fb = Framebuffer::open(path)?;
+
+    let bg = Pixel::rgb(0x10, 0x18, 0x40); // deep blue, the DrDrOS background
+    let fg = Pixel::WHITE;
+    fb.clear(bg);
+
+    // Centre two short lines vertically around the middle of the screen.
+    let title = "DrDrOS booting...";
+    let sub = "Phase 1";
+
+    let title_w = GLYPH_WIDTH * title.len() as u32;
+    let sub_w = GLYPH_WIDTH * sub.len() as u32;
+
+    // `saturating_sub` so tiny framebuffers (smaller than the text) still
+    // render — they just clip to the left edge instead of underflowing.
+    let title_x = fb.width.saturating_sub(title_w) / 2;
+    let sub_x = fb.width.saturating_sub(sub_w) / 2;
+    let title_y = fb.height / 2 - GLYPH_HEIGHT;
+    let sub_y = fb.height / 2 + GLYPH_HEIGHT / 2;
+
+    draw_text(&mut fb, title_x, title_y, title, fg, bg);
+    draw_text(&mut fb, sub_x, sub_y, sub, fg, bg);
+
+    Ok(())
 }
 
 /// Mount a single pseudo-filesystem; log success or failure, never panic.
