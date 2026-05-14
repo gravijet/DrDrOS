@@ -27,6 +27,9 @@ version = "0.1.0"
 [[package]]
 name = "drdr-files"
 version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "drdr-font"

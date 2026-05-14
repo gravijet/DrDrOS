@@ -1,0 +1,16 @@
+# Workspace-wide cargo overrides for DrDrOS.
+#
+# Why this file exists
+# ────────────────────
+# The repo lives on an NTFS partition mounted with `fmask=133`, which
+# strips the execute bit from every file. Cargo's build scripts (any
+# crate with a build.rs — e.g. `nix`, `libc`) compile to ELF binaries
+# that cargo then tries to RUN; on NTFS the freshly written file lacks
+# its exec bit and the run fails with "Permission denied". Pointing
+# `target-dir` at an ext4 location (here under $HOME/.cache) sidesteps
+# the issue entirely.
+#
+# If you move the repo to a Linux-native filesystem, you can delete
+# this file — the default `target/` next to Cargo.toml works fine.
+[build]
+target-dir = "/home/benjamin/.cache/drdros-target"

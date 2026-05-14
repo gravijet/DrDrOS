@@ -13,3 +13,8 @@ license.workspace      = true
 [[bin]]
 name = "drdr-files"
 path = "src/main.rs"
+
+[dependencies]
+# Tier 2: termios raw mode for interactive navigation. `term` feature
+# enables nix::sys::termios on Unix.
+nix = { version = "0.31.3", features = ["term"] }
