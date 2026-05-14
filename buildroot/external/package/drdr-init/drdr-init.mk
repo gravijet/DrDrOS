@@ -15,7 +15,7 @@ DRDR_INIT_VERSION  = 0.1.0
 DRDR_INIT_SITE     = $(BR2_EXTERNAL_DRDROS_PATH)/../..
 DRDR_INIT_SITE_METHOD = local
 DRDR_INIT_LICENSE  = MIT OR Apache-2.0
-# DRDR_INIT_LICENSE_FILES is left unset until we ship LICENSE texts.
+DRDR_INIT_LICENSE_FILES = LICENSE-MIT LICENSE-APACHE
 
 # Where cargo drops the cross-compiled binary. .cargo/config.toml at the
 # repo root redirects target-dir to $HOME/.cache/drdros-target (the
