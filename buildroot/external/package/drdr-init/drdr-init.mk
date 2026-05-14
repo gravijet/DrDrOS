@@ -12,7 +12,11 @@
 ################################################################################
 
 DRDR_INIT_VERSION  = 0.1.0
-DRDR_INIT_SITE     = $(BR2_EXTERNAL_DRDROS_PATH)/../..
+# scripts/build-buildroot.sh maintains a clean mirror of the workspace
+# at $(HOME)/.cache/drdros-src (without buildroot/upstream/output and
+# other heavy excludes). Override DRDR_SRC_MIRROR if you've moved it.
+DRDR_SRC_MIRROR   ?= $(HOME)/.cache/drdros-src
+DRDR_INIT_SITE     = $(DRDR_SRC_MIRROR)
 DRDR_INIT_SITE_METHOD = local
 DRDR_INIT_LICENSE  = MIT OR Apache-2.0
 DRDR_INIT_LICENSE_FILES = LICENSE-MIT LICENSE-APACHE
