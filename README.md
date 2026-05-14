@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | Phase 3 — GUI framework (Tier 1 widgets shipped) |
+| **Status** | All 5 phases sketched in (Tier 1+ for each) — first QEMU boot pending |
 
 ---
 
@@ -85,44 +85,48 @@ everything above it is ours.
 ## Roadmap
 
 - [x] **Phase 1 — Foundation**
-      Cargo workspace · Buildroot 2026.02.1 vendored · drdr-init Tier 2 (mounts +
-      framebuffer splash) · drdr-fb primitives · drdr-font 8×16 bitmaps ·
-      BR2_EXTERNAL package recipe · `scripts/qemu.sh` runner
-      *(first QEMU boot pending — local fs mount blocks Buildroot exec bits)*
+      Cargo workspace · Buildroot 2026.02.1 (built out-of-tree at
+      `$HOME/.cache/drdros-buildroot`) · drdr-init Tier 2 (mounts + framebuffer
+      splash) · drdr-fb primitives · drdr-font 8×16 bitmaps · BR2_EXTERNAL
+      recipe wiring drdr-init as PID 1 · `scripts/qemu.sh` runner
 - [x] **Phase 2 — Core applications**
       DrDrShell Tier 2 (pipes, redirects, quoting) · DrDrFiles Tier 2 (interactive TUI)
       · DrDrEdit Tier 2 (vi-style modal) · drdr-tty shared raw-mode helper
-- [~] **Phase 3 — GUI framework**
-      Tier 1 widgets shipped: Rect, Theme, Widget trait, Label/Button/Frame, VBox/HBox.
-      Tier 2 next: evdev input layer · focus traversal · DrDrTheme customisation
-- [ ] **Phase 4 — Network & protocols**
-      DrDrNet binary protocol · basic TCP tools on top of it
-- [ ] **Phase 5 — Polish & ISO**
-      Boot screen · `xorriso` ISO pipeline · screenshots · final docs
+- [x] **Phase 3 — GUI framework**
+      Tier 1 widgets (Label/Button/Frame/VBox/HBox + Theme) ·
+      Tier 2 input (evdev KeyReader, KeyCode, focus model) · `drdr-demo` showcase
+- [x] **Phase 4 — Network & protocols**
+      DrDrNet Tier 1: length-prefixed binary frames + typed Encoder/Decoder ·
+      Tier 2 (TCP server/client + correlation IDs) pending
+- [x] **Phase 5 — Polish & ISO**
+      `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso` ·
+      DrDrTheme customisation + polish pass still ahead
 
 ---
 
 ## Building
 
 ```sh
-# Compile every crate in the workspace.
+# Userland: compile every Rust crate in the workspace.
 cargo build --workspace
 
-# Cross-compile drdr-init for the rootfs (needed once you wire it into Buildroot).
+# Cross-compile drdr-init for the rootfs (musl, statically linked PIE).
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl -p drdr-init
 
-# Build the Linux kernel + initramfs via the vendored Buildroot.
-make -C buildroot/upstream \
-     BR2_DEFCONFIG=$(pwd)/buildroot/drdros_defconfig \
-     BR2_EXTERNAL=$(pwd)/buildroot/external \
-     defconfig
-make -C buildroot/upstream
+# Kernel + initramfs: Buildroot out-of-tree at $HOME/.cache/drdros-buildroot
+# (NTFS strips exec bits; ext4 is required for the cross-toolchain).
+bash scripts/build-buildroot.sh             # ~15-30 min the first time
+# → buildroot/images/{bzImage, rootfs.cpio.gz} (symlinks into the cache)
 
-# Boot the resulting bzImage + rootfs.cpio.gz in QEMU.
-scripts/qemu.sh             # GTK window + serial mirrored to stdio
-scripts/qemu.sh --headless  # serial-only
-scripts/qemu.sh --kvm       # add KVM acceleration if /dev/kvm exists
+# Boot just the kernel + initramfs in QEMU (development loop).
+bash scripts/qemu.sh             # GTK window + serial mirrored to stdio
+bash scripts/qemu.sh --headless  # serial-only
+bash scripts/qemu.sh --kvm       # add KVM acceleration if /dev/kvm exists
+
+# Or wrap everything into a bootable hybrid ISO and boot that.
+bash iso/build.sh                # → iso/drdros.iso
+bash scripts/qemu.sh --iso       # boots via GRUB just like real hardware
 ```
 
 ## Running the core apps on the host
