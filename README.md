@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | Phase 2 — Core Apps (Tier 1 of each shipped) |
+| **Status** | Phase 3 — GUI framework (Tier 1 widgets shipped) |
 
 ---
 
@@ -68,14 +68,17 @@ everything above it is ours.
 | Crate / dir | Kind | Purpose |
 |---|---|---|
 | **drdr-init** | binary | PID 1 — boots the userland, draws the splash, launches DrDrShell |
-| **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, history, autocomplete |
-| **drdr-edit** | binary | DrDrEdit — text editor; RAM-resident; keyboard-driven |
-| **drdr-files** | binary | DrDrFiles — file manager; keyboard navigation |
-| **drdr-ui** | library | DrDrUI — windows, buttons, inputs, focus on the framebuffer |
-| **drdr-font** | library | DrDrFont — hand-drawn bitmap font renderer |
+| **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, quoting |
+| **drdr-edit** | binary | DrDrEdit — vi-style modal text editor; RAM-resident |
+| **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
+| **drdr-fb** | library | DrDrFb — direct framebuffer access (`/dev/fb0`) |
+| **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyph renderer |
+| **drdr-ui** | library | DrDrUI — widgets (Label/Button/Frame/VBox/HBox), Theme |
+| **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
 | **drdr-net** | library | DrDrNet — custom binary network protocol (not HTTP) |
-| **buildroot/** | tooling | Buildroot config producing the minimal Linux base |
+| **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe for drdr-init |
 | **iso/** | tooling | xorriso pipeline producing the bootable `drdros.iso` |
+| **scripts/qemu.sh** | tooling | Boot the bzImage + rootfs.cpio.gz under QEMU |
 
 ---
 
@@ -83,14 +86,15 @@ everything above it is ours.
 
 - [x] **Phase 1 — Foundation**
       Cargo workspace · Buildroot 2026.02.1 vendored · drdr-init Tier 2 (mounts +
-      framebuffer splash) · drdr-ui::fb primitives · drdr-font 8×16 bitmaps ·
+      framebuffer splash) · drdr-fb primitives · drdr-font 8×16 bitmaps ·
       BR2_EXTERNAL package recipe · `scripts/qemu.sh` runner
       *(first QEMU boot pending — local fs mount blocks Buildroot exec bits)*
-- [~] **Phase 2 — Core applications**
-      DrDrShell Tier 1 · DrDrEdit Tier 1 · DrDrFiles Tier 1 (all host-runnable).
-      Tier 2 next: pipes/redirects/history · raw-mode TTY navigation
-- [ ] **Phase 3 — GUI framework**
-      DrDrUI · DrDrFont · DrDrTheme (dark, minimal)
+- [x] **Phase 2 — Core applications**
+      DrDrShell Tier 2 (pipes, redirects, quoting) · DrDrFiles Tier 2 (interactive TUI)
+      · DrDrEdit Tier 2 (vi-style modal) · drdr-tty shared raw-mode helper
+- [~] **Phase 3 — GUI framework**
+      Tier 1 widgets shipped: Rect, Theme, Widget trait, Label/Button/Frame, VBox/HBox.
+      Tier 2 next: evdev input layer · focus traversal · DrDrTheme customisation
 - [ ] **Phase 4 — Network & protocols**
       DrDrNet binary protocol · basic TCP tools on top of it
 - [ ] **Phase 5 — Polish & ISO**
