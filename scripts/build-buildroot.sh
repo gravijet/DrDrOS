@@ -10,6 +10,7 @@
 # Usage:
 #   scripts/build-buildroot.sh defconfig    # generate .config from drdros_defconfig
 #   scripts/build-buildroot.sh              # full build → bzImage + rootfs.cpio.gz
+#   scripts/build-buildroot.sh kernel       # re-merge linux-fb.config + rebuild kernel
 #   scripts/build-buildroot.sh menuconfig   # interactive Kconfig
 #   scripts/build-buildroot.sh clean        # wipe output/
 #
@@ -19,6 +20,21 @@
 #   Both are symlinked into ./buildroot/images/ for `scripts/qemu.sh`.
 
 set -euo pipefail
+
+# NEVER run this as root / via sudo. Buildroot itself warns against it,
+# but the concrete failure here is sharper: the drdr-* packages
+# cross-compile with `cargo`, which is installed per-user via rustup
+# under $HOME/.cargo + $HOME/.rustup. Under sudo, $HOME becomes /root,
+# cargo is not on root's PATH, the musl target isn't installed there,
+# and the drdr-apps build dies with "cargo: command not found" *after*
+# wasting a full toolchain+kernel rebuild into /root/.cache. Run as you.
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    echo "error: do not run this as root / via sudo." >&2
+    echo "  Buildroot and the cargo cross-build are per-user; sudo sets" >&2
+    echo "  HOME=/root where rustup/cargo do not exist. Re-run as:" >&2
+    echo "    scripts/build-buildroot.sh ${*:-}" >&2
+    exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BR="${BR:-$HOME/.cache/drdros-buildroot}"
@@ -62,12 +78,32 @@ case "$target" in
     defconfig|menuconfig|savedefconfig|clean|distclean)
         make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" "$target"
         ;;
+    kernel)
+        # Force the kernel to re-merge linux-fb.config and rebuild. Use
+        # this after editing buildroot/external/linux-fb.config or the
+        # BR2_LINUX_KERNEL_* options: a plain `all` build will NOT pick
+        # up a changed/added fragment, because Buildroot keys rebuilds
+        # off per-package stamp files, not the Buildroot .config. This
+        # path is deliberately separate from `all` so normal builds
+        # don't eat a multi-minute kernel recompile every run.
+        sync_mirror
+        make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" defconfig
+        jobs=$(($(nproc) - 1))
+        [[ $jobs -lt 1 ]] && jobs=1
+        echo "[build-buildroot] reconfiguring + rebuilding kernel (-j$jobs)"
+        make BR2_EXTERNAL="$EXTERNAL" linux-reconfigure
+        make BR2_EXTERNAL="$EXTERNAL" -j"$jobs"
+        ;;
     all|"")
         sync_mirror
-        # Defconfig first if .config is missing.
-        if [[ ! -f .config ]]; then
-            make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" defconfig
-        fi
+        # ALWAYS regenerate .config from the repo defconfig. Doing this
+        # only "if .config is missing" once let a stale .config (frozen
+        # before BR2_PACKAGE_DRDR_APPS existed) silently ship an OS with
+        # no shell/editor/filemanager. `defconfig` is ~instant and only
+        # forces rebuilds of packages whose config actually changed, so
+        # running it unconditionally is safe and makes the repo defconfig
+        # the single source of truth.
+        make BR2_DEFCONFIG="$DEFCONFIG" BR2_EXTERNAL="$EXTERNAL" defconfig
         # Use one less than all cores so the laptop stays responsive.
         jobs=$(($(nproc) - 1))
         [[ $jobs -lt 1 ]] && jobs=1
@@ -75,7 +111,7 @@ case "$target" in
         make BR2_EXTERNAL="$EXTERNAL" -j"$jobs"
         ;;
     *)
-        echo "usage: $0 [defconfig|menuconfig|all|clean]" >&2
+        echo "usage: $0 [defconfig|menuconfig|kernel|all|clean]" >&2
         exit 2
         ;;
 esac
