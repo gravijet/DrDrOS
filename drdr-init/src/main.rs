@@ -1,28 +1,46 @@
-//! drdr-init — PID 1 for DrDrOS (Tier 2: framebuffer splash + shell).
+//! drdr-init — PID 1 for DrDrOS (Tier 3: framebuffer splash + supervisor).
 //!
 //! When the Linux kernel finishes booting it unpacks our initramfs into RAM
 //! and runs `/init` as process ID 1 — that's us. As PID 1 we are responsible
-//! for everything userland: mounting pseudo-filesystems, reaping orphans,
-//! and launching the program the human actually interacts with.
+//! for everything userland: mounting pseudo-filesystems, reaping orphaned
+//! children, and keeping the program the human interacts with alive.
 //!
-//! Tier 2 work:
+//! Tier 3 work (this file):
 //!   1. Mount /proc, /sys, /dev (three virtual filesystems the rest of
 //!      userland expects to find).
 //!   2. Print a console banner so serial-only setups still see us.
-//!   3. Open /dev/fb0 and paint the boot splash with DrDrFont. Failures
-//!      here are non-fatal — headless QEMU and serial-only boots simply
-//!      skip the splash.
-//!   4. exec() into /bin/sh, replacing ourselves with the shell.
+//!   3. Open /dev/fb0 and paint the boot splash in the real DrDrTheme
+//!      colors. Failures here are non-fatal — headless QEMU and
+//!      serial-only boots simply skip the splash.
+//!   4. **Supervise** the graphical session: *spawn* (not exec) the best
+//!      available session program, wait for it, and respawn it if it ever
+//!      exits. While waiting we reap every orphaned zombie the kernel
+//!      reparents onto us. PID 1 never returns.
 //!
-//! Tier 3 (Phase 2): exec drdr-shell instead of /bin/sh, keep PID 1
-//! around as a supervisor that reaps orphans and respawns the shell.
+//! Why a supervisor and not `exec()`?  `exec()` *replaces* PID 1 with the
+//! session — if that program then crashes, there is no PID 1 left and the
+//! kernel panics ("Attempted to kill init!"). A supervisor keeps PID 1
+//! resident, so a desktop crash is just a flicker-and-redraw, not a dead
+//! machine.
 
-use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
-use drdr_fb::{Framebuffer, Pixel};
+use drdr_fb::Framebuffer;
 use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
+use drdr_ui::Theme;
+use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::Pid;
+
+/// Programs we will try to run as the session, best first. The graphical
+/// desktop is the goal; the others are fallbacks so an early-bring-up
+/// rootfs (drdr-apps not installed yet) still boots to *something*
+/// interactive instead of a dead console.
+const SESSION_CANDIDATES: &[&str] = &["/bin/drdr-desk", "/bin/drdr-shell", "/bin/sh"];
 
 fn main() {
     print_banner();
@@ -42,40 +60,125 @@ fn main() {
     mount_pseudo("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID);
 
     // Paint the splash. Any failure here just logs and continues — we still
-    // want the shell on headless / serial-only boots where there's no fb0.
+    // want the session on headless / serial-only boots where there's no fb0.
     match draw_splash("/dev/fb0") {
         Ok(()) => println!("[drdr-init] framebuffer splash painted"),
         Err(e) => println!("[drdr-init] no framebuffer splash: {e} (continuing)"),
     }
 
-    // Prefer DrDrShell when it's installed; fall back to BusyBox /bin/sh
-    // for early-bring-up boots where drdr-apps isn't in the rootfs yet.
-    let shells: &[&str] = &["/bin/drdr-shell", "/bin/sh"];
-    let mut last_err: Option<std::io::Error> = None;
-    for shell in shells {
-        if !std::path::Path::new(shell).exists() {
-            continue;
-        }
-        println!("[drdr-init] handing control to {shell}...");
-        // exec() replaces THIS process image. On success it never returns —
-        // the calling process ceases to exist. We only reach the line
-        // below if exec failed (e.g. the binary is corrupt).
-        let err = Command::new(shell).exec();
-        eprintln!("[drdr-init] could not exec {shell}: {err}");
-        last_err = Some(err);
-    }
-    eprintln!(
-        "[drdr-init] FATAL: no shell could be executed (last error: {})",
-        last_err
-            .as_ref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "no shell found".into())
-    );
+    supervise();
+}
 
-    // PID 1 must NEVER exit (the kernel panics if it does), so if we get
-    // here, park the thread forever instead of returning from main().
+/// The supervisor loop. Never returns — PID 1 must stay resident for the
+/// entire life of the machine.
+///
+/// Each iteration:
+///   1. pick the best session program that actually exists,
+///   2. *spawn* it as a child (we keep our own process image),
+///   3. block in [`reap_until`], which reaps every child the kernel hands
+///      us and only returns when *our* session child is the one that died,
+///   4. small backoff, then respawn.
+fn supervise() -> ! {
     loop {
-        std::thread::park();
+        let Some(prog) = SESSION_CANDIDATES.iter().find(|p| Path::new(p).exists()) else {
+            // Nothing to run yet. Don't busy-spin: wait a few seconds and
+            // re-check (a device or mount might still be settling).
+            eprintln!(
+                "[drdr-init] no session program found ({}); retrying in 3s",
+                SESSION_CANDIDATES.join(", ")
+            );
+            thread::sleep(Duration::from_secs(3));
+            continue;
+        };
+
+        println!("[drdr-init] starting session: {prog}");
+        let child = match Command::new(prog).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[drdr-init] could not spawn {prog}: {e}; retrying in 2s");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        let session_pid = Pid::from_raw(child.id() as i32);
+
+        // We manage the wait ourselves via waitpid(-1), so we must NOT let
+        // std also try to reap this child. Leaking the handle is safe:
+        // `Child`'s Drop does not kill or wait on the process.
+        std::mem::forget(child);
+
+        match reap_until(session_pid) {
+            SessionEnd::Exited(code) => {
+                println!("[drdr-init] session {prog} exited ({code}); respawning");
+            }
+            SessionEnd::Signalled(sig) => {
+                println!("[drdr-init] session {prog} killed by signal {sig}; respawning");
+            }
+            SessionEnd::NoChildren => {
+                eprintln!("[drdr-init] session {prog} vanished before we could wait; respawning");
+            }
+        }
+
+        // Backoff so a session that crashes immediately can't peg the CPU
+        // in a tight spawn/die loop.
+        thread::sleep(Duration::from_millis(800));
+    }
+}
+
+/// How the session process ended (used only for the log line).
+enum SessionEnd {
+    Exited(i32),
+    Signalled(i32),
+    NoChildren,
+}
+
+/// Block reaping children until the one identified by `session_pid` dies.
+///
+/// As PID 1 we are the parent-of-last-resort: when any process anywhere
+/// loses its real parent, the kernel reparents it onto us, and when it
+/// exits it becomes a zombie that *only we* can clear by `wait`-ing for
+/// it. So we loop on `waitpid(-1)` (any child), silently reaping orphans,
+/// and only return once `session_pid` itself is the process that exited.
+fn reap_until(session_pid: Pid) -> SessionEnd {
+    loop {
+        // `None` for the second arg = blocking wait (no WNOHANG): we sleep
+        // until *some* child changes state instead of busy-polling.
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(status) => {
+                let pid = status.pid();
+                let is_session = pid == Some(session_pid);
+                match status {
+                    WaitStatus::Exited(_, code) => {
+                        if is_session {
+                            return SessionEnd::Exited(code);
+                        }
+                        // An orphan we just cleaned up. Note it and keep going.
+                        if let Some(p) = pid {
+                            println!("[drdr-init] reaped orphan pid {p} (exit {code})");
+                        }
+                    }
+                    WaitStatus::Signaled(_, sig, _) => {
+                        if is_session {
+                            return SessionEnd::Signalled(sig as i32);
+                        }
+                        if let Some(p) = pid {
+                            println!("[drdr-init] reaped orphan pid {p} (signal {sig:?})");
+                        }
+                    }
+                    // Stopped/Continued/etc. — not an exit; keep waiting.
+                    _ => {}
+                }
+            }
+            // No children at all: the session must have been reaped already
+            // (or never started). Let the supervisor respawn it.
+            Err(Errno::ECHILD) => return SessionEnd::NoChildren,
+            // Interrupted by a signal — just retry the wait.
+            Err(Errno::EINTR) => continue,
+            Err(e) => {
+                eprintln!("[drdr-init] waitpid error: {e}; respawning session");
+                return SessionEnd::NoChildren;
+            }
+        }
     }
 }
 
@@ -95,27 +198,28 @@ fn print_banner() {
     println!();
 }
 
-/// Open the framebuffer at `path` and paint the DrDrOS splash on it.
+/// Open the framebuffer at `path` and paint the DrDrOS boot splash, in the
+/// same [`Theme::DRDR`] palette the desktop uses so boot is visually
+/// continuous (no jarring color change when the session takes over).
 ///
 /// Layout (all coordinates relative to the screen's top-left):
-///   - whole screen filled with a deep blue background
-///   - one centred line: "DrDrOS booting..."  (white on blue, 2× scale via
-///     extra padding cells — actually drawn at 1× for Phase 1)
-///   - one centred sub-line below: "Phase 1"
+///   - whole screen filled with the theme background
+///   - centred "DrDrOS" wordmark in primary text
+///   - centred "starting the desktop..." sub-line in muted text
 ///
-/// The function is intentionally cheap (no animation, no timer): PID 1
-/// hits exec() within milliseconds of returning, so the splash is the
-/// *last* thing the framebuffer shows before the shell takes the console.
+/// The function is intentionally cheap (no animation, no timer): the
+/// supervisor spawns the session within milliseconds, which repaints the
+/// screen itself — the splash just covers the gap so the user never stares
+/// at a blank/garbage framebuffer.
 fn draw_splash(path: &str) -> std::io::Result<()> {
     let mut fb = Framebuffer::open(path)?;
 
-    let bg = Pixel::rgb(0x10, 0x18, 0x40); // deep blue, the DrDrOS background
-    let fg = Pixel::WHITE;
-    fb.clear(bg);
+    let theme = Theme::DRDR;
+    fb.clear(theme.bg);
 
     // Centre two short lines vertically around the middle of the screen.
-    let title = "DrDrOS booting...";
-    let sub = "Phase 1";
+    let title = "DrDrOS";
+    let sub = "starting the desktop...";
 
     let title_w = GLYPH_WIDTH * title.len() as u32;
     let sub_w = GLYPH_WIDTH * sub.len() as u32;
@@ -127,8 +231,8 @@ fn draw_splash(path: &str) -> std::io::Result<()> {
     let title_y = fb.height / 2 - GLYPH_HEIGHT;
     let sub_y = fb.height / 2 + GLYPH_HEIGHT / 2;
 
-    draw_text(&mut fb, title_x, title_y, title, fg, bg);
-    draw_text(&mut fb, sub_x, sub_y, sub, fg, bg);
+    draw_text(&mut fb, title_x, title_y, title, theme.fg, theme.bg);
+    draw_text(&mut fb, sub_x, sub_y, sub, theme.muted, theme.bg);
 
     Ok(())
 }

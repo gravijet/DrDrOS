@@ -18,6 +18,7 @@ members = [
     "drdr-tty",
     "drdr-fb",
     "drdr-demo",
+    "drdr-desk",
 ]
 
 # Shared metadata. Each crate inherits these via `field.workspace = true`,

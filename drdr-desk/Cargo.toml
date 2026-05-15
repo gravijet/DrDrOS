@@ -1,0 +1,26 @@
+# drdr-desk — DrDrDesk, the DrDrOS graphical session / desktop shell.
+#
+# This is the program a user actually lands in after boot: a framebuffer
+# desktop with a keyboard-driven launcher for the other DrDr apps.
+# drdr-init (PID 1) supervises and respawns it.
+
+[package]
+name        = "drdr-desk"
+description = "DrDrDesk — DrDrOS framebuffer desktop + app launcher."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[[bin]]
+name = "drdr-desk"
+path = "src/main.rs"
+
+[dependencies]
+drdr-fb   = { path = "../drdr-fb" }
+drdr-font = { path = "../drdr-font" }
+drdr-ui   = { path = "../drdr-ui" }
+# reboot(2) / poweroff for the launcher's power entries.
+nix = { version = "0.31.3", features = ["reboot"] }
