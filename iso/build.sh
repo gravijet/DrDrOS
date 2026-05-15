@@ -44,6 +44,15 @@ if ! command -v grub-mkrescue >/dev/null; then
     echo "iso/build.sh: grub-mkrescue not found — install grub-common + xorriso" >&2
     exit 1
 fi
+# grub-mkrescue shells out to mtools (mformat/mcopy) to build the EFI
+# System Partition FAT image. Without it the run dies late with a cryptic
+# "mformat invocation failed" and writes no ISO — catch it up front.
+if ! command -v mformat >/dev/null; then
+    echo "iso/build.sh: mformat not found — install mtools (grub-mkrescue" >&2
+    echo "  needs it to build the embedded EFI boot image)" >&2
+    echo "  → sudo apt-get install -y mtools" >&2
+    exit 1
+fi
 if [[ ! -f $BZIMAGE ]]; then
     echo "iso/build.sh: kernel image not found: $BZIMAGE" >&2
     echo "  → run scripts/build-buildroot.sh first" >&2
