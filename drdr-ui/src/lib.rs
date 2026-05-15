@@ -23,12 +23,17 @@
 //! goes down — same as the framebuffer underneath.
 
 pub mod input;
+pub mod window;
 
 use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
-pub use input::{Event, EventResponse, KeyCode, KeyReader};
+pub use input::{
+    detect_keyboard, detect_mouse, Event, EventResponse, HubEvent, InputHub, KeyCode, KeyReader,
+    MouseButton, MouseEvent, PointerReader,
+};
+pub use window::{AppControl, Cell, TextGrid, Window, WindowApp, WindowManager};
 
 // ─── Geometry ────────────────────────────────────────────────────────
 

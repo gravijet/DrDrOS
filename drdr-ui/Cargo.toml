@@ -20,3 +20,7 @@ path = "src/lib.rs"
 # via drdr-font's bitmap glyphs.
 drdr-fb   = { path = "../drdr-fb" }
 drdr-font = { path = "../drdr-font" }
+# Tier 2 input multiplexing: poll(2) over the keyboard + mouse fds so
+# the window manager can watch both at once. "poll" is the only nix
+# feature we need here — no async runtime, no extra transitive weight.
+nix = { version = "0.31.3", features = ["poll"] }

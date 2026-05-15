@@ -23,6 +23,8 @@
 //! resident, so a desktop crash is just a flicker-and-redraw, not a dead
 //! machine.
 
+mod net;
+
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -58,6 +60,19 @@ fn main() {
     mount_pseudo("sysfs", "/sys", "sysfs", common);
     // /dev MUST allow device nodes (that's its whole point), so only NOSUID.
     mount_pseudo("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID);
+
+    // Set the kernel hostname from /etc/hostname, like any real init —
+    // the kernel boots with hostname "(none)" until userland sets it.
+    // Non-fatal cosmetic step (the DrDrNet panel shows it).
+    set_hostname();
+
+    // Bring the loopback interface up so userland TCP works (the DrDrDesk
+    // "DrDrNet" window talks to a local reactor server over 127.0.0.1).
+    // Non-fatal: a desktop with no networking is still perfectly usable.
+    match net::bring_up_loopback() {
+        Ok(()) => println!("[drdr-init] loopback up (127.0.0.1/8)"),
+        Err(e) => println!("[drdr-init] loopback bring-up failed: {e} (continuing)"),
+    }
 
     // Paint the splash. Any failure here just logs and continues — we still
     // want the session on headless / serial-only boots where there's no fb0.
@@ -179,6 +194,24 @@ fn reap_until(session_pid: Pid) -> SessionEnd {
                 return SessionEnd::NoChildren;
             }
         }
+    }
+}
+
+/// Apply the configured hostname. Buildroot writes the name into
+/// `/etc/hostname`; the kernel itself starts as "(none)" until some
+/// userland process calls `sethostname(2)`. On a normal distro an init
+/// script does it — here PID 1 is us, so we do it.
+fn set_hostname() {
+    let name = match std::fs::read_to_string("/etc/hostname") {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return, // no config → leave the kernel default
+    };
+    if name.is_empty() {
+        return;
+    }
+    match nix::unistd::sethostname(&name) {
+        Ok(()) => println!("[drdr-init] hostname set to {name}"),
+        Err(e) => println!("[drdr-init] sethostname({name}): {e} (continuing)"),
     }
 }
 

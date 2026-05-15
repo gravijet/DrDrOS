@@ -14,3 +14,10 @@ license.workspace      = true
 [lib]
 name = "drdr_net"
 path = "src/lib.rs"
+
+[dependencies]
+# Tier 3's reactor needs epoll. nix's "event" feature gives us a SAFE
+# wrapper around epoll_create1/epoll_ctl/epoll_wait, so drdr-net keeps
+# its `#![forbid(unsafe_code)]` — the unsafe lives inside nix, audited
+# upstream, not in our protocol code. No async runtime is pulled in.
+nix = { version = "0.31.3", features = ["event"] }

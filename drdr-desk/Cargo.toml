@@ -22,5 +22,10 @@ path = "src/main.rs"
 drdr-fb   = { path = "../drdr-fb" }
 drdr-font = { path = "../drdr-font" }
 drdr-ui   = { path = "../drdr-ui" }
-# reboot(2) / poweroff for the launcher's power entries.
+# The "DrDrNet" status window is a real client of DrDrNet's Tier 3 async
+# reactor: DrDrDesk runs the reactor server in a background thread and
+# the window polls it over loopback TCP. Proves the protocol with an
+# actual app, not just unit tests.
+drdr-net  = { path = "../drdr-net" }
+# reboot(2) / poweroff for the System window's power entries.
 nix = { version = "0.31.3", features = ["reboot"] }
