@@ -53,6 +53,19 @@ if ! command -v mformat >/dev/null; then
     echo "  → sudo apt-get install -y mtools" >&2
     exit 1
 fi
+# grub-mkrescue only embeds a legacy-BIOS El Torito boot image if the
+# BIOS GRUB modules (package grub-pc-bin) are present. Without them the
+# ISO is UEFI-only: it boots fine on modern machines and under
+# `scripts/qemu.sh --iso --uefi`, but SeaBIOS (plain `--iso`) and older
+# BIOS-only PCs will report "No bootable device". Warn, don't fail —
+# a UEFI-only ISO is still a valid, useful artifact.
+if [[ ! -d /usr/lib/grub/i386-pc ]]; then
+    echo "iso/build.sh: WARNING — grub-pc-bin not found" >&2
+    echo "  → the ISO will be UEFI-only (no legacy-BIOS boot)." >&2
+    echo "  → boot it with: scripts/qemu.sh --iso --uefi" >&2
+    echo "  → for BIOS boot too: sudo apt-get install -y grub-pc-bin" >&2
+fi
+
 if [[ ! -f $BZIMAGE ]]; then
     echo "iso/build.sh: kernel image not found: $BZIMAGE" >&2
     echo "  → run scripts/build-buildroot.sh first" >&2

@@ -37,6 +37,7 @@ SERIAL_ARGS=(-serial stdio)
 APPEND="console=tty0 console=ttyS0 loglevel=4"
 ACCEL=()
 ISO_PATH=""
+UEFI=0
 
 # Parse flags.
 for arg in "$@"; do
@@ -56,8 +57,15 @@ for arg in "$@"; do
         --iso)
             ISO_PATH="$REPO_ROOT/iso/drdros.iso"
             ;;
+        --uefi)
+            # Boot the ISO under UEFI (OVMF) instead of the default
+            # SeaBIOS. Required when the ISO has only a UEFI El Torito
+            # image — i.e. iso/build.sh ran without grub-pc-bin, so no
+            # legacy-BIOS boot image was embedded.
+            UEFI=1
+            ;;
         *)
-            echo "usage: $0 [--headless] [--kvm] [--iso]" >&2
+            echo "usage: $0 [--headless] [--kvm] [--iso] [--uefi]" >&2
             exit 2
             ;;
     esac
@@ -70,14 +78,43 @@ if [[ -n $ISO_PATH ]]; then
         echo "error: $ISO_PATH not found — run iso/build.sh first" >&2
         exit 1
     fi
+    FIRMWARE_ARGS=()
+    if [[ $UEFI -eq 1 ]]; then
+        # Locate an OVMF build. The split CODE/VARS layout is the modern
+        # one; OVMF.fd is the older single-file fallback. VARS is NVRAM,
+        # so QEMU must be able to write it — copy to a private temp file.
+        OVMF_CODE=""
+        for c in /usr/share/OVMF/OVMF_CODE_4M.fd \
+                 /usr/share/OVMF/OVMF_CODE.fd \
+                 /usr/share/ovmf/OVMF.fd; do
+            [[ -f $c ]] && { OVMF_CODE="$c"; break; }
+        done
+        if [[ -z $OVMF_CODE ]]; then
+            echo "error: --uefi needs OVMF — install the 'ovmf' package" >&2
+            exit 1
+        fi
+        OVMF_VARS_SRC="${OVMF_CODE%CODE*}VARS${OVMF_CODE##*CODE}"
+        [[ -f $OVMF_VARS_SRC ]] || OVMF_VARS_SRC="$OVMF_CODE"
+        VARS_TMP="$(mktemp -t drdros-ovmf-vars.XXXXXX.fd)"
+        trap 'rm -f "$VARS_TMP"' EXIT
+        cp "$OVMF_VARS_SRC" "$VARS_TMP"
+        FIRMWARE_ARGS=(
+            -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE"
+            -drive "if=pflash,format=raw,unit=1,file=$VARS_TMP"
+        )
+        echo "[qemu.sh] UEFI firmware: $OVMF_CODE"
+    fi
     echo "[qemu.sh] booting from ISO $ISO_PATH"
-    exec qemu-system-x86_64 \
+    # No `exec`: the EXIT trap that cleans up the OVMF vars copy must run.
+    qemu-system-x86_64 \
         "${ACCEL[@]}" \
+        "${FIRMWARE_ARGS[@]}" \
         -m 256M \
         -cdrom "$ISO_PATH" \
         -boot d \
         "${DISPLAY_ARGS[@]}" \
         "${SERIAL_ARGS[@]}"
+    exit $?
 fi
 
 echo "[qemu.sh] booting $KERNEL + $INITRD"

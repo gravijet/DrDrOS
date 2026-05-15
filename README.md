@@ -104,10 +104,12 @@ everything above it is ours.
       Tier 2: correlation IDs, Codec trait, Conn request/reply, real
       `tcp` transport (std::net, thread-per-conn) · Tier 3 (async) ahead
 - [x] **Phase 5 — Polish & ISO**
-      `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso` ·
-      DrDrTheme polish pass done (semantic roles + WCAG-AA contrast,
-      enforced by test) · ISO boot test needs the `mtools` host package
-      (EFI image step); ISO staging verified complete
+      `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso`
+      (+ `--uefi`) · DrDrTheme polish pass done (semantic roles +
+      WCAG-AA contrast, enforced by test) · **ISO boot test passed**:
+      `iso/drdros.iso` boots end-to-end under UEFI (GRUB → kernel →
+      drdr-init splash → DrDrShell prompt). Legacy-BIOS boot needs
+      `grub-pc-bin` at ISO-build time (build warns if absent)
 
 ---
 
@@ -133,7 +135,8 @@ bash scripts/qemu.sh --kvm       # add KVM acceleration if /dev/kvm exists
 
 # Or wrap everything into a bootable hybrid ISO and boot that.
 bash iso/build.sh                # → iso/drdros.iso
-bash scripts/qemu.sh --iso       # boots via GRUB just like real hardware
+bash scripts/qemu.sh --iso       # boots via GRUB (legacy BIOS)
+bash scripts/qemu.sh --iso --uefi # ...via UEFI/OVMF (UEFI-only ISOs)
 ```
 
 ## Running the core apps on the host
