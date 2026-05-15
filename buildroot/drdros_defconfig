@@ -27,11 +27,15 @@ BR2_TOOLCHAIN_BUILDROOT_MUSL=y
 
 # ─── Linux kernel ───────────────────────────────────────────────────────
 # Build the kernel from upstream sources, starting from the standard
-# `arch/x86/configs/x86_64_defconfig`. This includes many drivers we don't
-# need — we'll add a kernel fragment to trim it down in a later step.
+# `arch/x86/configs/x86_64_defconfig`, then layer our config fragment on
+# top. The stock x86_64 defconfig ships NO framebuffer at all, so
+# linux-fb.config enables a DRM display driver for QEMU's `-vga std`
+# plus the fbdev-emulation layer that creates /dev/fb0 — without it the
+# whole framebuffer-only userland has nothing to draw on.
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_USE_DEFCONFIG=y
 BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DRDROS_PATH)/linux-fb.config"
 
 # ─── Root filesystem ────────────────────────────────────────────────────
 # Ship the rootfs as a gzipped cpio archive (initramfs). The Linux kernel

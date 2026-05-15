@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | All 5 phases sketched in (Tier 1+ for each) — first QEMU boot pending |
+| **Status** | All 5 phases at Tier 1+ · **boots end-to-end in QEMU** — drdr-init → framebuffer splash → DrDrShell |
 
 ---
 
@@ -89,6 +89,10 @@ everything above it is ours.
       `$HOME/.cache/drdros-buildroot`) · drdr-init Tier 2 (mounts + framebuffer
       splash) · drdr-fb primitives · drdr-font 8×16 bitmaps · BR2_EXTERNAL
       recipe wiring drdr-init as PID 1 · `scripts/qemu.sh` runner
+- [x] **First boot** — boots end-to-end under QEMU: custom kernel
+      (`linux-fb.config` fragment adds bochs-drm + fbdev emulation so
+      `/dev/fb0` exists) → drdr-init mounts proc/sys/dev → paints the
+      framebuffer splash → execs `/bin/drdr-shell` to an interactive prompt
 - [x] **Phase 2 — Core applications**
       DrDrShell Tier 2 (pipes, redirects, quoting) · DrDrFiles Tier 2 (interactive TUI)
       · DrDrEdit Tier 2 (vi-style modal) · drdr-tty shared raw-mode helper

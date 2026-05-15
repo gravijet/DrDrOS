@@ -13,6 +13,9 @@ buildroot/images/
 iso/build/
 iso/*.iso
 
+# Claude Code local session/agent state — never committed.
+.claude/
+
 # Editor and IDE noise.
 .vscode/
 .idea/
