@@ -21,7 +21,12 @@ path = "src/main.rs"
 #             child, not just the session it spawned (orphans get
 #             reparented to us and would otherwise pile up as zombies).
 [dependencies]
-nix = { version = "0.31.3", features = ["mount", "process"] }
+nix = { version = "0.31.3", features = ["mount", "process", "hostname"] }
+# Bring the loopback interface up at boot (SIOCSIFADDR / SIOCSIFFLAGS
+# ioctls). nix has no safe wrapper for these, so this is the one place
+# drdr-init makes raw libc ioctl calls — kept tiny + commented in net.rs.
+# Without `lo` UP, nothing in DrDrOS can use TCP (the DrDrNet panel).
+libc = "0.2"
 # Open /dev/fb0 and paint the boot splash in the real DrDrTheme colors.
 drdr-fb   = { path = "../drdr-fb" }
 drdr-font = { path = "../drdr-font" }

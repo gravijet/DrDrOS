@@ -35,6 +35,7 @@ version = "0.1.0"
 dependencies = [
  "drdr-fb",
  "drdr-font",
+ "drdr-net",
  "drdr-ui",
  "nix",
 ]
@@ -74,12 +75,16 @@ dependencies = [
  "drdr-fb",
  "drdr-font",
  "drdr-ui",
+ "libc",
  "nix",
 ]
 
 [[package]]
 name = "drdr-net"
 version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "drdr-shell"
@@ -98,6 +103,7 @@ version = "0.1.0"
 dependencies = [
  "drdr-fb",
  "drdr-font",
+ "nix",
 ]
 
 [[package]]

@@ -129,6 +129,110 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
     Ok(Frame { kind: kind_buf[0], id, payload })
 }
 
+// ─── FrameParser — incremental, non-blocking re-framing ──────────────
+
+/// Number of fixed header bytes before the payload: `len:u32` (4) +
+/// `kind:u8` (1) + `id:u32` (4).
+pub const FRAME_HEADER_LEN: usize = 4 + 1 + 4;
+
+/// Why incremental parsing gave up on the stream entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// A frame header announced a payload larger than [`MAX_PAYLOAD_LEN`].
+    /// This is unrecoverable: we can't trust where the next frame starts,
+    /// so the caller must drop the connection.
+    Oversize { declared: usize },
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Oversize { declared } => write!(
+                f,
+                "frame declares {declared} byte payload, over MAX_PAYLOAD_LEN ({MAX_PAYLOAD_LEN})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// Re-assembles whole [`Frame`]s out of a TCP byte stream.
+///
+/// Why this exists
+/// ───────────────
+/// TCP is a *byte stream*, not a message stream: one `read()` can hand
+/// you half a frame, or two-and-a-half frames, in any split. The
+/// blocking [`read_frame`] copes by calling `read_exact` repeatedly —
+/// but `read_exact` *blocks* until the bytes arrive, which is exactly
+/// what an async reactor must never do. So instead the reactor reads
+/// whatever bytes are available right now, [`push`](FrameParser::push)es
+/// them in here, and pulls out every *complete* frame with
+/// [`next`](FrameParser::next). Incomplete tail bytes stay buffered
+/// until the next readable event tops them up.
+///
+/// It's the same wire format as [`read_frame`] / [`write_frame`] — a
+/// reactor peer and a thread-per-conn peer interoperate byte-for-byte.
+#[derive(Debug, Default)]
+pub struct FrameParser {
+    /// Bytes received but not yet parsed into a frame. `consumed` marks
+    /// how far we've parsed; we compact (drop the consumed prefix) lazily
+    /// so steady-state parsing doesn't memmove on every frame.
+    buf: Vec<u8>,
+    consumed: usize,
+}
+
+impl FrameParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed freshly `read()` bytes in. Cheap — just an append.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// How many unparsed bytes are buffered (a partial frame tail).
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.consumed
+    }
+
+    /// Pull the next complete frame, if one has fully arrived.
+    ///
+    /// - `Ok(Some(frame))` — a whole frame was available and consumed.
+    /// - `Ok(None)` — not enough bytes yet; call again after more `push`.
+    /// - `Err(FrameError::Oversize)` — the stream is unframeable; the
+    ///   caller must close the connection (we can't resync safely).
+    pub fn next(&mut self) -> Result<Option<Frame>, FrameError> {
+        let avail = &self.buf[self.consumed..];
+        if avail.len() < FRAME_HEADER_LEN {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(avail[0..4].try_into().unwrap()) as usize;
+        if len > MAX_PAYLOAD_LEN {
+            return Err(FrameError::Oversize { declared: len });
+        }
+        let total = FRAME_HEADER_LEN + len;
+        if avail.len() < total {
+            return Ok(None); // header says `len` payload bytes; still en route.
+        }
+        let kind = avail[4];
+        let id = u32::from_be_bytes(avail[5..9].try_into().unwrap());
+        let payload = avail[FRAME_HEADER_LEN..total].to_vec();
+        self.consumed += total;
+
+        // Lazy compaction: once the consumed prefix is the majority of
+        // the buffer, drop it so memory tracks the live tail, not the
+        // whole history of the connection.
+        if self.consumed > 4096 && self.consumed * 2 >= self.buf.len() {
+            self.buf.drain(..self.consumed);
+            self.consumed = 0;
+        }
+
+        Ok(Some(Frame { kind, id, payload }))
+    }
+}
+
 // ─── Encoder ────────────────────────────────────────────────────────
 
 /// Append-only byte builder for frame payloads. Every multi-byte type
@@ -600,6 +704,361 @@ pub mod tcp {
     }
 }
 
+// ─── reactor — async transport (Tier 3) ──────────────────────────────
+
+/// A hand-rolled, single-thread, non-blocking server for DrDrNet.
+///
+/// **No async runtime.** Tier 2's [`tcp`] server spawns one OS thread
+/// per connection and every `read` blocks. That's simple but a thread
+/// costs ~8 MiB of stack and a scheduler round-trip to wake. The Tier 3
+/// model flips it: **one thread serves every connection and never
+/// blocks**. The machinery that makes that possible is `epoll`, a Linux
+/// syscall where you hand the kernel a set of file descriptors and it
+/// reports *which ones are ready* right now — so the thread only ever
+/// touches sockets that actually have work pending.
+///
+/// How the loop works
+/// ──────────────────
+/// 1. The listener socket is non-blocking and registered with epoll for
+///    "readable" (a readable listener == a client waiting to be
+///    `accept`ed).
+/// 2. `epoll_wait` sleeps until *something* is ready, then returns the
+///    ready set. For the listener we `accept` every pending client
+///    (looping until `WouldBlock`) and register each new socket.
+/// 3. For a connection that's readable we `read` whatever bytes are
+///    there, feed them to a per-connection [`FrameParser`], and for
+///    every whole [`Frame`] call the handler. Anything the handler
+///    returns is appended to that connection's out-buffer.
+/// 4. We try to flush the out-buffer immediately. If the socket isn't
+///    writable yet we ask epoll to also watch it for "writable" and
+///    finish the send when that fires. Back-pressure, no blocking.
+///
+/// The wire format is byte-for-byte the Tier 2 format (see
+/// [`write_frame`]) including the correlation `id`, so a reactor server
+/// and a thread-per-connection [`tcp`] client interoperate freely. The
+/// handler is deliberately frame-level (`FnMut(&Frame) -> Option<Frame>`)
+/// to stay transport-agnostic like the rest of DrDrNet; a request/reply
+/// handler just echoes [`Frame::id`] into the reply it returns.
+pub mod reactor {
+    use super::{Frame, FrameError, FrameParser, write_frame};
+    use std::collections::HashMap;
+    use std::io::{self, ErrorKind, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+
+    use nix::errno::Errno;
+    use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+
+    /// epoll "data" token reserved for the listening socket. Connections
+    /// get small incrementing ids that never reach this value in
+    /// practice, so the listener is unambiguous.
+    const LISTENER_TOKEN: u64 = u64::MAX;
+
+    /// Everything the reactor tracks for one live connection.
+    struct ConnState {
+        stream: TcpStream,
+        /// Re-frames the inbound byte stream (handles partial / coalesced
+        /// frames — TCP gives no message boundaries).
+        parser: FrameParser,
+        /// Bytes queued to send. `out_pos` is how far we've written; the
+        /// unsent tail is `out[out_pos..]`.
+        out: Vec<u8>,
+        out_pos: usize,
+        /// Whether our current epoll interest mask includes EPOLLOUT, so
+        /// we only issue an `epoll_ctl(MOD)` when the interest changes.
+        watching_write: bool,
+        /// Set when the peer closed, the stream errored, or a frame was
+        /// unparseable. We finish flushing any reply, then drop the conn.
+        closing: bool,
+    }
+
+    impl ConnState {
+        fn new(stream: TcpStream) -> Self {
+            Self {
+                stream,
+                parser: FrameParser::new(),
+                out: Vec::new(),
+                out_pos: 0,
+                watching_write: false,
+                closing: false,
+            }
+        }
+
+        /// True when there is nothing left to send.
+        fn out_drained(&self) -> bool {
+            self.out_pos >= self.out.len()
+        }
+
+        /// Drain the socket: read until `WouldBlock`, parse out every
+        /// complete frame, and queue whatever the handler answers with.
+        fn pump_reads<H>(&mut self, handler: &mut H)
+        where
+            H: FnMut(&Frame) -> Option<Frame>,
+        {
+            let mut tmp = [0u8; 8192];
+            loop {
+                match self.stream.read(&mut tmp) {
+                    // 0 bytes on a stream socket == orderly peer close.
+                    Ok(0) => {
+                        self.closing = true;
+                        return;
+                    }
+                    Ok(n) => {
+                        self.parser.push(&tmp[..n]);
+                        loop {
+                            match self.parser.next() {
+                                Ok(Some(frame)) => {
+                                    if let Some(reply) = handler(&frame) {
+                                        // Vec<u8>: Write — serialising a
+                                        // frame into memory never fails.
+                                        let _ = write_frame(&mut self.out, &reply);
+                                    }
+                                }
+                                Ok(None) => break, // need more bytes
+                                Err(FrameError::Oversize { .. }) => {
+                                    // Stream is unframeable from here on;
+                                    // we can't find the next boundary.
+                                    self.closing = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        self.closing = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Push the out-buffer to the socket until it's empty or the
+        /// kernel's send buffer is full (`WouldBlock`).
+        fn pump_writes(&mut self) {
+            while !self.out_drained() {
+                match self.stream.write(&self.out[self.out_pos..]) {
+                    Ok(0) => {
+                        self.closing = true;
+                        break;
+                    }
+                    Ok(n) => self.out_pos += n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        self.closing = true;
+                        break;
+                    }
+                }
+            }
+            if self.out_drained() && !self.out.is_empty() {
+                self.out.clear();
+                self.out_pos = 0;
+            }
+        }
+    }
+
+    /// A bound, not-yet-running reactor server. Split from [`run`] so a
+    /// caller (or a test) can read [`local_addr`] before serving — pass
+    /// port `0` to let the OS pick one, then look it up.
+    ///
+    /// [`local_addr`]: Listener::local_addr
+    /// [`run`]: Listener::run
+    pub struct Listener {
+        inner: TcpListener,
+    }
+
+    impl Listener {
+        pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+            Ok(Self { inner: TcpListener::bind(addr)? })
+        }
+
+        /// The address we actually bound to (resolves port `0`).
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        /// Run the reactor loop on the calling thread. Never returns
+        /// except on a fatal epoll error — one thread, every connection.
+        ///
+        /// `handler` is called once per complete inbound frame; return
+        /// `Some(reply)` to send a frame back (echo [`Frame::id`] for a
+        /// correlated response) or `None` for fire-and-forget.
+        pub fn run<H>(self, mut handler: H) -> io::Result<()>
+        where
+            H: FnMut(&Frame) -> Option<Frame>,
+        {
+            self.inner.set_nonblocking(true)?;
+            let epoll = Epoll::new(EpollCreateFlags::empty()).map_err(io::Error::other)?;
+            epoll
+                .add(&self.inner, EpollEvent::new(EpollFlags::EPOLLIN, LISTENER_TOKEN))
+                .map_err(io::Error::other)?;
+
+            let mut conns: HashMap<u64, ConnState> = HashMap::new();
+            let mut next_id: u64 = 0;
+            // Ready-set scratch buffer. epoll fills [0..n]; a fixed cap is
+            // fine — extra-ready fds just surface on the next wait().
+            let mut events = [EpollEvent::empty(); 64];
+
+            loop {
+                let n = match epoll.wait(&mut events, EpollTimeout::NONE) {
+                    Ok(n) => n,
+                    Err(Errno::EINTR) => continue, // a signal woke us; re-wait
+                    Err(e) => return Err(io::Error::other(e)),
+                };
+
+                for ev in &events[..n] {
+                    let token = ev.data();
+                    let flags = ev.events();
+
+                    if token == LISTENER_TOKEN {
+                        // Level-triggered: drain the accept backlog now.
+                        loop {
+                            match self.inner.accept() {
+                                Ok((stream, _peer)) => {
+                                    stream.set_nonblocking(true)?;
+                                    let _ = stream.set_nodelay(true);
+                                    let id = next_id;
+                                    next_id += 1;
+                                    epoll
+                                        .add(
+                                            &stream,
+                                            EpollEvent::new(EpollFlags::EPOLLIN, id),
+                                        )
+                                        .map_err(io::Error::other)?;
+                                    conns.insert(id, ConnState::new(stream));
+                                }
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                                Err(_) => break,
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Decide this connection's fate inside a borrow scope
+                    // so we can `remove` it from the map afterwards.
+                    let close = {
+                        let Some(conn) = conns.get_mut(&token) else {
+                            continue;
+                        };
+
+                        if flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) {
+                            conn.closing = true;
+                        }
+                        if !conn.closing && flags.contains(EpollFlags::EPOLLIN) {
+                            conn.pump_reads(&mut handler);
+                        }
+                        // Try to send if the kernel said writable OR we
+                        // just produced replies in pump_reads.
+                        if flags.contains(EpollFlags::EPOLLOUT) || !conn.out_drained() {
+                            conn.pump_writes();
+                        }
+
+                        if conn.closing && conn.out_drained() {
+                            true
+                        } else {
+                            // Only ask the kernel to watch for "writable"
+                            // while we actually have something buffered —
+                            // otherwise EPOLLOUT would fire continuously.
+                            let want_write = !conn.out_drained();
+                            if want_write != conn.watching_write {
+                                conn.watching_write = want_write;
+                                let mut mask = EpollFlags::EPOLLIN;
+                                if want_write {
+                                    mask |= EpollFlags::EPOLLOUT;
+                                }
+                                epoll
+                                    .modify(
+                                        &conn.stream,
+                                        &mut EpollEvent::new(mask, token),
+                                    )
+                                    .map_err(io::Error::other)?;
+                            }
+                            false
+                        }
+                    };
+
+                    if close {
+                        if let Some(conn) = conns.remove(&token) {
+                            let _ = epoll.delete(&conn.stream);
+                            // conn (and its fd) drops here.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convenience: [`bind`](Listener::bind) + [`run`](Listener::run).
+    /// Blocks the calling thread forever on success.
+    pub fn serve<A, H>(addr: A, handler: H) -> io::Result<()>
+    where
+        A: ToSocketAddrs,
+        H: FnMut(&Frame) -> Option<Frame>,
+    {
+        Listener::bind(addr)?.run(handler)
+    }
+}
+
+// ─── status — a tiny real protocol carried over DrDrNet ──────────────
+
+/// The "node status" protocol DrDrOS uses to prove DrDrNet end-to-end.
+///
+/// It is *not* part of the transport — it's an ordinary application
+/// protocol expressed with the same [`Codec`] / [`Frame`] primitives any
+/// DrDr app would use. DrDrDesk runs a [`reactor`] server that answers
+/// [`StatReq`] with a [`Stat`]; the DrDrDesk "DrDrNet" window is a client
+/// that requests one every refresh and draws it. Defining the wire
+/// contract here keeps server and client honest about the same bytes.
+pub mod status {
+    use super::{Codec, Decoder, Encoder, DecodeError};
+
+    /// Client → server: "tell me how you're doing." No fields; the
+    /// `kind` byte is the whole message. Still a [`Codec`] type so it
+    /// rides the typed [`Conn::request`](super::Conn::request) path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct StatReq;
+
+    /// Server → client: a snapshot of the serving node.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Stat {
+        /// Seconds since the status server started.
+        pub uptime_secs: u64,
+        /// How many requests the server has answered (this one included).
+        pub requests: u64,
+        /// A short human label for the node (hostname-ish).
+        pub host: String,
+    }
+
+    /// Frame `kind` for a [`StatReq`].
+    pub const KIND_STAT_REQ: u8 = 0x10;
+    /// Frame `kind` for a [`Stat`] reply.
+    pub const KIND_STAT_OK: u8 = 0x11;
+
+    impl Codec for StatReq {
+        fn encode(&self, _enc: &mut Encoder) {}
+        fn decode(_dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            Ok(StatReq)
+        }
+    }
+
+    impl Codec for Stat {
+        fn encode(&self, enc: &mut Encoder) {
+            self.uptime_secs.encode(enc);
+            self.requests.encode(enc);
+            self.host.encode(enc);
+        }
+        fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            Ok(Self {
+                uptime_secs: u64::decode(dec)?,
+                requests: u64::decode(dec)?,
+                host: String::decode(dec)?,
+            })
+        }
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -915,5 +1374,145 @@ mod tests {
         assert_eq!((k2, r2), (200, 100));
 
         server.join().unwrap();
+    }
+
+    // ─── Tier 3: incremental FrameParser ─────────────────────────────
+
+    #[test]
+    fn frameparser_reassembles_a_byte_at_a_time() {
+        // The worst-case TCP split: every byte arrives in its own read.
+        let frame = Frame::with_id(7, 0xCAFEBABE, b"drdr payload".to_vec());
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &frame).unwrap();
+
+        let mut p = FrameParser::new();
+        for (i, b) in wire.iter().enumerate() {
+            p.push(&[*b]);
+            // Frame only completes on the very last byte.
+            if i + 1 < wire.len() {
+                assert_eq!(p.next().unwrap(), None);
+            }
+        }
+        assert_eq!(p.next().unwrap(), Some(frame));
+        assert_eq!(p.next().unwrap(), None);
+        assert_eq!(p.buffered(), 0);
+    }
+
+    #[test]
+    fn frameparser_yields_multiple_coalesced_frames() {
+        // Two frames delivered in one read, plus a partial third tail.
+        let f1 = Frame::with_id(1, 11, b"one".to_vec());
+        let f2 = Frame::with_id(2, 22, b"two".to_vec());
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &f1).unwrap();
+        write_frame(&mut wire, &f2).unwrap();
+        let full = wire.len();
+        write_frame(&mut wire, &Frame::new(3, b"thr".to_vec())).unwrap();
+
+        let mut p = FrameParser::new();
+        p.push(&wire[..full + 3]); // both frames + 3 bytes of the third
+        assert_eq!(p.next().unwrap(), Some(f1));
+        assert_eq!(p.next().unwrap(), Some(f2));
+        assert_eq!(p.next().unwrap(), None); // third still incomplete
+        p.push(&wire[full + 3..]);
+        assert_eq!(p.next().unwrap().unwrap().payload, b"thr");
+    }
+
+    #[test]
+    fn frameparser_rejects_oversize_length() {
+        // Hand-craft a header claiming MAX_PAYLOAD_LEN + 1 bytes.
+        let mut wire = ((MAX_PAYLOAD_LEN + 1) as u32).to_be_bytes().to_vec();
+        wire.push(0); // kind
+        wire.extend_from_slice(&0u32.to_be_bytes()); // id
+        let mut p = FrameParser::new();
+        p.push(&wire);
+        assert!(matches!(p.next(), Err(FrameError::Oversize { .. })));
+    }
+
+    // ─── Tier 3: epoll reactor ───────────────────────────────────────
+
+    /// The async server interoperates byte-for-byte with the Tier 2
+    /// thread-per-conn client: same frames, same correlation ids, just a
+    /// different I/O strategy underneath.
+    #[test]
+    fn reactor_serves_correlated_requests() {
+        let listener = reactor::Listener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            // One thread, frame-level handler: double the number.
+            listener
+                .run(|f: &Frame| {
+                    let n = unpack::<u32>(&f.payload).unwrap();
+                    Some(Frame::with_id(200, f.id, pack(&(n * 2))))
+                })
+                .unwrap();
+        });
+
+        let mut client = tcp::connect(addr).unwrap();
+        let (k1, r1): (u8, u32) = client.request(100, &21u32).unwrap();
+        assert_eq!((k1, r1), (200, 42));
+        // Reuse the same socket: correlation ids must still line up.
+        let (_k2, r2): (u8, u32) = client.request(100, &1000u32).unwrap();
+        assert_eq!(r2, 2000);
+    }
+
+    /// Many connections, one reactor thread — the whole point of Tier 3.
+    #[test]
+    fn reactor_handles_many_connections_on_one_thread() {
+        let listener = reactor::Listener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            listener
+                .run(|f: &Frame| {
+                    let n = unpack::<u32>(&f.payload).unwrap();
+                    Some(Frame::with_id(200, f.id, pack(&(n + 1))))
+                })
+                .unwrap();
+        });
+
+        let mut clients: Vec<_> = (0..16)
+            .map(|_| tcp::connect(addr).unwrap())
+            .collect();
+        // Interleave requests across all 16 live sockets.
+        for round in 0..3u32 {
+            for (i, c) in clients.iter_mut().enumerate() {
+                let v = round * 100 + i as u32;
+                let (_k, r): (u8, u32) = c.request(100, &v).unwrap();
+                assert_eq!(r, v + 1);
+            }
+        }
+    }
+
+    /// End-to-end of the real `status` protocol over the reactor: the
+    /// exact path DrDrDesk's "DrDrNet" window exercises at runtime.
+    #[test]
+    fn reactor_status_protocol_roundtrip() {
+        use status::{Stat, StatReq, KIND_STAT_OK, KIND_STAT_REQ};
+
+        let listener = reactor::Listener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut served = 0u64;
+            listener
+                .run(move |f: &Frame| {
+                    assert_eq!(f.kind, KIND_STAT_REQ);
+                    served += 1;
+                    let stat = Stat {
+                        uptime_secs: 42,
+                        requests: served,
+                        host: "drdros".into(),
+                    };
+                    Some(Frame::with_id(KIND_STAT_OK, f.id, pack(&stat)))
+                })
+                .unwrap();
+        });
+
+        let mut client = tcp::connect(addr).unwrap();
+        let (kind, s1): (u8, Stat) = client.request(KIND_STAT_REQ, &StatReq).unwrap();
+        assert_eq!(kind, KIND_STAT_OK);
+        assert_eq!(s1, Stat { uptime_secs: 42, requests: 1, host: "drdros".into() });
+        let (_k, s2): (u8, Stat) = client.request(KIND_STAT_REQ, &StatReq).unwrap();
+        assert_eq!(s2.requests, 2); // server kept state across requests
     }
 }

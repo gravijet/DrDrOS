@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | All 5 phases at Tier 1+ · **boots to a graphical desktop** — drdr-init (PID 1 supervisor) → DrDrDesk launcher → DrDr apps |
+| **Status** | All phases at Tier 2+ · **boots to a real window manager** — drdr-init (PID 1, sets hostname + brings up `lo`) → DrDrDesk: overlapping windows, mouse, a live DrDrNet panel backed by a Tier 3 async reactor |
 
 ---
 
@@ -70,16 +70,16 @@ everything above it is ours.
 
 | Crate / dir | Kind | Purpose |
 |---|---|---|
-| **drdr-init** | binary | PID 1 — mounts, draws the splash, then *supervises* (spawns + respawns) the graphical session |
-| **drdr-desk** | binary | DrDrDesk — framebuffer desktop + keyboard-driven launcher for the DrDr apps |
+| **drdr-init** | binary | PID 1 — mounts, sets the hostname, brings `lo` up, draws the splash, then *supervises* (spawns + respawns) the graphical session |
+| **drdr-desk** | binary | DrDrDesk — framebuffer **window manager**: overlapping windows, mouse + keyboard, in-window apps (About / DrDrFiles / System / DrDrNet) |
 | **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, quoting |
 | **drdr-edit** | binary | DrDrEdit — vi-style modal text editor; RAM-resident |
 | **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
 | **drdr-fb** | library | DrDrFb — direct framebuffer access (`/dev/fb0`) |
 | **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyph renderer |
-| **drdr-ui** | library | DrDrUI — widgets (Label/Button/Frame/VBox/HBox), Theme |
+| **drdr-ui** | library | DrDrUI — widgets + Theme, the `TextGrid`/`WindowApp` surface, a stacking `WindowManager`, and an `InputHub` (poll over keyboard + mouse) |
 | **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
-| **drdr-net** | library | DrDrNet — custom binary network protocol (not HTTP) |
+| **drdr-net** | library | DrDrNet — custom binary protocol (not HTTP): framing, codecs, sync TCP, **and a hand-rolled epoll reactor** (Tier 3 async) |
 | **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe for drdr-init |
 | **iso/** | tooling | xorriso pipeline producing the bootable `drdros.iso` |
 | **scripts/qemu.sh** | tooling | Boot the bzImage + rootfs.cpio.gz under QEMU |
@@ -106,7 +106,7 @@ everything above it is ours.
 - [x] **Phase 4 — Network & protocols**
       DrDrNet Tier 1: length-prefixed binary frames + typed Encoder/Decoder ·
       Tier 2: correlation IDs, Codec trait, Conn request/reply, real
-      `tcp` transport (std::net, thread-per-conn) · Tier 3 (async) ahead
+      `tcp` transport (std::net, thread-per-conn) · **Tier 3 done** (see Phase 7)
 - [x] **Phase 5 — Polish & ISO**
       `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso`
       (+ `--uefi`) · DrDrTheme polish pass done (semantic roles +
@@ -124,8 +124,24 @@ everything above it is ours.
       respawns the desktop if it ever exits — a session crash is a
       flicker, not a kernel panic · **verified**: `iso/drdros.iso` boots
       under UEFI straight into the DrDrDesk desktop (headless QMP
-      screendump). Tier 2 ahead: a real window manager + mouse
-- [ ] **Phase 7 — DrDrNet Tier 3 (async) + app integration**
+      screendump)
+- [x] **Phase 7 — Window manager + DrDrNet Tier 3 (async)**
+      **DrDrUI Tier 2**: a `TextGrid` + `WindowApp` surface (apps draw
+      characters, not pixels — no PTY, no terminal emulator), a stacking
+      `WindowManager` (overlapping windows, title bars, drag-to-move,
+      Alt-Tab, click-`[x]`-to-close), a hand-drawn cursor, and an
+      `InputHub` that `poll(2)`s the auto-detected keyboard **and** mouse
+      (evdev `REL_*`/`BTN_LEFT`) at once · **DrDrDesk Tier 2** is now that
+      WM, hosting About / DrDrFiles / System / DrDrNet windows (`--ppm`
+      still works) · **DrDrNet Tier 3**: an incremental `FrameParser`
+      (re-frames a TCP byte stream without blocking) + a hand-rolled
+      single-thread **epoll reactor** (`nix`, no tokio, many connections
+      one thread) keeping the Tier 2 wire format + correlation IDs · the
+      DrDrNet window is a *live client* of that reactor (DrDrDesk runs
+      the server in a background thread; drdr-init brings `lo` up so the
+      loopback TCP works) · **verified** end-to-end on the headless UEFI
+      ISO boot: the panel shows the reactor serving ~4 req/s
+- [ ] **Phase 8 — DrDrNet over the wire + more windowed apps** (ahead)
 
 ---
 
