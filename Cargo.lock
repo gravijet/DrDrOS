@@ -30,6 +30,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drdr-desk"
+version = "0.1.0"
+dependencies = [
+ "drdr-fb",
+ "drdr-font",
+ "drdr-ui",
+ "nix",
+]
+
+[[package]]
 name = "drdr-edit"
 version = "0.1.0"
 dependencies = [
@@ -63,6 +73,7 @@ version = "0.1.0"
 dependencies = [
  "drdr-fb",
  "drdr-font",
+ "drdr-ui",
  "nix",
 ]
 

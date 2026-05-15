@@ -15,7 +15,7 @@ everything above it is ours.
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Storage** | Runs from RAM — no required disk writes |
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
-| **Status** | All 5 phases at Tier 1+ · **boots end-to-end in QEMU** — drdr-init → framebuffer splash → DrDrShell |
+| **Status** | All 5 phases at Tier 1+ · **boots to a graphical desktop** — drdr-init (PID 1 supervisor) → DrDrDesk launcher → DrDr apps |
 
 ---
 
@@ -36,6 +36,9 @@ everything above it is ours.
                   ┌──────────────────────────────────────────────────┐
                   │                  DrDrOS USERLAND                 │
                   │                                                  │
+                  │                  DrDrDesk                       │
+                  │           (graphical session / launcher)         │
+                  │       ┌──────────────┼──────────────┐            │
                   │   DrDrFiles      DrDrEdit       DrDrShell        │
                   │   ─────────      ────────       ─────────        │
                   │       │              │              │            │
@@ -67,7 +70,8 @@ everything above it is ours.
 
 | Crate / dir | Kind | Purpose |
 |---|---|---|
-| **drdr-init** | binary | PID 1 — boots the userland, draws the splash, launches DrDrShell |
+| **drdr-init** | binary | PID 1 — mounts, draws the splash, then *supervises* (spawns + respawns) the graphical session |
+| **drdr-desk** | binary | DrDrDesk — framebuffer desktop + keyboard-driven launcher for the DrDr apps |
 | **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, quoting |
 | **drdr-edit** | binary | DrDrEdit — vi-style modal text editor; RAM-resident |
 | **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
@@ -92,7 +96,7 @@ everything above it is ours.
 - [x] **First boot** — boots end-to-end under QEMU: custom kernel
       (`linux-fb.config` fragment adds bochs-drm + fbdev emulation so
       `/dev/fb0` exists) → drdr-init mounts proc/sys/dev → paints the
-      framebuffer splash → execs `/bin/drdr-shell` to an interactive prompt
+      framebuffer splash → hands off to the graphical session
 - [x] **Phase 2 — Core applications**
       DrDrShell Tier 2 (pipes, redirects, quoting) · DrDrFiles Tier 2 (interactive TUI)
       · DrDrEdit Tier 2 (vi-style modal) · drdr-tty shared raw-mode helper
@@ -108,8 +112,20 @@ everything above it is ours.
       (+ `--uefi`) · DrDrTheme polish pass done (semantic roles +
       WCAG-AA contrast, enforced by test) · **ISO boot test passed**:
       `iso/drdros.iso` boots end-to-end under UEFI (GRUB → kernel →
-      drdr-init splash → DrDrShell prompt). Legacy-BIOS boot needs
+      drdr-init splash → DrDrDesk). Legacy-BIOS boot needs
       `grub-pc-bin` at ISO-build time (build warns if absent)
+- [x] **Phase 6 — Graphical session**
+      DrDrFont completed to the full printable ASCII set (≈95 hand-authored
+      8×16 glyphs via a compact `const fn` pixel-art DSL) · **DrDrDesk**:
+      framebuffer desktop with a keyboard-driven launcher (↑/↓/Tab, Enter)
+      for DrDrShell / DrDrFiles / DrDrEdit + Reboot / Power off, themed by
+      DrDrTheme · **drdr-init is now a supervisor**: it *spawns* (not
+      `exec`s) the session, reaps every orphaned child as PID 1 must, and
+      respawns the desktop if it ever exits — a session crash is a
+      flicker, not a kernel panic · **verified**: `iso/drdros.iso` boots
+      under UEFI straight into the DrDrDesk desktop (headless QMP
+      screendump). Tier 2 ahead: a real window manager + mouse
+- [ ] **Phase 7 — DrDrNet Tier 3 (async) + app integration**
 
 ---
 

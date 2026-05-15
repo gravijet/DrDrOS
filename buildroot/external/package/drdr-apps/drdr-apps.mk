@@ -1,10 +1,12 @@
 ################################################################################
 #
-# drdr-apps — DrDrShell + DrDrFiles + DrDrEdit
+# drdr-apps — DrDrDesk + DrDrShell + DrDrFiles + DrDrEdit
 #
-# One Buildroot package that fans out into three Rust binaries. Building
-# them as a single package keeps the host-side cargo invocation efficient
-# (one workspace, one resolver pass) and the Buildroot config tidy.
+# One Buildroot package that fans out into the userland Rust binaries.
+# Building them as a single package keeps the host-side cargo invocation
+# efficient (one workspace, one resolver pass) and the Buildroot config
+# tidy. DrDrDesk is the graphical session drdr-init supervises; the other
+# three are the apps it launches.
 #
 ################################################################################
 
@@ -22,10 +24,11 @@ define DRDR_APPS_BUILD_CMDS
 	cd $(DRDR_APPS_SITE) && \
 		cargo build --release \
 			--target x86_64-unknown-linux-musl \
-			-p drdr-shell -p drdr-files -p drdr-edit
+			-p drdr-desk -p drdr-shell -p drdr-files -p drdr-edit
 endef
 
 define DRDR_APPS_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 0755 $(DRDR_APPS_OUT)/drdr-desk  $(TARGET_DIR)/bin/drdr-desk
 	$(INSTALL) -D -m 0755 $(DRDR_APPS_OUT)/drdr-shell $(TARGET_DIR)/bin/drdr-shell
 	$(INSTALL) -D -m 0755 $(DRDR_APPS_OUT)/drdr-files $(TARGET_DIR)/bin/drdr-files
 	$(INSTALL) -D -m 0755 $(DRDR_APPS_OUT)/drdr-edit  $(TARGET_DIR)/bin/drdr-edit
