@@ -17,8 +17,16 @@ dependency. EFI works out of the box; legacy BIOS works too as long as
 ```sh
 scripts/build-buildroot.sh   # bzImage + rootfs.cpio.gz → buildroot/images/
 bash iso/build.sh            # → iso/drdros.iso
-scripts/qemu.sh --iso        # boot the ISO under QEMU
+scripts/qemu.sh --iso        # boot the ISO under QEMU (legacy BIOS)
+scripts/qemu.sh --iso --uefi # ...or under UEFI (OVMF); needed if the
+                             #    ISO was built without grub-pc-bin
 ```
+
+> **BIOS vs UEFI:** `grub-mkrescue` embeds a legacy-BIOS boot image
+> only when `grub-pc-bin` is installed. Without it the ISO is
+> **UEFI-only** — `scripts/qemu.sh --iso` (SeaBIOS) will say "No
+> bootable device"; use `--uefi` (needs the `ovmf` package), or
+> install `grub-pc-bin` and rebuild for a dual-firmware ISO.
 
 ## Custom paths
 
