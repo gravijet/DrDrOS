@@ -5,18 +5,25 @@
 //! Every message is a single self-describing **frame**:
 //!
 //! ```text
-//!   ┌──────────┬──────┬───────────────────────────────┐
-//!   │  len:u32 │ kind │       payload (len bytes)     │
-//!   │   (BE)   │  u8  │           any bytes           │
-//!   └──────────┴──────┴───────────────────────────────┘
-//!     4 bytes   1 byte           variable
+//!   ┌──────────┬──────┬──────────┬────────────────────────────┐
+//!   │  len:u32 │ kind │  id:u32  │     payload (len bytes)    │
+//!   │   (BE)   │  u8  │   (BE)   │          any bytes         │
+//!   └──────────┴──────┴──────────┴────────────────────────────┘
+//!     4 bytes   1 byte  4 bytes            variable
 //! ```
 //!
-//! - `len` is the byte count of the payload (does NOT include itself or
-//!   `kind`). Big-endian so a `tcpdump` / `xxd` dump reads naturally
-//!   left-to-right.
+//! - `len` is the byte count of the payload only (it does NOT include
+//!   itself, `kind`, or `id`). Big-endian so a `tcpdump` / `xxd` dump
+//!   reads naturally left-to-right.
 //! - `kind` is a one-byte tag the application layer assigns meaning to
 //!   (request? response? heartbeat?). DrDrNet itself doesn't interpret it.
+//! - `id` is a **correlation ID** (Tier 2). When a client fires several
+//!   requests down one socket, replies can come back in any order; the
+//!   server echoes the request's `id` into its reply so the client knows
+//!   which request a given reply answers — the same role JSON-RPC's
+//!   `id` field plays. The reserved value `id == 0` means "unsolicited":
+//!   a server push, heartbeat, or fire-and-forget notification that
+//!   expects no reply. See [`NO_CORRELATION`].
 //! - `payload` is arbitrary bytes — typically built with the [`Encoder`]
 //!   helpers in this module.
 //!
@@ -30,9 +37,12 @@
 //! [`Decoder`] reads them back out of a `&[u8]` with bounds checks that
 //! return a descriptive [`DecodeError`] on short / malformed input.
 //!
-//! Tier 2 will add request/response correlation IDs, a `Codec` trait
-//! that types implement, and a small async runtime; Tier 3 connects
-//! the protocol over `tokio` / `std::net::TcpStream` for real apps.
+//! Tier 2 (this module) adds the `id` correlation field above, a
+//! [`Codec`] trait that types implement, request/reply helpers on
+//! [`Conn`], and a real TCP transport in the [`tcp`] submodule
+//! (`std::net`, thread-per-connection — no async runtime yet). Tier 3
+//! will layer an async runtime on top for fully concurrent,
+//! out-of-order request multiplexing.
 
 #![forbid(unsafe_code)]
 
@@ -43,17 +53,35 @@ use std::io::{self, Read, Write};
 /// allocating an unbounded buffer.
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
+/// Reserved correlation ID meaning "this frame is unsolicited" — a
+/// server push, heartbeat, or fire-and-forget notification that expects
+/// no reply. [`Conn::send_typed`] uses this; [`Conn::request`] never
+/// hands it out.
+pub const NO_CORRELATION: u32 = 0;
+
 /// One on-the-wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     /// Application-defined tag — DrDrNet itself attaches no meaning.
     pub kind: u8,
+    /// Correlation ID. `0` ([`NO_CORRELATION`]) = unsolicited; a nonzero
+    /// value ties a reply back to the request that carried the same id.
+    pub id: u32,
     pub payload: Vec<u8>,
 }
 
 impl Frame {
+    /// An unsolicited frame (`id == 0`). Use this for notifications and
+    /// heartbeats — anything the peer is not expected to reply to.
     pub fn new(kind: u8, payload: Vec<u8>) -> Self {
-        Self { kind, payload }
+        Self { kind, id: NO_CORRELATION, payload }
+    }
+
+    /// A correlated frame carrying an explicit `id`. A client builds a
+    /// request with a fresh id; a server builds its reply by echoing the
+    /// request's id straight back.
+    pub fn with_id(kind: u8, id: u32, payload: Vec<u8>) -> Self {
+        Self { kind, id, payload }
     }
 }
 
@@ -72,6 +100,7 @@ pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let len = frame.payload.len() as u32;
     w.write_all(&len.to_be_bytes())?;
     w.write_all(&[frame.kind])?;
+    w.write_all(&frame.id.to_be_bytes())?;
     w.write_all(&frame.payload)?;
     Ok(())
 }
@@ -92,9 +121,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
     }
     let mut kind_buf = [0u8; 1];
     r.read_exact(&mut kind_buf)?;
+    let mut id_buf = [0u8; 4];
+    r.read_exact(&mut id_buf)?;
+    let id = u32::from_be_bytes(id_buf);
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
-    Ok(Frame { kind: kind_buf[0], payload })
+    Ok(Frame { kind: kind_buf[0], id, payload })
 }
 
 // ─── Encoder ────────────────────────────────────────────────────────
@@ -356,21 +388,43 @@ pub fn unpack<T: Codec>(bytes: &[u8]) -> Result<T, DecodeError> {
 // ─── Conn — typed framed stream ──────────────────────────────────────
 
 /// Wraps any Read+Write duplex stream (TcpStream, UnixStream, an
-/// in-memory pipe, …) and offers send/recv methods at two levels:
+/// in-memory pipe, …) and offers send/recv methods at three levels:
 ///
 ///   - `send_frame` / `recv_frame` — raw [`Frame`]s
-///   - `send_typed` / `recv_typed` — a `kind` byte plus a [`Codec`] payload
+///   - `send_typed` / `recv_typed` — a `kind` byte plus a [`Codec`]
+///     payload, sent *unsolicited* (`id == 0`: notifications, pushes)
+///   - `request` / `recv_request` + `reply` — correlated round-trips:
+///     the client allocates a fresh id, the server echoes it back
 ///
 /// `Conn` owns the underlying stream so it can flush after every send.
 /// If you need to keep the stream for other purposes, hand the trait
 /// object across the boundary instead of using `Conn`.
+///
+/// The synchronous `request` here sends one frame and blocks for the
+/// matching reply; it verifies the reply's id but does not yet juggle
+/// many in-flight requests at once (that demux map is Tier 3's job).
 pub struct Conn<S: Read + Write> {
     stream: S,
+    /// Next correlation ID this side will hand out. Starts at 1 because
+    /// 0 is reserved ([`NO_CORRELATION`]); wraps back to 1, never 0.
+    next_id: u32,
 }
 
 impl<S: Read + Write> Conn<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self { stream, next_id: 1 }
+    }
+
+    /// Hand out the next correlation ID, skipping the reserved 0 on
+    /// wrap-around. IDs are per-`Conn`; collisions only matter while a
+    /// request is in flight, and 2³² ids is plenty for that window.
+    fn alloc_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        id
     }
 
     /// Give back the inner stream (e.g. to drop it explicitly).
@@ -387,8 +441,9 @@ impl<S: Read + Write> Conn<S> {
         read_frame(&mut self.stream)
     }
 
-    /// Send a typed message with the given `kind` byte. The payload is
-    /// encoded via the [`Codec`] impl.
+    /// Send an **unsolicited** typed message (`id == 0`) with the given
+    /// `kind` byte — a notification, push, or heartbeat the peer is not
+    /// expected to answer. For request/response use [`Conn::request`].
     pub fn send_typed<T: Codec>(&mut self, kind: u8, msg: &T) -> io::Result<()> {
         self.send_frame(&Frame::new(kind, pack(msg)))
     }
@@ -401,6 +456,147 @@ impl<S: Read + Write> Conn<S> {
         let value = unpack::<T>(&frame.payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok((frame.kind, value))
+    }
+
+    /// **Client side.** Send a request and block for its reply.
+    ///
+    /// Allocates a fresh correlation id, sends `req` under `req_kind`,
+    /// then reads exactly one frame back. The reply must echo the same
+    /// id — if it doesn't, that's a protocol violation and we return
+    /// `InvalidData` rather than silently handing back a mismatched
+    /// answer. Returns the reply's `kind` byte plus the decoded body so
+    /// the caller can tell e.g. an OK response from an ERROR one.
+    pub fn request<Req: Codec, Resp: Codec>(
+        &mut self,
+        req_kind: u8,
+        req: &Req,
+    ) -> io::Result<(u8, Resp)> {
+        let id = self.alloc_id();
+        self.send_frame(&Frame::with_id(req_kind, id, pack(req)))?;
+        let frame = self.recv_frame()?;
+        if frame.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reply correlation id {} does not match request id {id}", frame.id),
+            ));
+        }
+        let value = unpack::<Resp>(&frame.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok((frame.kind, value))
+    }
+
+    /// **Server side.** Receive the next request, decoding its body as
+    /// `T`. The returned [`Request`] keeps the correlation `id` so the
+    /// handler can route it straight into [`Conn::reply`].
+    pub fn recv_request<T: Codec>(&mut self) -> io::Result<Request<T>> {
+        let frame = self.recv_frame()?;
+        let body = unpack::<T>(&frame.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Request { kind: frame.kind, id: frame.id, body })
+    }
+
+    /// **Server side.** Answer a request by echoing its correlation id
+    /// back so the client's [`Conn::request`] can match the reply. Pass
+    /// the `id` from the [`Request`] you handled.
+    pub fn reply<T: Codec>(&mut self, id: u32, reply_kind: u8, msg: &T) -> io::Result<()> {
+        self.send_frame(&Frame::with_id(reply_kind, id, pack(msg)))
+    }
+}
+
+/// A decoded request as seen by a server: the application `kind` tag,
+/// the correlation `id` to echo in the reply, and the decoded `body`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request<T> {
+    pub kind: u8,
+    pub id: u32,
+    pub body: T,
+}
+
+// ─── tcp — std::net transport ────────────────────────────────────────
+
+/// The real-socket transport for DrDrNet (Tier 2).
+///
+/// Everything above is transport-agnostic — `Conn` works over any
+/// `Read + Write`. This module is the thin layer that produces a
+/// `Conn<TcpStream>` from an address, for both ends of a connection.
+///
+/// **No async runtime.** A server here is a classic blocking accept
+/// loop that spawns one OS thread per connection. That's the right
+/// amount of machinery for DrDrOS's needs today; Tier 3 will introduce
+/// async if we ever need thousands of idle connections on one thread.
+pub mod tcp {
+    use super::Conn;
+    use std::io;
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+
+    /// Connect to a DrDrNet server and wrap the socket in a [`Conn`].
+    ///
+    /// We set `TCP_NODELAY`, which disables *Nagle's algorithm*. Nagle
+    /// makes the kernel hold back tiny writes for a few ms hoping to
+    /// coalesce them into one packet — great for bulk streams, but for a
+    /// request/reply protocol it adds latency to every single call. We
+    /// frame our own messages and want each one on the wire immediately.
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Conn<TcpStream>> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        Ok(Conn::new(stream))
+    }
+
+    /// A bound TCP listener that hands back ready [`Conn`]s.
+    ///
+    /// Binding is split from serving so callers (and tests) can read the
+    /// actual [`local_addr`](Listener::local_addr) before accepting —
+    /// pass port `0` to let the OS pick a free port, then look it up.
+    pub struct Listener {
+        inner: TcpListener,
+    }
+
+    impl Listener {
+        pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+            Ok(Self { inner: TcpListener::bind(addr)? })
+        }
+
+        /// The address we actually bound to (resolves port `0`).
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        /// Block until one client connects; return its `Conn` and peer
+        /// address. Useful for simple one-shot servers and for tests.
+        pub fn accept(&self) -> io::Result<(Conn<TcpStream>, SocketAddr)> {
+            let (stream, peer) = self.inner.accept()?;
+            stream.set_nodelay(true)?;
+            Ok((Conn::new(stream), peer))
+        }
+
+        /// Blocking accept loop: for every incoming connection, spawn a
+        /// thread running `handler`. Returns only if `accept()` itself
+        /// errors (a dead listener) — a panicking handler just takes its
+        /// own connection's thread down, not the server.
+        pub fn serve<H>(&self, handler: H) -> io::Result<()>
+        where
+            H: Fn(Conn<TcpStream>, SocketAddr) + Send + Sync + 'static,
+        {
+            let handler = std::sync::Arc::new(handler);
+            for stream in self.inner.incoming() {
+                let stream = stream?;
+                stream.set_nodelay(true)?;
+                let peer = stream.peer_addr()?;
+                let h = std::sync::Arc::clone(&handler);
+                std::thread::spawn(move || h(Conn::new(stream), peer));
+            }
+            Ok(())
+        }
+    }
+
+    /// Convenience: [`bind`](Listener::bind) + [`serve`](Listener::serve)
+    /// in one call. Blocks forever on success.
+    pub fn serve<A, H>(addr: A, handler: H) -> io::Result<()>
+    where
+        A: ToSocketAddrs,
+        H: Fn(Conn<TcpStream>, SocketAddr) + Send + Sync + 'static,
+    {
+        Listener::bind(addr)?.serve(handler)
     }
 }
 
@@ -416,10 +612,12 @@ mod tests {
         let frame = Frame::new(0x42, b"hello drdr".to_vec());
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
-        // 4 len + 1 kind + 10 payload = 15.
-        assert_eq!(buf.len(), 15);
+        // 4 len + 1 kind + 4 id + 10 payload = 19.
+        assert_eq!(buf.len(), 19);
         assert_eq!(&buf[..4], &10u32.to_be_bytes());
         assert_eq!(buf[4], 0x42);
+        // Frame::new is unsolicited → id == 0.
+        assert_eq!(&buf[5..9], &0u32.to_be_bytes());
 
         let mut cur = Cursor::new(buf);
         let got = read_frame(&mut cur).unwrap();
@@ -617,5 +815,105 @@ mod tests {
         client.send_typed(1, &42u32).unwrap();
         let err = server.recv_typed::<Join>().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ─── Tier 2: correlation IDs ─────────────────────────────────────
+
+    #[test]
+    fn frame_roundtrip_preserves_id() {
+        let frame = Frame::with_id(7, 0xABCD_1234, b"body".to_vec());
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        // kind byte, then the id as 4 BE bytes, before the payload.
+        assert_eq!(buf[4], 7);
+        assert_eq!(&buf[5..9], &0xABCD_1234u32.to_be_bytes());
+
+        let got = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, frame);
+        assert_eq!(got.id, 0xABCD_1234);
+    }
+
+    #[test]
+    fn recv_request_then_reply_echoes_id() {
+        // Drive both sides by hand on the synchronous pipe: the client
+        // sends a correlated frame, the server decodes it as a Request,
+        // answers with reply(), and the client sees the same id back.
+        let (client, server) = pipe_pair();
+        let mut client = Conn::new(client);
+        let mut server = Conn::new(server);
+
+        client
+            .send_frame(&Frame::with_id(/* kind */ 1, /* id */ 77, pack(&Join {
+                user_id: 3,
+                username: "grace".into(),
+            })))
+            .unwrap();
+
+        let req: Request<Join> = server.recv_request().unwrap();
+        assert_eq!(req.kind, 1);
+        assert_eq!(req.id, 77);
+        assert_eq!(req.body, Join { user_id: 3, username: "grace".into() });
+
+        server.reply(req.id, /* kind=OK */ 2, &"welcome".to_string()).unwrap();
+
+        let reply = client.recv_frame().unwrap();
+        assert_eq!(reply.kind, 2);
+        assert_eq!(reply.id, 77);
+        assert_eq!(unpack::<String>(&reply.payload).unwrap(), "welcome");
+    }
+
+    #[test]
+    fn request_rejects_mismatched_reply_id() {
+        // Pre-load a reply carrying the wrong id into the channel the
+        // client reads from, then call request(): it allocates id 1,
+        // sends, reads our planted frame (id 999) and must reject it.
+        let (client, server) = pipe_pair();
+        let mut client = Conn::new(client);
+        let mut server = Conn::new(server);
+        server
+            .send_frame(&Frame::with_id(2, 999, pack(&"stale".to_string())))
+            .unwrap();
+
+        let err = client.request::<u32, String>(1, &42u32).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn alloc_id_skips_reserved_zero_on_wrap() {
+        let (client, _server) = pipe_pair();
+        let mut conn = Conn::new(client);
+        conn.next_id = u32::MAX;
+        assert_eq!(conn.alloc_id(), u32::MAX);
+        // Next would wrap to 0 (reserved) — must land on 1 instead.
+        assert_eq!(conn.alloc_id(), 1);
+        assert_eq!(conn.alloc_id(), 2);
+    }
+
+    // ─── Tier 2: real TCP transport ──────────────────────────────────
+
+    /// Full round-trip over loopback TCP: a server thread answers two
+    /// correlated requests; the client's auto-allocated ids (1 then 2)
+    /// must match each reply.
+    #[test]
+    fn tcp_request_reply_over_loopback() {
+        let listener = tcp::Listener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _peer) = listener.accept().unwrap();
+            // Echo-server: double the number, twice.
+            for _ in 0..2 {
+                let req: Request<u32> = conn.recv_request().unwrap();
+                conn.reply(req.id, /* kind=OK */ 200, &(req.body * 2)).unwrap();
+            }
+        });
+
+        let mut client = tcp::connect(addr).unwrap();
+        let (k1, r1): (u8, u32) = client.request(/* kind=DOUBLE */ 100, &21u32).unwrap();
+        assert_eq!((k1, r1), (200, 42));
+        let (k2, r2): (u8, u32) = client.request(100, &50u32).unwrap();
+        assert_eq!((k2, r2), (200, 100));
+
+        server.join().unwrap();
     }
 }

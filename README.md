@@ -101,7 +101,8 @@ everything above it is ours.
       Tier 2 input (evdev KeyReader, KeyCode, focus model) · `drdr-demo` showcase
 - [x] **Phase 4 — Network & protocols**
       DrDrNet Tier 1: length-prefixed binary frames + typed Encoder/Decoder ·
-      Tier 2 (TCP server/client + correlation IDs) pending
+      Tier 2: correlation IDs, Codec trait, Conn request/reply, real
+      `tcp` transport (std::net, thread-per-conn) · Tier 3 (async) ahead
 - [x] **Phase 5 — Polish & ISO**
       `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso` ·
       DrDrTheme customisation + polish pass still ahead
