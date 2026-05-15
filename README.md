@@ -105,7 +105,9 @@ everything above it is ours.
       `tcp` transport (std::net, thread-per-conn) · Tier 3 (async) ahead
 - [x] **Phase 5 — Polish & ISO**
       `iso/build.sh` (grub-mkrescue hybrid ISO) · `scripts/qemu.sh --iso` ·
-      DrDrTheme customisation + polish pass still ahead
+      DrDrTheme polish pass done (semantic roles + WCAG-AA contrast,
+      enforced by test) · ISO boot test needs the `mtools` host package
+      (EFI image step); ISO staging verified complete
 
 ---
 

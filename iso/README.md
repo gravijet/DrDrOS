@@ -45,7 +45,17 @@ Installed by default on most Ubuntu / Debian desktop installs:
 
 - `grub-common` (provides `grub-mkrescue`)
 - `xorriso`
+- `mtools` — provides `mformat`/`mcopy`. `grub-mkrescue` uses these to
+  build the embedded **EFI System Partition** (a FAT image holding the
+  EFI bootloader). Missing it fails with `mformat invocation failed`
+  and *no ISO is written*. Headless server images often omit it.
 
 For legacy BIOS booting also install:
 
 - `grub-pc-bin`
+
+One-liner for Debian/Ubuntu:
+
+```sh
+sudo apt-get install -y grub-common xorriso mtools grub-pc-bin
+```
