@@ -62,30 +62,55 @@ impl Rect {
 
 // ─── Theme ───────────────────────────────────────────────────────────
 
-/// A flat color palette shared by every widget in a draw pass.
+/// A flat palette of *semantic* color roles shared by every widget in a
+/// draw pass. Widgets never hard-code colors — they ask the theme for
+/// the role they need ("primary text", "a raised surface"), so a single
+/// palette swap restyles the whole UI. This is the same idea as CSS
+/// custom properties / design tokens, just resolved at draw time.
+///
+/// Two background depths matter on a dark UI: `bg` is the furthest-back
+/// desktop/window fill, `surface` is one step *raised* (panels, controls
+/// at rest) so elements read as layered rather than flat. Text comes in
+/// two weights: `fg` for primary content and `muted` for secondary
+/// chrome (frame titles, hints, disabled affordances).
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
-    /// Default text color.
-    pub fg: Pixel,
-    /// Window / background fill.
+    /// Furthest-back fill: desktop and window backgrounds.
     pub bg: Pixel,
-    /// Highlight color for focused / pressed widgets.
+    /// One step raised from `bg`: panels and controls at rest. Must be
+    /// distinguishable from `bg` without a border.
+    pub surface: Pixel,
+    /// Primary text — high contrast against both `bg` and `surface`.
+    pub fg: Pixel,
+    /// Secondary text/chrome: titles, hints, disabled affordances.
+    /// Still readable, but visibly recedes next to `fg`.
+    pub muted: Pixel,
+    /// Highlight for focused / pressed widgets and primary actions.
     pub accent: Pixel,
-    /// Text color when painted over `accent` (must contrast).
+    /// Text painted over `accent` — must contrast with `accent`, not
+    /// with `bg`. On a bright accent this is deliberately *dark*.
     pub accent_fg: Pixel,
-    /// Color for 1-pixel borders.
+    /// 1-pixel borders separating regions at rest.
     pub border: Pixel,
 }
 
 impl Theme {
-    /// The default DrDrOS theme: deep blue background, soft white text,
-    /// teal accent. Phase 5 introduces DrDrTheme for user customisation.
+    /// The default DrDrOS theme — "DrDr Midnight": a low-saturation navy
+    /// dark scheme. Phase 5 introduces DrDrTheme for user customisation;
+    /// this is the built-in every component falls back to.
+    ///
+    /// The palette is tuned for contrast, not just looks: see the
+    /// `default_theme_meets_wcag_aa` test, which enforces a ≥ 4.5:1
+    /// luminance contrast ratio (WCAG AA for body text) on the
+    /// text-over-fill pairs a user actually reads.
     pub const DRDR: Self = Self {
-        fg: Pixel::rgb(0xE0, 0xE6, 0xF0),
-        bg: Pixel::rgb(0x10, 0x18, 0x40),
-        accent: Pixel::rgb(0x36, 0xA0, 0x9F),
-        accent_fg: Pixel::WHITE,
-        border: Pixel::rgb(0x4A, 0x5A, 0x80),
+        bg:        Pixel::rgb(0x0B, 0x0F, 0x1E),
+        surface:   Pixel::rgb(0x18, 0x1F, 0x33),
+        fg:        Pixel::rgb(0xE8, 0xEC, 0xF4),
+        muted:     Pixel::rgb(0x97, 0xA0, 0xB8),
+        accent:    Pixel::rgb(0x3D, 0xD0, 0xBC),
+        accent_fg: Pixel::rgb(0x05, 0x10, 0x1A),
+        border:    Pixel::rgb(0x2C, 0x36, 0x55),
     };
 }
 
@@ -173,13 +198,16 @@ impl Button {
 
 impl Widget for Button {
     fn draw(&self, fb: &mut Framebuffer, bounds: Rect, theme: &Theme) {
-        let (bg, fg) = if self.focused {
-            (theme.accent, theme.accent_fg)
+        // At rest a button is a raised `surface` chip with a quiet
+        // border; focused, it fills with `accent` and the border becomes
+        // an accent focus-ring so the active control is unmistakable.
+        let (bg, fg, border) = if self.focused {
+            (theme.accent, theme.accent_fg, theme.accent)
         } else {
-            (theme.bg, theme.fg)
+            (theme.surface, theme.fg, theme.border)
         };
         fb.fill_rect(bounds.x, bounds.y, bounds.w, bounds.h, bg);
-        draw_border(fb, bounds, theme.border);
+        draw_border(fb, bounds, border);
 
         let text_w = GLYPH_WIDTH * self.text.chars().count() as u32;
         let inner = bounds.shrink(2);
@@ -235,7 +263,9 @@ impl Widget for Frame {
             let ty = bounds.y;
             let strip_w = GLYPH_WIDTH * self.title.chars().count() as u32 + 4;
             fb.fill_rect(tx.saturating_sub(2), ty, strip_w, 1, theme.bg);
-            draw_text(fb, tx, ty.saturating_sub(GLYPH_HEIGHT / 4), &self.title, theme.fg, theme.bg);
+            // A frame title is chrome, not content → muted, painted over
+            // the frame's own `bg` fill so the glyph cells match.
+            draw_text(fb, tx, ty.saturating_sub(GLYPH_HEIGHT / 4), &self.title, theme.muted, theme.bg);
         }
 
         let inner = bounds.shrink(self.padding);
@@ -384,4 +414,67 @@ fn draw_border(fb: &mut Framebuffer, r: Rect, color: Pixel) {
     fb.fill_rect(r.x, r.y + r.h - 1, r.w, 1, color);
     fb.fill_rect(r.x, r.y, 1, r.h, color);
     fb.fill_rect(r.x + r.w - 1, r.y, 1, r.h, color);
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2.x relative luminance of one channel (sRGB → linear light).
+    fn channel(c: u8) -> f64 {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+
+    fn luminance(p: Pixel) -> f64 {
+        0.2126 * channel(p.r) + 0.7152 * channel(p.g) + 0.0722 * channel(p.b)
+    }
+
+    /// WCAG contrast ratio of two colors: 1.0 (identical) … 21.0
+    /// (black vs white). Body text needs ≥ 4.5 for AA.
+    fn contrast(a: Pixel, b: Pixel) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The polish pass is only worth anything if the palette is actually
+    /// legible. Lock that in: every text-over-fill pair a user reads
+    /// must clear WCAG AA, and the dark-UI layering invariant
+    /// (`surface` sits *above* `bg`) must hold.
+    #[test]
+    fn default_theme_meets_wcag_aa() {
+        let t = Theme::DRDR;
+
+        // Primary text is read at length → hold it to AAA (≥ 7:1).
+        assert!(contrast(t.fg, t.bg) >= 7.0, "fg/bg = {}", contrast(t.fg, t.bg));
+        assert!(
+            contrast(t.fg, t.surface) >= 7.0,
+            "fg/surface = {}",
+            contrast(t.fg, t.surface)
+        );
+        // Button label on the accent fill, and muted chrome on bg → AA.
+        assert!(
+            contrast(t.accent_fg, t.accent) >= 4.5,
+            "accent_fg/accent = {}",
+            contrast(t.accent_fg, t.accent)
+        );
+        assert!(
+            contrast(t.muted, t.bg) >= 4.5,
+            "muted/bg = {}",
+            contrast(t.muted, t.bg)
+        );
+
+        // `surface` must be visibly raised above `bg` (lighter) and not
+        // accidentally equal to it — that's what sells depth on a flat
+        // framebuffer with no shadows.
+        assert!(luminance(t.surface) > luminance(t.bg));
+        assert_ne!(t.surface, t.bg);
+        // Borders have to separate regions at rest, so they must differ
+        // from the surface they're drawn against.
+        assert_ne!(t.border, t.surface);
+        assert_ne!(t.border, t.bg);
+    }
 }
