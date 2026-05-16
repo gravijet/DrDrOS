@@ -38,6 +38,12 @@ APPEND="console=tty0 console=ttyS0 loglevel=4"
 ACCEL=()
 ISO_PATH=""
 UEFI=0
+# KVM is auto-enabled below when /dev/kvm exists. Without hardware
+# virtualisation QEMU emulates every instruction in software, and
+# DrDrDesk's full-scene repaint is heavy enough that the mouse lags
+# badly — so KVM is the default, not an opt-in. `--no-kvm` forces the
+# slow pure-emulation path (e.g. to reproduce a TCG-only bug).
+NO_KVM=0
 # QEMU's default `pc` machine exposes only a PS/2 keyboard via i8042 and
 # (in this kernel/QEMU combo) no pointer device at all — DrDrDesk then
 # runs keyboard-only and the mouse is dead. Give the VM a USB mouse on
@@ -57,11 +63,11 @@ for arg in "$@"; do
             APPEND="console=ttyS0 loglevel=4"
             ;;
         --kvm)
-            if [[ -e /dev/kvm ]]; then
-                ACCEL=(-enable-kvm -cpu host)
-            else
-                echo "warning: /dev/kvm not present, skipping --kvm" >&2
-            fi
+            # Kept for compatibility / explicitness; KVM is now the
+            # default whenever /dev/kvm exists (see below).
+            ;;
+        --no-kvm)
+            NO_KVM=1
             ;;
         --iso)
             ISO_PATH="$REPO_ROOT/iso/drdros.iso"
@@ -74,11 +80,22 @@ for arg in "$@"; do
             UEFI=1
             ;;
         *)
-            echo "usage: $0 [--headless] [--kvm] [--iso] [--uefi]" >&2
+            echo "usage: $0 [--headless] [--kvm] [--no-kvm] [--iso] [--uefi]" >&2
             exit 2
             ;;
     esac
 done
+
+# Enable KVM by default when the host can (massive speed-up; DrDrDesk's
+# repaint is unusably laggy under pure TCG emulation). --no-kvm opts out.
+if [[ $NO_KVM -eq 0 && -e /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+    ACCEL=(-enable-kvm -cpu host)
+    echo "[qemu.sh] KVM acceleration enabled"
+elif [[ $NO_KVM -eq 1 ]]; then
+    echo "[qemu.sh] KVM disabled (--no-kvm) — expect slow software emulation" >&2
+else
+    echo "[qemu.sh] /dev/kvm not usable — falling back to slow software emulation" >&2
+fi
 
 # --iso boots from the GRUB ISO instead of -kernel/-initrd, so we
 # exercise the full boot chain like real hardware does.

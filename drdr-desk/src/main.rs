@@ -89,12 +89,20 @@ fn main() -> ExitCode {
 
     // Keyboard is required; the mouse is optional (keyboard-only is a
     // valid fallback — Alt-Tab + arrow keys still drive everything).
-    let kbd_path = match args.kbd_path.clone().or_else(detect_keyboard) {
+    // We *wait* for it: on real UEFI hardware the keyboard is USB and
+    // enumerates a beat after we start (see `wait_for_device`). Hard-
+    // exiting on the first miss is what makes a real machine sit on the
+    // boot splash forever (exit → drdr-init respawn → race → repeat).
+    // 12s is generous for USB enumeration; an explicit --kbd skips it.
+    let kbd_path = match args.kbd_path.clone() {
         Some(p) => p,
-        None => {
-            eprintln!("drdr-desk: no keyboard under /dev/input — pass --kbd");
-            return ExitCode::from(1);
-        }
+        None => match wait_for_device("keyboard", Duration::from_secs(12), detect_keyboard) {
+            Some(p) => p,
+            None => {
+                eprintln!("drdr-desk: no keyboard under /dev/input — pass --kbd");
+                return ExitCode::from(1);
+            }
+        },
     };
     let keys = match KeyReader::open(&kbd_path) {
         Ok(k) => k,
@@ -105,17 +113,14 @@ fn main() -> ExitCode {
     };
     eprintln!("[drdr-desk] keyboard: {kbd_path}");
 
-    // An explicit --mouse wins; otherwise auto-detect, but *wait* for it:
-    // a USB pointer enumerates asynchronously (xHCI) and can appear a
-    // second or two after we start, while the PS/2 keyboard is there
-    // synchronously. Checking once would lose that race and strand us in
-    // keyboard-only mode with a dead mouse. wait_for_mouse returns the
+    // An explicit --mouse wins; otherwise auto-detect, but *wait* for it
+    // (see `wait_for_device`): a USB pointer enumerates asynchronously
+    // and appears a beat after we start. wait_for_device returns the
     // instant a relative pointer shows up, or None after the budget (a
-    // genuinely mouseless box just stays keyboard-only, a few seconds
-    // later).
+    // genuinely mouseless box just stays keyboard-only, 4s later).
     let mouse_path = match args.mouse_path.clone() {
         Some(p) => Some(p),
-        None => wait_for_mouse(Duration::from_secs(4)),
+        None => wait_for_device("pointer", Duration::from_secs(4), detect_mouse),
     };
     let pointer = match &mouse_path {
         Some(p) => match PointerReader::open(p) {
@@ -163,12 +168,19 @@ fn main() -> ExitCode {
     // the clear-then-repaint sequence being scanned out mid-draw.
     let mut back = Framebuffer::in_memory(fb.width, fb.height);
 
-    // The event loop. Draw to the back buffer, present it, then block
-    // for input *or* a heartbeat (which also refreshes time-based
-    // windows like the DrDrNet panel). We repaint every iteration —
-    // Tier 2 keeps the loop trivial; dirty-rect repainting is a later
-    // optimisation, no longer needed for flicker now that we present
-    // whole frames.
+    // The event loop. Draw the whole scene to the back buffer, present
+    // it in one blit, then block for input or the heartbeat.
+    //
+    // Then *coalesce*: a full redraw + ~3 MB present is far slower than
+    // the 60–125 motion packets/sec a USB mouse emits. Repainting once
+    // per packet makes the renderer fall behind, events back up in the
+    // kernel buffer, and the cursor lags seconds behind the hand. So
+    // after the blocking wait we drain everything already queued,
+    // applying it WITHOUT a repaint between events — one repaint per
+    // batch. The 0 ms poll is a non-blocking "is anything else waiting?"
+    // and `Tick` from it means "queue empty". The count cap still forces
+    // a repaint during *continuous* motion (a window drag) so the screen
+    // keeps up instead of freezing until the hand stops.
     loop {
         wm.draw(&mut back, &theme);
         fb.present(&back);
@@ -179,6 +191,15 @@ fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("drdr-desk: input error: {e}");
                 thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        }
+        for _ in 0..16 {
+            match hub.poll_event(Duration::from_millis(0)) {
+                Ok(HubEvent::Key(k)) => wm.handle_key(k),
+                Ok(HubEvent::Mouse(m)) => wm.handle_mouse(m),
+                Ok(HubEvent::Tick) => break, // nothing more queued
+                Err(_) => break,
             }
         }
     }
@@ -255,22 +276,31 @@ fn hostname() -> String {
     "drdros".into()
 }
 
-/// Poll [`detect_mouse`] until a relative pointer appears or `budget`
-/// elapses. Returns the moment one shows up (so a present mouse costs
-/// only its enumeration time, ~1s on QEMU xHCI), or `None` after the
-/// budget for a box that truly has no pointer. See the call site for
-/// why a single check races USB enumeration and loses.
-fn wait_for_mouse(budget: Duration) -> Option<String> {
+/// Poll `detect` until it finds a device or `budget` elapses, returning
+/// the moment one appears (so a present device costs only its
+/// enumeration time, not the whole budget).
+///
+/// Why this is needed for *both* keyboard and mouse: USB HID devices
+/// enumerate **asynchronously** — the controller (xHCI) probes, then the
+/// device is found a second or two later. A single check at startup
+/// races that and loses. In QEMU we hand the VM a *PS/2* keyboard
+/// (i8042, synchronous, there instantly) so only the USB mouse raced;
+/// but on real UEFI hardware the keyboard is USB too, so it races
+/// exactly the same way — and because the keyboard is mandatory,
+/// drdr-desk would exit, drdr-init would respawn it, it would race
+/// again, and the machine would sit on the boot splash forever.
+fn wait_for_device(
+    what: &str,
+    budget: Duration,
+    detect: impl Fn() -> Option<String>,
+) -> Option<String> {
     let deadline = Instant::now() + budget;
     loop {
-        if let Some(p) = detect_mouse() {
+        if let Some(p) = detect() {
             return Some(p);
         }
         if Instant::now() >= deadline {
-            eprintln!(
-                "[drdr-desk] no pointer after {}s — keyboard-only",
-                budget.as_secs()
-            );
+            eprintln!("[drdr-desk] no {what} after {}s", budget.as_secs());
             return None;
         }
         thread::sleep(Duration::from_millis(100));
