@@ -504,46 +504,216 @@ impl InputHub {
 }
 
 // ─── Device auto-detection ───────────────────────────────────────────
+//
+// We pick devices by *what they can do*, not by which kernel "handler"
+// is bound to them. The naive "find a device whose `H: Handlers=` lists
+// `kbd`" is wrong: the ACPI **Power Button** also uses the `kbd` handler
+// (it emits KEY_POWER), and on QEMU it enumerates as `event0` — *before*
+// the real keyboard — so handler-matching opens the Power Button and no
+// keystroke ever arrives. Likewise the mouse's `mouseN` handler only
+// exists if the kernel has `CONFIG_INPUT_MOUSEDEV`, which we don't need
+// (we read evdev directly) and don't compile.
+//
+// Instead we read each device's `B: EV=` capability bitmask from
+// `/proc/bus/input/devices`. `EV` is a bit per evdev event *type*
+// (linux/input-event-codes.h): bit `EV_KEY` = it has keys, bit `EV_REL`
+// = it reports relative motion (a mouse), bit `EV_REP` = it does key
+// auto-repeat (every real keyboard does; buttons like Power/Sleep do
+// not). That last bit is exactly what separates a keyboard from the
+// Power Button. This also works unchanged on real USB hardware.
 
-/// Find an input device whose kernel `H: Handlers=` line lists `want`
-/// (e.g. `"kbd"` or `"mouse"`), returning its `/dev/input/eventN` path.
-///
-/// `/proc/bus/input/devices` is the kernel's plain-text inventory of
-/// every input device: blank-line-separated blocks, one `H:` line each
-/// naming the handlers bound to it (`kbd`, `mouse0`, `event3`, …). We
-/// scan for the capability we want and read the `eventN` node off the
-/// same line — no hard-coding `/dev/input/event0`.
-fn detect_by_handler(want: &str) -> Option<String> {
-    let table = fs::read_to_string("/proc/bus/input/devices").ok()?;
-    for line in table.lines() {
-        let Some(handlers) = line.strip_prefix("H: Handlers=") else {
-            continue;
-        };
-        let toks: Vec<&str> = handlers.split_whitespace().collect();
-        let matches = toks.iter().any(|t| {
-            *t == want || (want == "mouse" && t.starts_with("mouse"))
-        });
-        if matches {
-            if let Some(ev) = toks.iter().find(|t| t.starts_with("event")) {
-                return Some(format!("/dev/input/{ev}"));
-            }
-        }
-    }
-    None
+/// `1 << EV_KEY` — device has keys. (`EV_KEY` = 0x01.)
+const EVBIT_KEY: u64 = 1 << 0x01;
+/// `1 << EV_REL` — device reports relative motion → it's a mouse.
+const EVBIT_REL: u64 = 1 << 0x02;
+/// `1 << EV_REP` — device does autorepeat → it's a real keyboard, not a
+/// Power/Sleep button (those are `EV=3`: SYN+KEY only).
+const EVBIT_REP: u64 = 1 << 0x14;
+
+/// One parsed `/proc/bus/input/devices` block: the `eventN` node name
+/// and the `EV=` capability bitmask. Everything else is ignored.
+struct InputDev {
+    event: String,
+    ev: u64,
 }
 
-/// Auto-detect the keyboard's event node (handler `kbd`). Falls back to
-/// the first existing `event*` so a minimal QEMU still finds something.
+/// Parse `/proc/bus/input/devices` into (eventNode, EV-mask) pairs.
+///
+/// The file is blank-line-separated blocks; within a block we only need
+/// `H: Handlers=… eventN …` (which `/dev/input` node to open) and
+/// `B: EV=<hex>` (the capability bitmask). Devices with no `event*`
+/// handler (can't be read via evdev) are skipped.
+fn parse_input_devices() -> Vec<InputDev> {
+    match fs::read_to_string("/proc/bus/input/devices") {
+        Ok(table) => parse_input_devices_str(&table),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The pure parser, split out so it can be unit-tested against a fixed
+/// `/proc/bus/input/devices` sample without touching the real filesystem.
+fn parse_input_devices_str(table: &str) -> Vec<InputDev> {
+    let mut out = Vec::new();
+    let mut event: Option<String> = None;
+    let mut ev: u64 = 0;
+    let flush = |event: &mut Option<String>, ev: &mut u64, out: &mut Vec<InputDev>| {
+        if let Some(e) = event.take() {
+            out.push(InputDev { event: e, ev: *ev });
+        }
+        *ev = 0;
+    };
+    for line in table.lines() {
+        if line.is_empty() {
+            flush(&mut event, &mut ev, &mut out);
+        } else if let Some(h) = line.strip_prefix("H: Handlers=") {
+            event = h
+                .split_whitespace()
+                .find(|t| t.starts_with("event"))
+                .map(|t| t.to_string());
+        } else if let Some(rest) = line.strip_prefix("B: EV=") {
+            // The kernel prints EV as one hex word (no spaces), e.g.
+            // `120013`. KEY/REL bitmaps are multi-word but we don't need
+            // them — the EV type mask alone classifies the device.
+            ev = u64::from_str_radix(rest.trim(), 16).unwrap_or(0);
+        }
+    }
+    flush(&mut event, &mut ev, &mut out); // file may not end with a blank line
+    out
+}
+
+/// Auto-detect the keyboard's evdev node.
+///
+/// A real keyboard has `EV_KEY` **and** `EV_REP` set — the autorepeat
+/// bit is what tells it apart from the ACPI Power/Sleep buttons (which
+/// also carry the `kbd` handler but are `EV=3`). Falls back to any
+/// keyed device, then `event0`, so an unusual setup still gets *a* try.
 pub fn detect_keyboard() -> Option<String> {
-    detect_by_handler("kbd").or_else(|| {
+    pick_keyboard(&parse_input_devices()).or_else(|| {
         (0..16)
             .map(|n| format!("/dev/input/event{n}"))
             .find(|p| Path::new(p).exists())
     })
 }
 
-/// Auto-detect the mouse's event node (handler `mouseN`). Returns `None`
-/// if there is no pointer — the desktop then runs keyboard-only.
+/// Keyboard selection over an already-parsed device list (pure, tested).
+fn pick_keyboard(devs: &[InputDev]) -> Option<String> {
+    devs.iter()
+        .find(|d| d.ev & EVBIT_KEY != 0 && d.ev & EVBIT_REP != 0)
+        .or_else(|| devs.iter().find(|d| d.ev & EVBIT_KEY != 0))
+        .map(|d| format!("/dev/input/{}", d.event))
+}
+
+/// Auto-detect the mouse's evdev node: the device that reports relative
+/// motion (`EV_REL`). Returns `None` if there is no pointer — the
+/// desktop then runs keyboard-only.
+///
+/// Note this is the *relative* pointer our [`PointerReader`] decodes; an
+/// absolute device (a `usb-tablet`, `EV_ABS`) is intentionally not
+/// matched because we don't decode absolute axes yet.
 pub fn detect_mouse() -> Option<String> {
-    detect_by_handler("mouse")
+    pick_mouse(&parse_input_devices())
+}
+
+/// Mouse selection over an already-parsed device list (pure, tested).
+fn pick_mouse(devs: &[InputDev]) -> Option<String> {
+    devs.iter()
+        .find(|d| d.ev & EVBIT_REL != 0)
+        .map(|d| format!("/dev/input/{}", d.event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim `/proc/bus/input/devices` from a DrDrOS QEMU boot, with a
+    /// USB mouse block appended. The trap this locks down: the ACPI
+    /// **Power Button** (`event0`) carries the `kbd` handler and sorts
+    /// *before* the real keyboard, so the old handler-matching opened
+    /// `event0` and no keystroke ever arrived.
+    const SAMPLE: &str = "\
+I: Bus=0019 Vendor=0000 Product=0001 Version=0000
+N: Name=\"Power Button\"
+P: Phys=LNXPWRBN/button/input0
+S: Sysfs=/devices/LNXSYSTM:00/LNXPWRBN:00/input/input0
+U: Uniq=
+H: Handlers=kbd event0
+B: PROP=0
+B: EV=3
+B: KEY=8000 10000000000000 0
+
+I: Bus=0011 Vendor=0001 Product=0001 Version=ab41
+N: Name=\"AT Translated Set 2 keyboard\"
+P: Phys=isa0060/serio0/input0
+S: Sysfs=/devices/platform/i8042/serio0/input/input1
+U: Uniq=
+H: Handlers=sysrq kbd leds event1
+B: PROP=0
+B: EV=120013
+B: KEY=402000007 ff803078f800d001 feffffdfffcfffff fffffffffffffffe
+B: MSC=10
+B: LED=7
+
+I: Bus=0003 Vendor=0627 Product=0001 Version=0000
+N: Name=\"QEMU QEMU USB Mouse\"
+P: Phys=usb-0000:00:01.2-1/input0
+S: Sysfs=/devices/pci0000:00/0000:00:01.2/usb1/1-1/1-1:1.0/input/input2
+U: Uniq=
+H: Handlers=event2
+B: PROP=0
+B: EV=17
+B: KEY=70000 0 0 0 0
+B: REL=103
+";
+
+    #[test]
+    fn parses_event_node_and_ev_mask() {
+        let d = parse_input_devices_str(SAMPLE);
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].event, "event0");
+        assert_eq!(d[0].ev, 0x3); // Power Button: SYN+KEY only
+        assert_eq!(d[1].event, "event1");
+        assert_eq!(d[1].ev, 0x120013); // keyboard: …+REP+LED
+        assert_eq!(d[2].event, "event2");
+        assert_eq!(d[2].ev, 0x17); // mouse: …+REL
+    }
+
+    #[test]
+    fn keyboard_pick_skips_the_power_button() {
+        let d = parse_input_devices_str(SAMPLE);
+        // The whole point: NOT event0 (Power Button, no EV_REP).
+        assert_eq!(pick_keyboard(&d).as_deref(), Some("/dev/input/event1"));
+    }
+
+    #[test]
+    fn mouse_pick_finds_the_relative_pointer() {
+        let d = parse_input_devices_str(SAMPLE);
+        assert_eq!(pick_mouse(&d).as_deref(), Some("/dev/input/event2"));
+    }
+
+    #[test]
+    fn no_pointer_means_no_mouse() {
+        // Power Button + keyboard only (the pre-usb-mouse QEMU state):
+        // detection must return None, not a false positive.
+        let kbd_only = SAMPLE.split("\nI: Bus=0003").next().unwrap();
+        let d = parse_input_devices_str(kbd_only);
+        assert_eq!(d.len(), 2);
+        assert_eq!(pick_mouse(&d), None);
+        assert_eq!(pick_keyboard(&d).as_deref(), Some("/dev/input/event1"));
+    }
+
+    #[test]
+    fn an_absolute_tablet_is_not_picked_as_a_mouse() {
+        // usb-tablet reports EV_ABS (bit 3 → 0x8), not EV_REL. We don't
+        // decode absolute axes, so it must NOT be chosen (keyboard-only
+        // is correct until PointerReader grows EV_ABS support).
+        let tablet = "\
+N: Name=\"QEMU USB Tablet\"
+H: Handlers=event3
+B: EV=b
+B: ABS=3
+";
+        let d = parse_input_devices_str(tablet);
+        assert_eq!(d[0].ev, 0xb); // SYN+KEY+ABS, no REL
+        assert_eq!(pick_mouse(&d), None);
+    }
 }

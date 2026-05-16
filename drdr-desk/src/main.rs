@@ -105,7 +105,18 @@ fn main() -> ExitCode {
     };
     eprintln!("[drdr-desk] keyboard: {kbd_path}");
 
-    let mouse_path = args.mouse_path.clone().or_else(detect_mouse);
+    // An explicit --mouse wins; otherwise auto-detect, but *wait* for it:
+    // a USB pointer enumerates asynchronously (xHCI) and can appear a
+    // second or two after we start, while the PS/2 keyboard is there
+    // synchronously. Checking once would lose that race and strand us in
+    // keyboard-only mode with a dead mouse. wait_for_mouse returns the
+    // instant a relative pointer shows up, or None after the budget (a
+    // genuinely mouseless box just stays keyboard-only, a few seconds
+    // later).
+    let mouse_path = match args.mouse_path.clone() {
+        Some(p) => Some(p),
+        None => wait_for_mouse(Duration::from_secs(4)),
+    };
     let pointer = match &mouse_path {
         Some(p) => match PointerReader::open(p) {
             Ok(pr) => {
@@ -242,6 +253,28 @@ fn hostname() -> String {
         }
     }
     "drdros".into()
+}
+
+/// Poll [`detect_mouse`] until a relative pointer appears or `budget`
+/// elapses. Returns the moment one shows up (so a present mouse costs
+/// only its enumeration time, ~1s on QEMU xHCI), or `None` after the
+/// budget for a box that truly has no pointer. See the call site for
+/// why a single check races USB enumeration and loses.
+fn wait_for_mouse(budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(p) = detect_mouse() {
+            return Some(p);
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[drdr-desk] no pointer after {}s — keyboard-only",
+                budget.as_secs()
+            );
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // ─── Argv ────────────────────────────────────────────────────────────
