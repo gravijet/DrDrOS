@@ -297,6 +297,40 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Copy a whole frame from `src` onto this framebuffer in one pass —
+    /// the *present* step of double buffering.
+    ///
+    /// Why this exists: painting straight onto the mmap'd `/dev/fb0` lets
+    /// the monitor scan out a half-drawn frame (cleared background, then
+    /// windows appearing one by one) — that's the flicker. The cure is
+    /// to render the whole scene into an off-screen [`in_memory`] buffer
+    /// and then blit it here in a single tight copy, so the screen only
+    /// ever shows complete frames.
+    ///
+    /// Both surfaces must be 32bpp (the only depth we render). The copy
+    /// is row-by-row because the on-screen framebuffer's `pitch` (bytes
+    /// per row) is often padded wider than `width * 4`, while the heap
+    /// back buffer is exactly `width * 4` — the byte offsets don't line
+    /// up, so a single flat `copy_from_slice` would shear the image.
+    /// Mismatched sizes are clipped to the overlapping region.
+    pub fn present(&mut self, src: &Framebuffer) {
+        if self.bpp != 32 || src.bpp != 32 {
+            return;
+        }
+        let w = self.width.min(src.width) as usize;
+        let h = self.height.min(src.height) as usize;
+        let row_bytes = w * 4;
+        let dst_pitch = self.pitch as usize;
+        let src_pitch = src.pitch as usize;
+        let src_buf = src.buffer_ro();
+        let dst_buf = self.buffer();
+        for y in 0..h {
+            let s = y * src_pitch;
+            let d = y * dst_pitch;
+            dst_buf[d..d + row_bytes].copy_from_slice(&src_buf[s..s + row_bytes]);
+        }
+    }
+
     /// Mutable view over the framebuffer bytes — mmap or heap.
     fn buffer(&mut self) -> &mut [u8] {
         match &mut self.backend {
