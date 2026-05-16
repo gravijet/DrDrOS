@@ -18,11 +18,15 @@
 //!   - [`input`] module with [`KeyReader`], [`Event`], [`KeyCode`],
 //!     [`EventResponse`] — opens `/dev/input/eventN` and decodes raw
 //!     evdev records into framework events.
+//!   - [`vt`] module with [`VtGuard`] — takes the virtual terminal off
+//!     the kernel (graphics mode + keyboard silenced) so fbcon stops
+//!     fighting us for `/dev/fb0`, and restores it on exit.
 //!
 //! Coordinate system: (0, 0) is the top-left pixel; +x goes right, +y
 //! goes down — same as the framebuffer underneath.
 
 pub mod input;
+pub mod vt;
 pub mod window;
 
 use drdr_fb::{Framebuffer, Pixel};
@@ -33,6 +37,7 @@ pub use input::{
     detect_keyboard, detect_mouse, Event, EventResponse, HubEvent, InputHub, KeyCode, KeyReader,
     MouseButton, MouseEvent, PointerReader,
 };
+pub use vt::VtGuard;
 pub use window::{AppControl, Cell, TextGrid, Window, WindowApp, WindowManager};
 
 // ─── Geometry ────────────────────────────────────────────────────────

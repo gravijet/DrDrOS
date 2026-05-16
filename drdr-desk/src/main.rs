@@ -37,8 +37,8 @@ use drdr_fb::Framebuffer;
 use drdr_net::status::{KIND_STAT_OK, Stat};
 use drdr_net::{Frame, pack, reactor};
 use drdr_ui::{
-    HubEvent, InputHub, KeyReader, PointerReader, Rect, Theme, WindowManager, detect_keyboard,
-    detect_mouse,
+    HubEvent, InputHub, KeyReader, PointerReader, Rect, Theme, VtGuard, WindowManager,
+    detect_keyboard, detect_mouse,
 };
 
 use apps::{AboutApp, FilesApp, NetApp, SystemApp};
@@ -123,16 +123,44 @@ fn main() -> ExitCode {
         }
     };
 
+    // Take the virtual terminal away from the kernel: graphics mode so
+    // fbcon stops repainting /dev/fb0 underneath us (the flicker + the
+    // "always-open terminal"), and keyboard silenced so keystrokes stop
+    // being echoed to the dead console instead of reaching us (we read
+    // the keyboard from evdev, which is unaffected). Held in `_vt` for
+    // the whole program: its Drop restores a usable text console on any
+    // exit, including a panic. Non-fatal like the splash — a serial-only
+    // boot has no VT to grab and that's fine.
+    let _vt = match VtGuard::acquire() {
+        Ok(g) => {
+            eprintln!("[drdr-desk] virtual terminal acquired (graphics mode)");
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("[drdr-desk] could not take over the console: {e} (continuing)");
+            None
+        }
+    };
+
     let mut hub = InputHub::new(keys, pointer);
     let mut wm = WindowManager::new(fb.width, fb.height);
     build_desktop(&mut wm, net_addr);
 
-    // The event loop. Draw, then block for input *or* a heartbeat (which
-    // also refreshes time-based windows like the DrDrNet panel). We
-    // repaint every iteration — Tier 2 keeps the loop trivial; dirty-rect
-    // repainting is a later optimisation.
+    // Double buffering: render the whole scene into this off-screen
+    // buffer, then blit it to /dev/fb0 in one pass (`fb.present`). The
+    // monitor only ever sees complete frames, so there's no flicker from
+    // the clear-then-repaint sequence being scanned out mid-draw.
+    let mut back = Framebuffer::in_memory(fb.width, fb.height);
+
+    // The event loop. Draw to the back buffer, present it, then block
+    // for input *or* a heartbeat (which also refreshes time-based
+    // windows like the DrDrNet panel). We repaint every iteration —
+    // Tier 2 keeps the loop trivial; dirty-rect repainting is a later
+    // optimisation, no longer needed for flicker now that we present
+    // whole frames.
     loop {
-        wm.draw(&mut fb, &theme);
+        wm.draw(&mut back, &theme);
+        fb.present(&back);
         match hub.poll_event(Duration::from_millis(250)) {
             Ok(HubEvent::Key(k)) => wm.handle_key(k),
             Ok(HubEvent::Mouse(m)) => wm.handle_mouse(m),
