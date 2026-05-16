@@ -38,6 +38,15 @@ APPEND="console=tty0 console=ttyS0 loglevel=4"
 ACCEL=()
 ISO_PATH=""
 UEFI=0
+# QEMU's default `pc` machine exposes only a PS/2 keyboard via i8042 and
+# (in this kernel/QEMU combo) no pointer device at all — DrDrDesk then
+# runs keyboard-only and the mouse is dead. Give the VM a USB mouse on
+# an explicit xHCI controller (the legacy `-usb` PIIX UHCI proved
+# flaky here). `usb-mouse` is a *relative* HID pointer (EV_REL),
+# exactly what PointerReader decodes. The kernel has USB_XHCI_HCD +
+# USB_HID + HID_GENERIC, so usbhid binds it as a normal
+# /dev/input/eventN.
+INPUT_ARGS=(-device qemu-xhci,id=xhci -device usb-mouse,bus=xhci.0)
 
 # Parse flags.
 for arg in "$@"; do
@@ -112,6 +121,7 @@ if [[ -n $ISO_PATH ]]; then
         -m 256M \
         -cdrom "$ISO_PATH" \
         -boot d \
+        "${INPUT_ARGS[@]}" \
         "${DISPLAY_ARGS[@]}" \
         "${SERIAL_ARGS[@]}"
     exit $?
@@ -124,5 +134,6 @@ exec qemu-system-x86_64 \
     -kernel "$KERNEL" \
     -initrd "$INITRD" \
     -append "$APPEND" \
+    "${INPUT_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     "${SERIAL_ARGS[@]}"
