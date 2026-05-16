@@ -38,7 +38,7 @@ pub use input::{
     MouseButton, MouseEvent, PointerReader,
 };
 pub use vt::VtGuard;
-pub use window::{AppControl, Cell, TextGrid, Window, WindowApp, WindowManager};
+pub use window::{AppControl, Cell, Spawn, TextGrid, Window, WindowApp, WindowManager};
 
 // ─── Geometry ────────────────────────────────────────────────────────
 

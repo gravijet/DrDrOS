@@ -165,9 +165,18 @@ pub enum AppControl {
     Close,
 }
 
-/// A program that lives in a window. The contract is intentionally
-/// four small methods — see the module docs for why it is *not* a
-/// terminal.
+/// A request from an app to open another window (e.g. DrDrFiles opening
+/// a file in the editor, or the launcher opening an app). The window
+/// manager drains these after every input call and `open`s each one.
+pub struct Spawn {
+    pub rect: Rect,
+    pub app: Box<dyn WindowApp>,
+}
+
+/// A program that lives in a window. The contract stays tiny — see the
+/// module docs for why it is *not* a terminal. Every method past
+/// `title`/`render` has a default, so an app implements only what it
+/// uses (About is still two methods; the editor uses them all).
 pub trait WindowApp {
     /// Shown in the title bar; may change frame to frame (e.g. a clock).
     fn title(&self) -> String;
@@ -182,10 +191,27 @@ pub trait WindowApp {
         AppControl::Continue
     }
 
+    /// A mouse click landed in the content area. `(col, row)` is the
+    /// character cell (already translated from pixels by the WM);
+    /// `double` is true on the second click of a double-click. Default
+    /// ignores it. This is the "forward content clicks to apps" the
+    /// Tier 2 notes deferred.
+    fn on_click(&mut self, col: u32, row: u32, double: bool) -> AppControl {
+        let _ = (col, row, double);
+        AppControl::Continue
+    }
+
     /// Periodic heartbeat (~ every `InputHub` tick), even when not
     /// focused — lets a clock or a network panel keep itself current.
     fn on_tick(&mut self) -> AppControl {
         AppControl::Continue
+    }
+
+    /// Windows this app wants opened. The WM calls this right after
+    /// `on_key`/`on_click`/`on_tick` and opens whatever is returned,
+    /// then the app's queue is empty again. Default: nothing.
+    fn take_spawns(&mut self) -> Vec<Spawn> {
+        Vec::new()
     }
 }
 
@@ -237,6 +263,21 @@ impl Window {
     fn close_rect(&self) -> Rect {
         let s = TITLE_H;
         Rect::new(self.rect.x + self.rect.w.saturating_sub(s), self.rect.y, s, s)
+    }
+
+    /// Map a screen pixel to the content character cell under it, or
+    /// `None` if the pixel is outside the content area / past the grid.
+    /// This is the pixels→(col,row) translation the WM needs to forward
+    /// a click to the app, which only ever thinks in cells.
+    fn cell_at(&self, x: i32, y: i32) -> Option<(u32, u32)> {
+        let c = self.content_rect();
+        if !hit(c, x, y) {
+            return None;
+        }
+        let col = (x - c.x as i32) as u32 / GLYPH_WIDTH;
+        let row = (y - c.y as i32) as u32 / GLYPH_HEIGHT;
+        let (cols, rows) = Self::grid_dims(self.rect);
+        (col < cols && row < rows).then_some((col, row))
     }
 }
 
@@ -301,6 +342,11 @@ struct Drag {
     grab_dy: i32,
 }
 
+/// How long (ms) between two clicks still counts as a double-click, and
+/// how far apart (px) they may land. Tuned for a hand on a real mouse.
+const DOUBLE_CLICK_MS: u128 = 450;
+const DOUBLE_CLICK_SLOP: i32 = 6;
+
 /// A stacking window manager: a back-to-front list of windows (no
 /// compositor, no clipping regions — just paint bottom-up and the top
 /// one wins the overlap), one focused window, a cursor, and drag state.
@@ -312,6 +358,16 @@ pub struct WindowManager {
     pointer_x: i32,
     pointer_y: i32,
     drag: Option<Drag>,
+    /// (when, x, y) of the last left-press, for double-click detection.
+    last_click: Option<(std::time::Instant, i32, i32)>,
+    /// Set whenever something visible changed; the event loop only
+    /// repaints when this is true, so an idle desktop costs nothing and
+    /// a burst of mouse packets collapses into one frame (smoothness).
+    dirty: bool,
+    /// Builds a fresh launcher window. When the last window closes we
+    /// call this so the user is never stranded on an empty desktop with
+    /// no way to reopen anything ("reopen closed windows").
+    launcher: Option<Box<dyn Fn() -> Spawn>>,
 }
 
 impl WindowManager {
@@ -325,12 +381,49 @@ impl WindowManager {
             pointer_x: (screen_w / 2) as i32,
             pointer_y: (screen_h / 2) as i32,
             drag: None,
+            last_click: None,
+            dirty: true,
+            launcher: None,
         }
+    }
+
+    /// Register the factory used to re-open the launcher when the
+    /// desktop becomes empty. Without one, closing the last window just
+    /// leaves the bare wordmark (still not a crash, but a dead end).
+    pub fn set_launcher(&mut self, f: impl Fn() -> Spawn + 'static) {
+        self.launcher = Some(Box::new(f));
+    }
+
+    /// True if the scene changed since the last [`draw`](Self::draw).
+    pub fn needs_redraw(&self) -> bool {
+        self.dirty
     }
 
     /// Add a window on top (it becomes focused).
     pub fn open(&mut self, rect: Rect, app: Box<dyn WindowApp>) {
         self.windows.push(Window::new(rect, app));
+        self.dirty = true;
+    }
+
+    /// Open everything an app queued via [`WindowApp::take_spawns`].
+    fn drain_spawns(&mut self, idx: usize) {
+        if let Some(w) = self.windows.get_mut(idx) {
+            let spawns = w.app.take_spawns();
+            for s in spawns {
+                self.open(s.rect, s.app);
+            }
+        }
+    }
+
+    /// If the desktop just emptied, bring the launcher back.
+    fn refill_if_empty(&mut self) {
+        if self.windows.is_empty() {
+            if let Some(f) = &self.launcher {
+                let s = f();
+                self.windows.push(Window::new(s.rect, s.app));
+            }
+        }
+        self.dirty = true;
     }
 
     pub fn window_count(&self) -> usize {
@@ -374,14 +467,19 @@ impl WindowManager {
     /// Feed a key to the focused window. AltTab is handled by the WM
     /// itself; everything else goes to the top app.
     pub fn handle_key(&mut self, key: KeyCode) {
+        self.dirty = true;
         if key == KeyCode::AltTab {
             self.cycle_focus();
             return;
         }
-        if let Some(top) = self.windows.last_mut() {
-            if top.app.on_key(key) == AppControl::Close {
-                self.windows.pop();
-            }
+        let Some(idx) = self.windows.len().checked_sub(1) else {
+            return;
+        };
+        let ctrl = self.windows[idx].app.on_key(key);
+        self.drain_spawns(idx);
+        if ctrl == AppControl::Close {
+            self.windows.remove(idx);
+            self.refill_if_empty();
         }
     }
 
@@ -389,6 +487,7 @@ impl WindowManager {
     /// any event (Tier 2 keeps the loop dead simple; dirty-rect
     /// repaint is a Tier 3 optimisation).
     pub fn handle_mouse(&mut self, ev: MouseEvent) {
+        self.dirty = true;
         match ev {
             MouseEvent::Moved { dx, dy } => {
                 self.pointer_x =
@@ -410,19 +509,36 @@ impl WindowManager {
             }
             MouseEvent::Button { button: MouseButton::Left, pressed: true } => {
                 let (x, y) = (self.pointer_x, self.pointer_y);
+                // Is this the second click of a double-click?
+                let now = std::time::Instant::now();
+                let double = matches!(self.last_click, Some((t, lx, ly))
+                    if now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
+                        && (lx - x).abs() <= DOUBLE_CLICK_SLOP
+                        && (ly - y).abs() <= DOUBLE_CLICK_SLOP);
+                self.last_click = Some((now, x, y));
+
                 if let Some(i) = self.hit_window(x, y) {
                     self.raise(i);
-                    let top = self.windows.last().unwrap();
+                    let idx = self.windows.len() - 1;
+                    let top = &self.windows[idx];
                     if hit(top.close_rect(), x, y) {
-                        self.windows.pop(); // close box
+                        self.windows.remove(idx); // close box
+                        self.refill_if_empty();
                     } else if hit(top.title_rect(), x, y) {
                         let r = top.rect;
                         self.drag = Some(Drag {
                             grab_dx: x - r.x as i32,
                             grab_dy: y - r.y as i32,
                         });
+                    } else if let Some((col, row)) = top.cell_at(x, y) {
+                        // Content click → the app, with the double flag.
+                        let ctrl = self.windows[idx].app.on_click(col, row, double);
+                        self.drain_spawns(idx);
+                        if ctrl == AppControl::Close {
+                            self.windows.remove(idx);
+                            self.refill_if_empty();
+                        }
                     }
-                    // Click in the content area: focus only for now.
                 }
             }
             MouseEvent::Button { button: MouseButton::Left, pressed: false } => {
@@ -436,13 +552,19 @@ impl WindowManager {
     /// keep refreshing even when it isn't focused). Windows whose app
     /// asks to close are removed.
     pub fn tick(&mut self) {
+        self.dirty = true; // panels (DrDrNet clock) refresh each beat
         let mut i = 0;
         while i < self.windows.len() {
-            if self.windows[i].app.on_tick() == AppControl::Close {
+            let ctrl = self.windows[i].app.on_tick();
+            self.drain_spawns(i);
+            if ctrl == AppControl::Close {
                 self.windows.remove(i);
             } else {
                 i += 1;
             }
+        }
+        if self.windows.is_empty() {
+            self.refill_if_empty();
         }
     }
 
@@ -465,7 +587,7 @@ impl WindowManager {
             theme.muted,
             theme.bg,
         );
-        let hint = "drag titlebars  *  Alt-Tab cycles  *  [x] closes";
+        let hint = "drag titlebars * Alt-Tab cycles * double-click opens * [x] closes";
         let hw = GLYPH_WIDTH * hint.len() as u32;
         drdr_font::draw_text(
             fb,
@@ -484,6 +606,7 @@ impl WindowManager {
         }
 
         draw_cursor(fb, self.pointer_x, self.pointer_y);
+        self.dirty = false; // scene is now on screen
     }
 }
 
