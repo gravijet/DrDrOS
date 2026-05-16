@@ -17,6 +17,31 @@ everything above it is ours.
 | **Target** | x86_64 PCs from the last 20 years · VirtualBox · QEMU · Ventoy USB |
 | **Status** | All phases at Tier 2+ · **boots to a real window manager** — drdr-init (PID 1, sets hostname + brings up `lo`) → DrDrDesk: overlapping windows, mouse, a live DrDrNet panel backed by a Tier 3 async reactor |
 
+### What you actually get when it boots
+
+Power on a PC (or a VM) and a few seconds later you are in a graphical
+desktop — no login, no shell, no X11:
+
+- **A real window manager** — overlapping, draggable, titled windows
+  with a hand-drawn mouse cursor. Alt-Tab to cycle, double-click to
+  open, `[x]` to close, drag the title bar to move.
+- **DrDrFiles** — browse the live filesystem; double-click a folder to
+  enter it or a file to open it; create files (`n`) and delete them
+  (`d`) with confirmation.
+- **DrDrEdit** — a genuine in-window text editor: type, navigate, edit,
+  save (no PTY, no terminal emulator — apps draw characters into a
+  grid the WM blits).
+- **Launcher** — reopen any window you closed; it comes back on its own
+  if you close *everything*, so the desktop is never a dead end.
+- **DrDrNet** — a live status panel speaking an original length-prefixed
+  binary protocol over a hand-rolled single-thread epoll reactor (no
+  tokio, no HTTP) across loopback TCP.
+- **Owns the screen properly** — takes the Linux VT into graphics mode
+  so the kernel text console can't fight it, double-buffers every
+  frame (no flicker), and coalesces input so the cursor stays smooth.
+
+Every pixel and keystroke above is handled by code in this repository.
+
 ---
 
 ## Philosophy
@@ -86,6 +111,46 @@ everything above it is ours.
 
 ---
 
+## Project stats
+
+A snapshot of the **from-scratch userland only** — the Linux kernel and
+the Buildroot tree are *not* counted, just code in this repo:
+
+| Metric | Value |
+|---|---|
+| Rust source | **8,221 lines** across **19 files** |
+| Workspace crates | **11** (every `drdr-*`) |
+| Tests | **41** (unit + integration, `cargo test`) |
+| Git commits | **36** |
+| Tracked files (excl. `buildroot/`) | **42** |
+| Development window | 2026-05-14 → 2026-05-16 |
+
+Lines of Rust per crate:
+
+| Crate | Lines | Crate | Lines |
+|---|--:|---|--:|
+| drdr-ui (GUI framework, WM)     | 2172 | drdr-init (PID 1)        | 421 |
+| drdr-net (binary proto + reactor)| 1518 | drdr-fb (framebuffer)    | 374 |
+| drdr-desk (window manager + apps)| 1100 | drdr-demo (showcase)     | 268 |
+| drdr-font (8×16 glyphs)         |  659 | drdr-tty (raw-mode help) | 186 |
+| drdr-shell (shell)              |  562 | drdr-edit (modal editor) | 463 |
+| drdr-files (file browser)       |  498 |                          |     |
+
+Regenerate these numbers any time:
+
+```sh
+git ls-files '*.rs' | grep -v '^buildroot/' | xargs wc -l | tail -1   # LOC
+git rev-list --count HEAD                                              # commits
+grep -rl '#\[test\]' --include='*.rs' . | grep -v buildroot \
+  | xargs grep -ch '#\[test\]' | paste -sd+ | bc                       # tests
+```
+
+> Numbers are a point-in-time snapshot (the commands above are the
+> source of truth). They count *our* userland; the kernel underneath is
+> stock Linux built by Buildroot and deliberately excluded.
+
+---
+
 ## Roadmap
 
 - [x] **Phase 1 — Foundation**
@@ -141,6 +206,18 @@ everything above it is ours.
       the server in a background thread; drdr-init brings `lo` up so the
       loopback TCP works) · **verified** end-to-end on the headless UEFI
       ISO boot: the panel shows the reactor serving ~4 req/s
+- [x] **Phase 7.5 — Desktop made usable** (field-hardening)
+      Killed the kernel `fbcon` fighting us for `/dev/fb0` (VT taken into
+      `KD_GRAPHICS`, keyboard silenced, restored on exit) · double-buffered
+      every frame (no flicker) · capability-based input detection (the ACPI
+      Power Button no longer steals the keyboard) · wait out async USB
+      enumeration for keyboard *and* mouse · input coalescing + repaint
+      only on change + KVM-by-default → smooth cursor · the desktop now
+      paints **before** input is attached (never a stuck splash) ·
+      **DrDrFiles** opens folders/files on double-click and can
+      create/delete · **DrDrEdit** runs as an in-window editor · a
+      **Launcher** reopens closed windows (and auto-returns when the
+      desktop is emptied)
 - [ ] **Phase 8 — DrDrNet over the wire + more windowed apps** (ahead)
 
 ---
@@ -184,11 +261,6 @@ cargo run -q -p drdr-edit  -- notes.txt        # ed-style line editor
 
 ---
 
-## License
-
-Dual-licensed under **MIT OR Apache-2.0** — pick whichever fits your project.
-
----
 
 *Built by [@gravijet](https://github.com/gravijet) and Claude.*
 <span style="background:#000;color:#000;cursor:pointer;" 
