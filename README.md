@@ -139,13 +139,13 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **10607 lines** across **19 files** |
+| Rust source | **11120 lines** across **20 files** |
 | Workspace crates | **12** (every `drdr-*`) |
-| Tests | **55** (`cargo test`, all green) |
-| Git commits | **37** |
-| Tracked files (excl. `buildroot/`) | **42** |
+| Tests | **62** (`cargo test`, all green) |
+| Git commits | **38** |
+| Tracked files (excl. `buildroot/`) | **48** |
 | Development window | 2026-05-14
-? → 2026-05-16 |
+? → 2026-05-17 |
 
 Lines of Rust per crate (largest first):
 
