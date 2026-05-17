@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+#
+# .githooks/pre-commit — regenerate the README stats before every commit
+# so the numbers in README.md always match the tree being committed.
+#
+# This hook is versioned (it lives in the repo, not in .git/hooks) and is
+# activated by `bash scripts/install-hooks.sh`, which sets
+# core.hooksPath=.githooks. That makes "the numbers update automatically
+# on commit" true for every clone, not just one machine.
+#
+# It re-stages README.md if (and only if) it changed, so the refreshed
+# numbers are part of the commit you are making. Set DRDROS_SKIP_STATS=1
+# to bypass (e.g. an unrelated --amend).
+
+set -euo pipefail
+
+[ "${DRDROS_SKIP_STATS:-0}" = "1" ] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+[ -x scripts/stats.sh ] || chmod +x scripts/stats.sh 2>/dev/null || true
+
+before="$(git hash-object README.md 2>/dev/null || echo none)"
+bash scripts/stats.sh >/dev/null
+after="$(git hash-object README.md 2>/dev/null || echo none)"
+
+if [ "$before" != "$after" ]; then
+  git add README.md
+  echo "[pre-commit] README.md stats refreshed and re-staged."
+fi
+
+exit 0

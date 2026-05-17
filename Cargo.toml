@@ -17,6 +17,7 @@ members = [
     "drdr-font",
     "drdr-tty",
     "drdr-fb",
+    "drdr-store",
     "drdr-demo",
     "drdr-desk",
 ]

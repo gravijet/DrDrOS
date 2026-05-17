@@ -71,6 +71,13 @@ const K_OFF: CInt = 0x04;
 nix::ioctl_write_int_bad!(kd_set_mode, 0x4B3A); // KDSETMODE
 nix::ioctl_read_bad!(kd_get_kbmode, 0x4B44, CInt); // KDGKBMODE
 nix::ioctl_write_int_bad!(kd_set_kbmode, 0x4B45); // KDSKBMODE
+// KDGKBTYPE: "what kind of keyboard does this console have". It only
+// succeeds on a real VT; on a serial line or a pty it fails with
+// ENOTTY. That makes it the standard, cheap "is this actually a virtual
+// terminal" probe (systemd and libvterm use exactly this) — we run it
+// first so a serial-only boot fails *fast and cleanly* instead of us
+// blindly issuing KD_GRAPHICS at something that will never show pixels.
+nix::ioctl_read_bad!(kd_get_kbtype, 0x4B33, u8); // KDGKBTYPE
 
 /// Owns the VT takeover for as long as it is alive.
 ///
@@ -94,6 +101,18 @@ impl VtGuard {
     pub fn acquire() -> io::Result<Self> {
         let tty = open_console()?;
         let fd = tty.as_raw_fd();
+
+        // Confirm this is a real VT before we touch its mode. On a
+        // serial-only / headless boot the "console" is not a VT and
+        // KDGKBTYPE returns ENOTTY — bail now (non-fatal: the caller
+        // just runs without a VT) instead of leaving the keyboard
+        // silenced on a console that can't draw anyway.
+        //
+        // SAFETY: `fd` is the freshly opened console fd, valid for this
+        // call; the ioctl writes exactly one byte into `kbtype`.
+        let mut kbtype: u8 = 0;
+        unsafe { kd_get_kbtype(fd, &mut kbtype) }
+            .map_err(|e| io::Error::other(format!("not a virtual terminal: {e}")))?;
 
         // Read the current keyboard mode so we can put it back exactly.
         // If the call fails (unlikely on a real VT) we still restore to
@@ -144,13 +163,26 @@ impl Drop for VtGuard {
 /// fallbacks for unusual setups. We need read+write because the console
 /// ioctls require a writable fd.
 fn open_console() -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut last_err =
         io::Error::new(io::ErrorKind::NotFound, "no console device found");
     for path in ["/dev/tty0", "/dev/console", "/dev/tty1", "/dev/tty"] {
         if !Path::new(path).exists() {
             continue;
         }
-        match OpenOptions::new().read(true).write(true).open(path) {
+        // O_NONBLOCK: opening certain tty devices can otherwise *block*
+        // until a carrier/handshake — on real hardware that is a silent
+        // hang with the screen frozen on the splash. The console ioctls
+        // we issue don't care about the blocking flag, so non-blocking
+        // open is free insurance. O_NOCTTY: never let this become our
+        // controlling terminal (we are not a shell).
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+            .open(path)
+        {
             Ok(f) => return Ok(f),
             Err(e) => last_err = e,
         }

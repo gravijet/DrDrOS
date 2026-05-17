@@ -1,0 +1,27 @@
+# drdr-store — DrDrOS persistent storage.
+#
+# DrDrOS runs entirely from RAM: nothing is written to disk unless the
+# user asks. This crate is that "ask" — it enumerates the machine's
+# real block devices, mounts a chosen one, and gives apps a single
+# `save()` / `load()` API plus a persisted notion of "where my files
+# live". Everything degrades safely to a RAM directory when there is no
+# disk (or we are not root), so it never blocks or panics a boot.
+
+[package]
+name        = "drdr-store"
+description = "DrDrOS persistent storage: block-device discovery, mounting, save/load."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lib]
+name = "drdr_store"
+path = "src/lib.rs"
+
+[dependencies]
+# mount(2)/umount(2) for attaching a real partition; no other deps —
+# the parsers are hand-rolled over /proc and /sys.
+nix = { version = "0.31.3", features = ["mount"] }

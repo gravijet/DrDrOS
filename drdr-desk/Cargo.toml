@@ -27,5 +27,8 @@ drdr-ui   = { path = "../drdr-ui" }
 # the window polls it over loopback TCP. Proves the protocol with an
 # actual app, not just unit tests.
 drdr-net  = { path = "../drdr-net" }
+# Persistent storage: disk discovery + mounting + save/load so the
+# Notes / editor / Disks windows can write to real media, not just RAM.
+drdr-store = { path = "../drdr-store" }
 # reboot(2) / poweroff for the System window's power entries.
 nix = { version = "0.31.3", features = ["reboot"] }

@@ -76,8 +76,11 @@ fn main() {
 
     // Paint the splash. Any failure here just logs and continues — we still
     // want the session on headless / serial-only boots where there's no fb0.
+    // We log the *detected pixel format*: on real machines (efifb on a
+    // Surface, say) a wrong format is the difference between a desktop and
+    // a screen that merely looks frozen, so make it visible on the console.
     match draw_splash("/dev/fb0") {
-        Ok(()) => println!("[drdr-init] framebuffer splash painted"),
+        Ok(desc) => println!("[drdr-init] framebuffer splash painted — {desc}"),
         Err(e) => println!("[drdr-init] no framebuffer splash: {e} (continuing)"),
     }
 
@@ -244,11 +247,17 @@ fn print_banner() {
 /// supervisor spawns the session within milliseconds, which repaints the
 /// screen itself — the splash just covers the gap so the user never stares
 /// at a blank/garbage framebuffer.
-fn draw_splash(path: &str) -> std::io::Result<()> {
+fn draw_splash(path: &str) -> std::io::Result<String> {
     let mut fb = Framebuffer::open(path)?;
+    let desc = fb.describe();
 
-    let theme = Theme::DRDR;
+    // Same palette the desktop boots into, so the hand-off is seamless.
+    let theme = Theme::DEFAULT;
     fb.clear(theme.bg);
+
+    // A soft vertical gradient instead of a flat fill — the boot screen
+    // should already feel like the modern desktop it hands off to.
+    fb.fill_rect_v(0, 0, fb.width, fb.height, theme.bg, theme.surface);
 
     // Centre two short lines vertically around the middle of the screen.
     let title = "DrDrOS";
@@ -264,10 +273,42 @@ fn draw_splash(path: &str) -> std::io::Result<()> {
     let title_y = fb.height / 2 - GLYPH_HEIGHT;
     let sub_y = fb.height / 2 + GLYPH_HEIGHT / 2;
 
-    draw_text(&mut fb, title_x, title_y, title, theme.fg, theme.bg);
+    // A 2x-scaled wordmark reads as a logo, not console text.
+    draw_text_scaled(&mut fb, title_x.saturating_sub(title_w / 2), title_y.saturating_sub(GLYPH_HEIGHT / 2), title, theme.accent, 2);
     draw_text(&mut fb, sub_x, sub_y, sub, theme.muted, theme.bg);
 
-    Ok(())
+    // An indeterminate progress bar so a slow real-hardware boot looks
+    // alive rather than hung.
+    let bw = (fb.width / 4).clamp(80, 360);
+    let bx = fb.width.saturating_sub(bw) / 2;
+    let by = sub_y + GLYPH_HEIGHT * 2;
+    fb.fill_rect(bx, by, bw, 4, theme.border);
+    fb.fill_rect(bx, by, bw / 3, 4, theme.accent);
+
+    // Print the detected pixel format on-screen too: if the desktop ever
+    // looks frozen on real hardware, the user can read the real format
+    // off the panel even with no serial cable.
+    let foot_y = fb.height.saturating_sub(GLYPH_HEIGHT + 6);
+    draw_text(&mut fb, 8, foot_y, &desc, theme.muted, theme.bg);
+
+    Ok(desc)
+}
+
+/// Draw `text` with each glyph blown up `scale`x by replicating pixels —
+/// cheap "big text" for the boot wordmark without a second font.
+fn draw_text_scaled(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: drdr_fb::Pixel, scale: u32) {
+    let mut cx = x;
+    for ch in text.bytes() {
+        let glyph = drdr_font::glyph_for(ch);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..8u32 {
+                if *bits & (0x80u8 >> col) != 0 {
+                    fb.fill_rect(cx + col * scale, y + row as u32 * scale, scale, scale, fg);
+                }
+            }
+        }
+        cx += GLYPH_WIDTH * scale;
+    }
 }
 
 /// Mount a single pseudo-filesystem; log success or failure, never panic.
