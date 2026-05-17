@@ -36,6 +36,7 @@ dependencies = [
  "drdr-fb",
  "drdr-font",
  "drdr-net",
+ "drdr-store",
  "drdr-ui",
  "nix",
 ]
@@ -89,6 +90,13 @@ dependencies = [
 [[package]]
 name = "drdr-shell"
 version = "0.1.0"
+
+[[package]]
+name = "drdr-store"
+version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "drdr-tty"

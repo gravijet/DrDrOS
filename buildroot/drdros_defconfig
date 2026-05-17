@@ -31,11 +31,15 @@ BR2_TOOLCHAIN_BUILDROOT_MUSL=y
 # top. The stock x86_64 defconfig ships NO framebuffer at all, so
 # linux-fb.config enables a DRM display driver for QEMU's `-vga std`
 # plus the fbdev-emulation layer that creates /dev/fb0 — without it the
-# whole framebuffer-only userland has nothing to draw on.
+# whole framebuffer-only userland has nothing to draw on. linux-input.config
+# guarantees evdev + USB-HID + xHCI + hid-multitouch, which is what a real
+# tablet (Surface Go 2: Type Cover over USB, HID touchscreen) needs to
+# have any input at all — Buildroot merges multiple space-separated
+# fragment files in order.
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_USE_DEFCONFIG=y
 BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DRDROS_PATH)/linux-fb.config"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DRDROS_PATH)/linux-fb.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-input.config"
 
 # ─── Root filesystem ────────────────────────────────────────────────────
 # Ship the rootfs as a gzipped cpio archive (initramfs). The Linux kernel

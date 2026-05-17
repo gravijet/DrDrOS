@@ -34,8 +34,8 @@ use drdr_font::{draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
 pub use input::{
-    detect_keyboard, detect_mouse, Event, EventResponse, HubEvent, InputHub, KeyCode, KeyReader,
-    MouseButton, MouseEvent, PointerReader,
+    detect_keyboard, detect_mouse, detect_touch, Event, EventResponse, HubEvent, InputHub,
+    KeyCode, KeyReader, MouseButton, MouseEvent, PointerReader,
 };
 pub use vt::VtGuard;
 pub use window::{AppControl, Cell, Spawn, TextGrid, Window, WindowApp, WindowManager};
@@ -122,6 +122,43 @@ impl Theme {
         accent_fg: Pixel::rgb(0x05, 0x10, 0x1A),
         border:    Pixel::rgb(0x2C, 0x36, 0x55),
     };
+
+    /// "DrDrOS Fluent" — the modern, light scheme the desktop now boots
+    /// into: a near-white workspace, true-white raised surfaces, and a
+    /// Windows-11-style blue accent. The same semantic roles, so every
+    /// existing widget restyles for free. Same contrast discipline as
+    /// `DRDR` (see `theme_meets_wcag_aa`): primary text at AAA, chrome
+    /// and accent labels at AA, `surface` provably lighter than `bg`.
+    pub const FLUENT: Self = Self {
+        bg:        Pixel::rgb(0xF3, 0xF3, 0xF3),
+        surface:   Pixel::rgb(0xFF, 0xFF, 0xFF),
+        fg:        Pixel::rgb(0x1B, 0x1B, 0x1B),
+        muted:     Pixel::rgb(0x5C, 0x5C, 0x5C),
+        accent:    Pixel::rgb(0x00, 0x67, 0xC0),
+        accent_fg: Pixel::rgb(0xFF, 0xFF, 0xFF),
+        border:    Pixel::rgb(0xD0, 0xD0, 0xD0),
+    };
+
+    /// The desktop default. Swapping this one constant reskins the whole
+    /// OS — boot splash, every window, the taskbar and Start menu.
+    pub const DEFAULT: Self = Self::FLUENT;
+
+    /// Toggle between the light and dark schemes (the Settings app).
+    pub fn toggled(&self) -> Self {
+        if self.bg == Self::FLUENT.bg { Self::DRDR } else { Self::FLUENT }
+    }
+
+    /// A slightly raised step above `surface` for hover / pressed chrome
+    /// (taskbar buttons, Start menu rows). Derived so a palette swap
+    /// keeps it consistent: nudge toward the accent on light themes,
+    /// toward white on dark ones.
+    pub fn hover(&self) -> Pixel {
+        if self.bg == Self::FLUENT.bg {
+            self.bg.lerp(self.accent, 36)
+        } else {
+            self.surface.lerp(Pixel::WHITE, 28)
+        }
+    }
 }
 
 // ─── Widget trait ────────────────────────────────────────────────────
@@ -455,36 +492,48 @@ mod tests {
     /// must clear WCAG AA, and the dark-UI layering invariant
     /// (`surface` sits *above* `bg`) must hold.
     #[test]
-    fn default_theme_meets_wcag_aa() {
-        let t = Theme::DRDR;
+    fn theme_meets_wcag_aa() {
+        // Both shipped palettes — light and dark — obey the same rules,
+        // so switching themes in Settings can never produce an illegible
+        // desktop.
+        for (name, t) in [("DRDR", Theme::DRDR), ("FLUENT", Theme::FLUENT)] {
+            // Primary text is read at length → hold it to AAA (≥ 7:1).
+            assert!(
+                contrast(t.fg, t.bg) >= 7.0,
+                "{name}: fg/bg = {}",
+                contrast(t.fg, t.bg)
+            );
+            assert!(
+                contrast(t.fg, t.surface) >= 7.0,
+                "{name}: fg/surface = {}",
+                contrast(t.fg, t.surface)
+            );
+            // Button label on the accent fill, and muted chrome on bg → AA.
+            assert!(
+                contrast(t.accent_fg, t.accent) >= 4.5,
+                "{name}: accent_fg/accent = {}",
+                contrast(t.accent_fg, t.accent)
+            );
+            assert!(
+                contrast(t.muted, t.bg) >= 4.5,
+                "{name}: muted/bg = {}",
+                contrast(t.muted, t.bg)
+            );
 
-        // Primary text is read at length → hold it to AAA (≥ 7:1).
-        assert!(contrast(t.fg, t.bg) >= 7.0, "fg/bg = {}", contrast(t.fg, t.bg));
-        assert!(
-            contrast(t.fg, t.surface) >= 7.0,
-            "fg/surface = {}",
-            contrast(t.fg, t.surface)
-        );
-        // Button label on the accent fill, and muted chrome on bg → AA.
-        assert!(
-            contrast(t.accent_fg, t.accent) >= 4.5,
-            "accent_fg/accent = {}",
-            contrast(t.accent_fg, t.accent)
-        );
-        assert!(
-            contrast(t.muted, t.bg) >= 4.5,
-            "muted/bg = {}",
-            contrast(t.muted, t.bg)
-        );
-
-        // `surface` must be visibly raised above `bg` (lighter) and not
-        // accidentally equal to it — that's what sells depth on a flat
-        // framebuffer with no shadows.
-        assert!(luminance(t.surface) > luminance(t.bg));
-        assert_ne!(t.surface, t.bg);
-        // Borders have to separate regions at rest, so they must differ
-        // from the surface they're drawn against.
-        assert_ne!(t.border, t.surface);
-        assert_ne!(t.border, t.bg);
+            // `surface` must be visibly raised above `bg` (lighter) and
+            // not accidentally equal to it — that's what sells depth on a
+            // flat framebuffer.
+            assert!(
+                luminance(t.surface) > luminance(t.bg),
+                "{name}: surface not lighter than bg"
+            );
+            assert_ne!(t.surface, t.bg, "{name}");
+            // Borders have to separate regions at rest.
+            assert_ne!(t.border, t.surface, "{name}");
+            assert_ne!(t.border, t.bg, "{name}");
+        }
+        // The Settings toggle round-trips between the two.
+        assert_eq!(Theme::FLUENT.toggled().bg, Theme::DRDR.bg);
+        assert_eq!(Theme::DRDR.toggled().bg, Theme::FLUENT.bg);
     }
 }

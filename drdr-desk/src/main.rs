@@ -34,14 +34,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use drdr_fb::Framebuffer;
+use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
 use drdr_net::status::{KIND_STAT_OK, Stat};
 use drdr_net::{Frame, pack, reactor};
 use drdr_ui::{
-    HubEvent, InputHub, KeyReader, PointerReader, Rect, Spawn, Theme, VtGuard, WindowManager,
-    detect_keyboard, detect_mouse,
+    HubEvent, InputHub, KeyReader, PointerReader, Px, Rect, Spawn, Theme, VtGuard,
+    WindowManager, detect_keyboard, detect_mouse, detect_touch,
 };
 
-use apps::{AboutApp, FilesApp, LauncherApp, NetApp, SystemApp};
+use apps::{AboutApp, FilesApp, LauncherApp, NetApp};
 
 fn main() -> ExitCode {
     let args = match parse_args(env::args().collect()) {
@@ -52,7 +53,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let theme = Theme::DRDR;
+    // The active palette is process-global so the Settings window can
+    // flip light/dark at runtime; we re-read it before every repaint.
+    let mut theme = apps::current_theme();
 
     // Bring DrDrNet's async reactor up first so the "DrDrNet" window has
     // somewhere to connect. Returns None if loopback isn't usable — the
@@ -117,68 +120,30 @@ fn main() -> ExitCode {
     // to /dev/fb0 in one pass — the monitor only ever sees whole frames.
     let mut back = Framebuffer::in_memory(fb.width, fb.height);
 
-    // Show the desktop IMMEDIATELY, before waiting for input. The old
-    // order (detect input first) meant up to ~16s of the drdr-init
-    // splash before any window appeared — and if a device never showed,
-    // a hard exit → drdr-init respawn → a permanent splash. Now the
-    // desktop is on screen within a frame; we attach input live.
+    // Paint OUR first frame NOW, before touching input. This is the
+    // single most important line for debugging real hardware: the
+    // instant it runs, drdr-init's splash is gone and what's on the
+    // panel is ours. So "stuck on starting the desktop…" can ONLY mean
+    // present() didn't reach the panel (a pixel-format problem, which
+    // drdr-fb now handles for 16/24/32bpp + RGB-order), never that we
+    // were blocked waiting for a device.
+    eprintln!("[drdr-desk] framebuffer: {}", fb.describe());
     wm.draw(&mut back, &theme);
     fb.present(&back);
 
-    // Attach the keyboard. On real hardware it is USB and enumerates a
-    // beat after boot. We never give up and never exit — we keep the
-    // desktop live (ticking + redrawing) until a keyboard opens, so the
-    // user always sees a working desktop, never a frozen splash or a
-    // respawn loop. An explicit --kbd is tried first each pass.
-    let keys = loop {
-        if let Some(p) = args.kbd_path.clone().or_else(detect_keyboard) {
-            match KeyReader::open(&p) {
-                Ok(k) => {
-                    eprintln!("[drdr-desk] keyboard: {p}");
-                    break k;
-                }
-                Err(e) => eprintln!("[drdr-desk] open {p}: {e}; retrying"),
-            }
-        }
-        pump(&mut wm, &mut back, &mut fb, &theme);
-        thread::sleep(Duration::from_millis(150));
-    };
-
-    // The mouse is optional (keyboard-only is valid). Wait a bounded
-    // few seconds for the USB pointer to enumerate, pumping the desktop
-    // so it stays live, then give up gracefully.
-    let mouse_path = match args.mouse_path.clone() {
-        Some(p) => Some(p),
-        None => {
-            let deadline = Instant::now() + Duration::from_secs(4);
-            loop {
-                if let Some(p) = detect_mouse() {
-                    break Some(p);
-                }
-                if Instant::now() >= deadline {
-                    eprintln!("[drdr-desk] no pointer after 4s — keyboard-only");
-                    break None;
-                }
-                pump(&mut wm, &mut back, &mut fb, &theme);
-                thread::sleep(Duration::from_millis(150));
-            }
-        }
-    };
-    let pointer = match &mouse_path {
-        Some(p) => match PointerReader::open(p) {
-            Ok(pr) => {
-                eprintln!("[drdr-desk] mouse: {p}");
-                Some(pr)
-            }
-            Err(e) => {
-                eprintln!("[drdr-desk] mouse {p}: {e} (keyboard-only)");
-                None
-            }
-        },
-        None => None,
-    };
-
-    let mut hub = InputHub::new(keys, pointer);
+    // Attach input WITHOUT EVER BLOCKING. The old code looped forever
+    // until a keyboard opened — fatal on a Surface Go 2, which is a
+    // tablet: its only built-in pointer is the touchscreen and there is
+    // no keyboard at all unless the Type Cover is clipped on. That is
+    // exactly the "nothing happens, stuck" report. Now we take whatever
+    // exists right now (possibly nothing) and keep (re)attaching live in
+    // the loop, so the desktop is always on screen and becomes usable
+    // the moment a finger, mouse or keyboard appears.
+    let mut hub = InputHub::new(
+        attach_keyboard(args.kbd_path.as_deref()),
+        attach_pointer(&args, fb.width, fb.height),
+    );
+    let mut last_scan = Instant::now();
 
     // Event loop. Block for input or the heartbeat, then COALESCE every
     // packet already queued (a USB mouse fires 60–125/sec; one full
@@ -187,6 +152,26 @@ fn main() -> ExitCode {
     // when something actually changed (`needs_redraw`), so an idle
     // desktop is free and motion stays smooth.
     loop {
+        // Live hot-plug: USB enumerates a beat after boot and a Type
+        // Cover can be attached after the desktop is already up. Retry
+        // the missing devices a few times a second — cheap, and it means
+        // the user never has to reboot to get input recognised.
+        if (!hub.has_keyboard() || !hub.has_pointer())
+            && last_scan.elapsed() >= Duration::from_millis(700)
+        {
+            last_scan = Instant::now();
+            if !hub.has_keyboard() {
+                if let Some(k) = attach_keyboard(args.kbd_path.as_deref()) {
+                    hub.set_keyboard(k);
+                }
+            }
+            if !hub.has_pointer() {
+                if let Some(p) = attach_pointer(&args, fb.width, fb.height) {
+                    hub.set_pointer(p);
+                }
+            }
+        }
+
         match hub.poll_event(Duration::from_millis(250)) {
             Ok(HubEvent::Key(k)) => wm.handle_key(k),
             Ok(HubEvent::Mouse(m)) => wm.handle_mouse(m),
@@ -206,26 +191,95 @@ fn main() -> ExitCode {
             }
         }
         if wm.needs_redraw() {
+            theme = apps::current_theme(); // Settings may have toggled it
             wm.draw(&mut back, &theme);
+            // Until any input is attached, overlay a hint so a bare
+            // tablet boot explains itself instead of looking dead.
+            if !hub.has_keyboard() && !hub.has_pointer() {
+                draw_waiting_banner(&mut back, &theme);
+            }
             fb.present(&back);
         }
     }
 }
 
-/// One desktop frame while we're still waiting on input devices: advance
-/// the clocks/panels and repaint if anything changed. Keeps the desktop
-/// alive and on screen instead of a frozen splash.
-fn pump(
-    wm: &mut WindowManager,
-    back: &mut Framebuffer,
-    fb: &mut Framebuffer,
-    theme: &Theme,
-) {
-    wm.tick();
-    if wm.needs_redraw() {
-        wm.draw(back, theme);
-        fb.present(back);
+/// Open the keyboard if one is present *right now*, else `None` — never
+/// blocks. An explicit `--kbd` path wins; otherwise auto-detect.
+fn attach_keyboard(explicit: Option<&str>) -> Option<KeyReader> {
+    let path = explicit.map(str::to_string).or_else(detect_keyboard)?;
+    match KeyReader::open(&path) {
+        Ok(k) => {
+            eprintln!("[drdr-desk] keyboard: {path}");
+            Some(k)
+        }
+        Err(e) => {
+            eprintln!("[drdr-desk] keyboard {path}: {e} (retrying live)");
+            None
+        }
     }
+}
+
+/// Open a pointer if one is present *right now*, else `None` — never
+/// blocks. Preference: an explicit `--mouse`, then a relative mouse,
+/// then a **touchscreen** (the Surface Go 2's only pointer) opened in
+/// absolute mode and calibrated to the screen.
+fn attach_pointer(args: &Args, sw: u32, sh: u32) -> Option<PointerReader> {
+    if let Some(p) = args.mouse_path.as_deref() {
+        return match PointerReader::open(p) {
+            Ok(pr) => {
+                eprintln!("[drdr-desk] mouse (explicit): {p}");
+                Some(pr)
+            }
+            Err(e) => {
+                eprintln!("[drdr-desk] mouse {p}: {e}");
+                None
+            }
+        };
+    }
+    if let Some(p) = detect_mouse() {
+        if let Ok(pr) = PointerReader::open(&p) {
+            eprintln!("[drdr-desk] mouse: {p}");
+            return Some(pr);
+        }
+    }
+    if let Some(p) = detect_touch() {
+        match PointerReader::open_abs(&p, sw, sh) {
+            Ok(pr) => {
+                eprintln!("[drdr-desk] touchscreen: {p} (absolute, {sw}x{sh})");
+                return Some(pr);
+            }
+            Err(e) => eprintln!("[drdr-desk] touch {p}: {e}"),
+        }
+    }
+    None
+}
+
+/// A centred, hard-to-miss message while no input device has attached —
+/// proof the renderer works and a plain-language instruction for the
+/// owner of a keyboardless tablet.
+fn draw_waiting_banner(fb: &mut Framebuffer, theme: &Theme) {
+    let msg = "Touch the screen, or attach a keyboard / mouse";
+    let sub = "DrDrOS is running — waiting for an input device";
+    let mw = GLYPH_WIDTH * msg.len() as u32;
+    let sw = GLYPH_WIDTH * sub.len() as u32;
+    let cx = fb.width / 2;
+    let by = fb.height.saturating_sub(GLYPH_HEIGHT * 4);
+    fb.shade_rect(
+        0,
+        by.saturating_sub(10),
+        fb.width,
+        GLYPH_HEIGHT * 3 + 20,
+        Px::rgba(0, 0, 0, 150),
+    );
+    draw_text(fb, cx.saturating_sub(mw / 2), by, msg, theme.accent, theme.bg);
+    draw_text(
+        fb,
+        cx.saturating_sub(sw / 2),
+        by + GLYPH_HEIGHT + 4,
+        sub,
+        theme.muted,
+        theme.bg,
+    );
 }
 
 /// Open the default set of overlapping windows. Order matters: the last
@@ -244,14 +298,17 @@ fn build_desktop(wm: &mut WindowManager, net_addr: Option<SocketAddr>) {
         Rect::new(x, y, w, h)
     };
 
+    // The Start menu (taskbar) and the Launcher window share one app
+    // catalogue, so a new app shows up in both for free.
+    wm.set_start_menu(apps::app_catalog(net_addr));
+
     // Distinct positions (no two windows stacked exactly). The Launcher
     // opens last so it's on top and focused — it's the "what can I do"
     // hub, the right thing to greet the user with.
-    wm.open(clamp(40, 56, 540, 270), Box::new(AboutApp));
-    wm.open(clamp(560, 70, 440, 320), Box::new(NetApp::new(net_addr)));
-    wm.open(clamp(70, 360, 560, 380), Box::new(FilesApp::new("/")));
-    wm.open(clamp(660, 470, 340, 160), Box::new(SystemApp::new()));
-    wm.open(clamp(380, 200, 470, 300), Box::new(LauncherApp::new(net_addr)));
+    wm.open(clamp(40, 56, 560, 280), Box::new(AboutApp));
+    wm.open(clamp(600, 70, 440, 330), Box::new(NetApp::new(net_addr)));
+    wm.open(clamp(70, 380, 560, 360), Box::new(FilesApp::new("/")));
+    wm.open(clamp(380, 180, 470, 360), Box::new(LauncherApp::new(net_addr)));
 }
 
 /// Start DrDrNet's Tier 3 reactor on an ephemeral loopback port and

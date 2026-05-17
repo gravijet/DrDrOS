@@ -116,13 +116,47 @@ const KEY_RIGHTALT: u16 = 100;
 // our cue to flush the accumulated delta as one logical move.
 const EV_SYN: u16 = 0x00;
 const EV_REL: u16 = 0x02;
+/// Absolute axes — what a touchscreen / tablet reports instead of deltas.
+/// The Surface Go 2 has no mouse; the panel is the pointer, so we must
+/// decode this or the machine has no usable input at all.
+const EV_ABS: u16 = 0x03;
 const SYN_REPORT: u16 = 0;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const REL_WHEEL: u16 = 0x08;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+/// Multitouch position (type-B devices). We only track the first finger.
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
+/// Finger-on-glass for a touchscreen — we map it to the left button so a
+/// tap is a click and a drag moves windows, no mouse required.
+const BTN_TOUCH: u16 = 0x14a;
+
+/// `struct input_absinfo` (linux/input.h) — the calibration for one
+/// absolute axis. We only need `minimum`/`maximum` to map raw device
+/// units onto screen pixels.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct InputAbsinfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+// EVIOCGABS(abs) = _IOR('E', 0x40 + abs, struct input_absinfo). nix's
+// `ioctl_read!` computes the modern `_IOC` request number for us; we
+// need one per axis code we query.
+nix::ioctl_read!(ev_get_abs_x, b'E', 0x40 + 0x00, InputAbsinfo);
+nix::ioctl_read!(ev_get_abs_y, b'E', 0x40 + 0x01, InputAbsinfo);
+nix::ioctl_read!(ev_get_abs_mt_x, b'E', 0x40 + 0x35, InputAbsinfo);
+nix::ioctl_read!(ev_get_abs_mt_y, b'E', 0x40 + 0x36, InputAbsinfo);
 
 // ─── KeyReader ───────────────────────────────────────────────────────
 
@@ -340,6 +374,10 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEvent {
     Moved { dx: i32, dy: i32 },
+    /// Absolute position in **screen pixels**, already mapped from the
+    /// touchscreen's raw device range. The window manager sets the
+    /// cursor straight to this instead of integrating a delta.
+    MovedTo { x: i32, y: i32 },
     Button { button: MouseButton, pressed: bool },
     /// Wheel notch: +1 = up/away, -1 = down/toward the user.
     Wheel(i32),
@@ -353,12 +391,98 @@ pub struct PointerReader {
     file: File,
     accum_dx: i32,
     accum_dy: i32,
+    /// `Some` when this device reports absolute coordinates (a
+    /// touchscreen). Carries the raw→screen calibration.
+    abs: Option<AbsCal>,
+    /// Latest raw absolute X/Y seen this packet (absolute mode only).
+    last_ax: Option<i32>,
+    last_ay: Option<i32>,
+}
+
+/// Maps a touchscreen's raw axis range onto the screen. `min/max` come
+/// from `EVIOCGABS`; if that ioctl fails we start with a common default
+/// and *widen* it whenever we see a value outside it, so calibration
+/// self-corrects within the first swipe instead of staying wrong.
+#[derive(Debug, Clone, Copy)]
+struct AbsCal {
+    x_min: i32,
+    x_max: i32,
+    y_min: i32,
+    y_max: i32,
+    screen_w: i32,
+    screen_h: i32,
+}
+
+impl AbsCal {
+    fn map(&mut self, ax: i32, ay: i32) -> (i32, i32) {
+        if ax < self.x_min { self.x_min = ax; }
+        if ax > self.x_max { self.x_max = ax; }
+        if ay < self.y_min { self.y_min = ay; }
+        if ay > self.y_max { self.y_max = ay; }
+        let xspan = (self.x_max - self.x_min).max(1);
+        let yspan = (self.y_max - self.y_min).max(1);
+        let x = (ax - self.x_min) as i64 * (self.screen_w - 1).max(1) as i64 / xspan as i64;
+        let y = (ay - self.y_min) as i64 * (self.screen_h - 1).max(1) as i64 / yspan as i64;
+        (x as i32, y as i32)
+    }
 }
 
 impl PointerReader {
+    /// Open a **relative** pointer (a real mouse) — unchanged behaviour.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self { file, accum_dx: 0, accum_dy: 0 })
+        Ok(Self {
+            file,
+            accum_dx: 0,
+            accum_dy: 0,
+            abs: None,
+            last_ax: None,
+            last_ay: None,
+        })
+    }
+
+    /// Open an **absolute** pointer (a touchscreen) and calibrate it to a
+    /// `screen_w × screen_h` display by querying the kernel's axis range.
+    pub fn open_abs(
+        path: impl AsRef<Path>,
+        screen_w: u32,
+        screen_h: u32,
+    ) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let fd = file.as_raw_fd();
+        // Try ABS_X/ABS_Y first, then the multitouch axes; fall back to a
+        // wide default range that self-corrects.
+        let read = |f: unsafe fn(i32, *mut InputAbsinfo) -> nix::Result<i32>| -> Option<(i32, i32)> {
+            let mut a = InputAbsinfo::default();
+            // SAFETY: `fd` is the live device fd; `a` is a valid, aligned
+            // `#[repr(C)]` buffer the kernel fills. The ioctl only writes
+            // those 24 bytes.
+            match unsafe { f(fd, &mut a) } {
+                Ok(_) if a.maximum > a.minimum => Some((a.minimum, a.maximum)),
+                _ => None,
+            }
+        };
+        let (x_min, x_max) = read(ev_get_abs_x)
+            .or_else(|| read(ev_get_abs_mt_x))
+            .unwrap_or((0, 4095));
+        let (y_min, y_max) = read(ev_get_abs_y)
+            .or_else(|| read(ev_get_abs_mt_y))
+            .unwrap_or((0, 4095));
+        Ok(Self {
+            file,
+            accum_dx: 0,
+            accum_dy: 0,
+            abs: Some(AbsCal {
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+                screen_w: screen_w as i32,
+                screen_h: screen_h as i32,
+            }),
+            last_ax: None,
+            last_ay: None,
+        })
     }
 
     pub fn as_fd(&self) -> BorrowedFd<'_> {
@@ -367,7 +491,7 @@ impl PointerReader {
 
     /// Read exactly one evdev record and fold it in. Returns `Some` only
     /// when that record completed a logical event (a button transition,
-    /// a wheel notch, or the `SYN_REPORT` that ends a motion packet).
+    /// a wheel notch, or the `SYN_REPORT` that ends a packet).
     pub fn decode_one(&mut self) -> io::Result<Option<MouseEvent>> {
         let mut raw = [0u8; 24];
         self.file.read_exact(&mut raw)?;
@@ -382,9 +506,17 @@ impl PointerReader {
                 }
                 None
             }
+            EV_ABS => {
+                match ev.code {
+                    ABS_X | ABS_MT_POSITION_X => self.last_ax = Some(ev.value),
+                    ABS_Y | ABS_MT_POSITION_Y => self.last_ay = Some(ev.value),
+                    _ => {}
+                }
+                None
+            }
             EV_KEY => {
                 let button = match ev.code {
-                    BTN_LEFT => Some(MouseButton::Left),
+                    BTN_LEFT | BTN_TOUCH => Some(MouseButton::Left),
                     BTN_RIGHT => Some(MouseButton::Right),
                     BTN_MIDDLE => Some(MouseButton::Middle),
                     _ => None,
@@ -398,7 +530,15 @@ impl PointerReader {
                 }
             }
             EV_SYN if ev.code == SYN_REPORT => {
-                if self.accum_dx != 0 || self.accum_dy != 0 {
+                if let Some(cal) = &mut self.abs {
+                    match (self.last_ax, self.last_ay) {
+                        (Some(ax), Some(ay)) => {
+                            let (x, y) = cal.map(ax, ay);
+                            Some(MouseEvent::MovedTo { x, y })
+                        }
+                        _ => None,
+                    }
+                } else if self.accum_dx != 0 || self.accum_dy != 0 {
                     let (dx, dy) = (self.accum_dx, self.accum_dy);
                     self.accum_dx = 0;
                     self.accum_dy = 0;
@@ -434,13 +574,33 @@ pub enum HubEvent {
 /// the same idea as DrDrNet's epoll reactor, one tier smaller: a fixed
 /// couple of fds instead of thousands.
 pub struct InputHub {
-    keys: KeyReader,
+    keys: Option<KeyReader>,
     pointer: Option<PointerReader>,
 }
 
 impl InputHub {
-    pub fn new(keys: KeyReader, pointer: Option<PointerReader>) -> Self {
+    pub fn new(keys: Option<KeyReader>, pointer: Option<PointerReader>) -> Self {
         Self { keys, pointer }
+    }
+
+    /// Hot-swap the keyboard in once it finally enumerates (USB on real
+    /// hardware shows up a beat after boot; a Surface Type Cover may be
+    /// attached after the desktop is already up).
+    pub fn set_keyboard(&mut self, k: KeyReader) {
+        self.keys = Some(k);
+    }
+
+    /// Hot-swap the pointer/touchscreen in when it appears.
+    pub fn set_pointer(&mut self, p: PointerReader) {
+        self.pointer = Some(p);
+    }
+
+    pub fn has_keyboard(&self) -> bool {
+        self.keys.is_some()
+    }
+
+    pub fn has_pointer(&self) -> bool {
+        self.pointer.is_some()
     }
 
     /// Block until a key, a mouse event, or `timeout` elapses.
@@ -458,12 +618,26 @@ impl InputHub {
             .unwrap_or(PollTimeout::MAX);
 
         loop {
-            // PollFd borrows the fds, so the set is rebuilt each pass.
-            let mut fds = Vec::with_capacity(2);
-            fds.push(PollFd::new(self.keys.as_fd(), PollFlags::POLLIN));
-            if let Some(p) = &self.pointer {
-                fds.push(PollFd::new(p.as_fd(), PollFlags::POLLIN));
+            // With no input devices yet (a fresh tablet boot before the
+            // Type Cover / USB has enumerated) there is nothing to poll —
+            // just sleep out the timeout and tick so the desktop stays
+            // live and the caller can keep retrying device attach.
+            if self.keys.is_none() && self.pointer.is_none() {
+                std::thread::sleep(timeout.min(Duration::from_millis(250)));
+                return Ok(HubEvent::Tick);
             }
+
+            // PollFd borrows the fds, so the set is rebuilt each pass.
+            // `kbd_idx` / `ptr_idx` track which slot each device took.
+            let mut fds = Vec::with_capacity(2);
+            let kbd_idx = self.keys.as_ref().map(|k| {
+                fds.push(PollFd::new(k.as_fd(), PollFlags::POLLIN));
+                fds.len() - 1
+            });
+            let ptr_idx = self.pointer.as_ref().map(|p| {
+                fds.push(PollFd::new(p.as_fd(), PollFlags::POLLIN));
+                fds.len() - 1
+            });
 
             let n = match poll(&mut fds, to) {
                 Ok(n) => n,
@@ -474,21 +648,23 @@ impl InputHub {
                 return Ok(HubEvent::Tick);
             }
 
-            let kbd_ready = fds[0]
-                .revents()
-                .is_some_and(|r| r.intersects(PollFlags::POLLIN));
-            if kbd_ready {
-                if let Some(k) = self.keys.decode_one()? {
-                    return Ok(HubEvent::Key(k));
+            let ready = |i: usize| {
+                fds[i]
+                    .revents()
+                    .is_some_and(|r| r.intersects(PollFlags::POLLIN))
+            };
+
+            if let Some(ki) = kbd_idx {
+                if ready(ki) {
+                    if let Some(k) = self.keys.as_mut().unwrap().decode_one()? {
+                        return Ok(HubEvent::Key(k));
+                    }
+                    continue; // modifier / release — keep polling
                 }
-                continue; // modifier / release — keep polling
             }
 
-            if self.pointer.is_some() {
-                let ptr_ready = fds[1]
-                    .revents()
-                    .is_some_and(|r| r.intersects(PollFlags::POLLIN));
-                if ptr_ready {
+            if let Some(pi) = ptr_idx {
+                if ready(pi) {
                     if let Some(m) = self.pointer.as_mut().unwrap().decode_one()? {
                         return Ok(HubEvent::Mouse(m));
                     }
@@ -526,6 +702,9 @@ impl InputHub {
 const EVBIT_KEY: u64 = 1 << 0x01;
 /// `1 << EV_REL` — device reports relative motion → it's a mouse.
 const EVBIT_REL: u64 = 1 << 0x02;
+/// `1 << EV_ABS` — device reports absolute position → a touchscreen or
+/// tablet. The Surface Go 2's only built-in pointer.
+const EVBIT_ABS: u64 = 1 << 0x03;
 /// `1 << EV_REP` — device does autorepeat → it's a real keyboard, not a
 /// Power/Sleep button (those are `EV=3`: SYN+KEY only).
 const EVBIT_REP: u64 = 1 << 0x14;
@@ -618,6 +797,23 @@ pub fn detect_mouse() -> Option<String> {
 fn pick_mouse(devs: &[InputDev]) -> Option<String> {
     devs.iter()
         .find(|d| d.ev & EVBIT_REL != 0)
+        .map(|d| format!("/dev/input/{}", d.event))
+}
+
+/// Auto-detect a **touchscreen / absolute pointer** (`EV_ABS`).
+///
+/// This is what makes a keyboardless, mouseless tablet — a Surface Go 2 —
+/// actually usable: the panel becomes the cursor. We deliberately ignore
+/// devices that *also* report `EV_REL` (those are real mice / touchpads,
+/// handled by [`detect_mouse`] with its delta decoder).
+pub fn detect_touch() -> Option<String> {
+    pick_touch(&parse_input_devices())
+}
+
+/// Touchscreen selection over an already-parsed device list (pure).
+fn pick_touch(devs: &[InputDev]) -> Option<String> {
+    devs.iter()
+        .find(|d| d.ev & EVBIT_ABS != 0 && d.ev & EVBIT_REL == 0)
         .map(|d| format!("/dev/input/{}", d.event))
 }
 
@@ -715,5 +911,33 @@ B: ABS=3
         let d = parse_input_devices_str(tablet);
         assert_eq!(d[0].ev, 0xb); // SYN+KEY+ABS, no REL
         assert_eq!(pick_mouse(&d), None);
+        // …but it IS a touchscreen — the Surface Go 2's only pointer.
+        assert_eq!(pick_touch(&d).as_deref(), Some("/dev/input/event3"));
+    }
+
+    #[test]
+    fn a_real_mouse_is_not_mistaken_for_a_touchscreen() {
+        // The QEMU USB mouse (EV=17 = SYN+KEY+REL) must stay a mouse;
+        // pick_touch deliberately skips anything that also reports REL.
+        let d = parse_input_devices_str(SAMPLE);
+        assert_eq!(pick_touch(&d), None);
+        assert_eq!(pick_mouse(&d).as_deref(), Some("/dev/input/event2"));
+    }
+
+    #[test]
+    fn absolute_calibration_maps_corners_to_screen() {
+        let mut cal = AbsCal {
+            x_min: 0,
+            x_max: 4095,
+            y_min: 0,
+            y_max: 4095,
+            screen_w: 1920,
+            screen_h: 1280,
+        };
+        assert_eq!(cal.map(0, 0), (0, 0));
+        assert_eq!(cal.map(4095, 4095), (1919, 1279));
+        // A value past the learned range widens it and still maps in.
+        let (x, _) = cal.map(8191, 0);
+        assert!(x <= 1919);
     }
 }

@@ -1,0 +1,47 @@
+# Keep README.md's numbers honest on the server too.
+#
+#  • push to a branch  → regenerate the stats and commit the refreshed
+#    README.md back (with the *accurate* post-push commit count), so the
+#    numbers track HEAD even if a contributor's local hook was bypassed.
+#  • pull request       → verify only (scripts/stats.sh --check), failing
+#    the check if the author forgot to regenerate, without pushing into
+#    someone else's PR branch.
+#
+# Together with .githooks/pre-commit this makes the README numbers
+# self-updating on every commit AND every push — no manual step ever.
+
+name: README stats
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history → correct commit count
+
+      - name: Verify (pull request)
+        if: github.event_name == 'pull_request'
+        run: bash scripts/stats.sh --check
+
+      - name: Regenerate and commit (push)
+        if: github.event_name == 'push'
+        run: |
+          bash scripts/stats.sh
+          if git diff --quiet -- README.md; then
+            echo "README stats already current."
+            exit 0
+          fi
+          git config user.name  "drdros-stats-bot"
+          git config user.email "actions@github.com"
+          git add README.md
+          git commit -m "chore(readme): auto-refresh project stats [skip ci]"
+          git push
