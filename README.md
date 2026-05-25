@@ -33,19 +33,25 @@ graphical desktop — no login, no shell, no X11:
 - **A real window manager** — overlapping, titled windows, Alt-Tab to
   cycle, a hand-drawn cursor, a Launcher that returns if you close
   everything, so the desktop is never a dead end.
-- **A dozen windowed apps** — Files, Text Editor, **Notes** (persistent),
-  **Calculator** (our own expression parser), **Clock & Calendar**,
-  **System Monitor** (live CPU/RAM/load from `/proc`), **DrDrConsole**
-  (a no-PTY command interpreter), **Disks**, **Settings**, the DrDrNet
-  panel, About, and the power menu.
+- **A dozen-plus windowed apps** — Files, Text Editor, **Notes**
+  (persistent), **Calculator** (our own expression parser), **Clock &
+  Calendar**, **System Monitor** (live CPU/RAM/load from `/proc`),
+  **DrDrConsole** (a no-PTY command interpreter), **DrDrChat** (LAN
+  chat between DrDrOS machines), **DrDrPaint** (mouse-driven block
+  drawing), **DrDrSnake** (the game, on a tick-driven canvas), **Disks**,
+  **Settings**, the DrDrNet panel, About, and the power menu.
 - **Real, opt-in persistence (DrDrStore)** — everything runs from RAM by
   default. Open **Disks**, pick a partition, and DrDrOS mounts it
   (probing ext4/vfat/exfat/ntfs/…) and makes it your data directory.
   Notes and saved files now survive a reboot, and the disk is
   auto-rediscovered next time via a `.drdros` marker.
-- **DrDrNet** — a live status panel speaking an original length-prefixed
-  binary protocol over a hand-rolled single-thread epoll reactor (no
-  tokio, no HTTP) across loopback TCP.
+- **DrDrNet, over the wire** — the original length-prefixed binary
+  protocol now runs on every interface, not just loopback. Two DrDrOS
+  machines on the same LAN find each other automatically via a tiny
+  UDP-broadcast discovery protocol (`DDRN` magic, HELLO/BYE, peer
+  expiry), and **DrDrChat** exchanges typed chat frames between them
+  over the hand-rolled single-thread epoll reactor — no tokio, no HTTP,
+  no broker.
 - **Owns the screen properly, on real hardware** — takes the Linux VT
   into graphics mode, double-buffers every frame, coalesces input, and
   **encodes pixels for the panel's true format** so an efifb/simpledrm
@@ -108,7 +114,7 @@ Every pixel and keystroke above is handled by code in this repository.
 | Crate / dir | Kind | Purpose |
 |---|---|---|
 | **drdr-init** | binary | PID 1 — mounts, hostname, brings `lo` up, paints the splash (logging the real pixel format), then *supervises* the session |
-| **drdr-desk** | binary | DrDrDesk — the desktop: a dozen windowed apps, never blocks on input, attaches keyboard/mouse/touch live |
+| **drdr-desk** | binary | DrDrDesk — the desktop: a dozen-plus windowed apps (incl. LAN chat, paint, snake), never blocks on input, attaches keyboard/mouse/touch live |
 | **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, quoting |
 | **drdr-edit** | binary | DrDrEdit — vi-style modal text editor |
 | **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
@@ -117,7 +123,7 @@ Every pixel and keystroke above is handled by code in this repository.
 | **drdr-ui** | library | DrDrUI — widgets, Theme (light + dark), `TextGrid`/`WindowApp`, the WM **+ taskbar/Start-menu shell**, `InputHub` (kbd + mouse + **touchscreen**), VT takeover |
 | **drdr-store** | library | DrDrStore — block-device discovery, mounting, and a `save`/`load` API so files persist beyond RAM |
 | **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
-| **drdr-net** | library | DrDrNet — custom binary protocol + a hand-rolled epoll reactor (Tier 3 async) |
+| **drdr-net** | library | DrDrNet — custom binary protocol + a hand-rolled epoll reactor (Tier 3 async) **+ UDP-broadcast peer discovery + a chat sub-protocol** so two DrDrOS machines on a LAN find each other and talk |
 | **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) |
 | **iso/** | tooling | xorriso pipeline producing the bootable `drdros.iso` |
 | **scripts/** | tooling | `qemu.sh` runner · `stats.sh` (auto-updates the numbers below) |
@@ -139,10 +145,10 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **11120 lines** across **20 files** |
+| Rust source | **12128 lines** across **20 files** |
 | Workspace crates | **12** (every `drdr-*`) |
-| Tests | **62** (`cargo test`, all green) |
-| Git commits | **38** |
+| Tests | **76** (`cargo test`, all green) |
+| Git commits | **39** |
 | Tracked files (excl. `buildroot/`) | **48** |
 | Development window | 2026-05-14
 ? → 2026-05-17 |
@@ -151,9 +157,9 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-ui    |  2902 | GUI framework + WM + shell |
-| drdr-desk  |  2425 | window manager + apps |
-| drdr-net   |  1518 | binary proto + reactor |
+| drdr-desk  |  3212 | window manager + apps |
+| drdr-ui    |  2943 | GUI framework + WM + shell |
+| drdr-net   |  1911 | binary proto + reactor |
 | drdr-fb    |   664 | framebuffer (all bpp) |
 | drdr-font  |   659 | 8x16 glyphs |
 | drdr-shell |   562 | shell |
@@ -195,13 +201,26 @@ Lines of Rust per crate (largest first):
       live · touchscreens (`EV_ABS`) drive the cursor so a keyboardless
       tablet is usable · VT open is non-blocking and VT-probed · the
       kernel gains an input fragment (evdev/USB-HID/xHCI/hid-multitouch)
-- [x] **Phase 7.7 — Modern desktop + persistence** *(this release)*
+- [x] **Phase 7.7 — Modern desktop + persistence**
       Windows-style **taskbar + Start menu**, light "Fluent" theme with a
       dark toggle, window shadows + minimise/maximise/close · **DrDrStore**
       (mount a disk, save for real) · new apps: Notes, Calculator, Clock &
       Calendar, System Monitor, DrDrConsole, Disks, Settings · README
       numbers auto-regenerate on commit/push
-- [ ] **Phase 8 — DrDrNet over the wire + more windowed apps** (ahead)
+- [x] **Phase 8 — DrDrNet over the wire + more windowed apps**
+      *(this release)*
+      The DrDrNet reactor binds to **every interface**, not just
+      loopback, and a tiny UDP-broadcast **peer-discovery** sub-protocol
+      (`DDRN` magic, HELLO/BYE, TTL expiry) lets two DrDrOS machines on
+      the same LAN find each other with no config · the same reactor
+      now multiplexes the existing `status` protocol with a new typed
+      **chat** sub-protocol (`KIND_CHAT_SAY`, fire-and-forget
+      `ChatMsg`) · the WM gains a real `on_drag` hook on the
+      `WindowApp` trait so drawing apps see motion-while-held, not just
+      clicks · three new windowed apps wire it together: **DrDrChat**
+      (peer list + log + composer; broadcasts to every known peer),
+      **DrDrPaint** (palette + click/drag block painting), and
+      **DrDrSnake** (tick-driven game).
 
 ---
 

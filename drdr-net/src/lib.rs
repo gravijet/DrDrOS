@@ -1059,6 +1059,289 @@ pub mod status {
     }
 }
 
+// ─── chat — LAN chat carried over DrDrNet frames ─────────────────────
+
+/// The chat sub-protocol. A peer sends an **unsolicited** [`ChatMsg`]
+/// (`id == 0`) under [`KIND_CHAT_SAY`] over a normal DrDrNet TCP
+/// connection; the receiving peer's reactor handler logs it and answers
+/// nothing. The wire shape is identical to any other [`Codec`] payload
+/// — same framing, same encoder, no special transport.
+pub mod chat {
+    use super::{Codec, DecodeError, Decoder, Encoder};
+
+    /// Frame `kind` for an outgoing chat line. Distinct from the status
+    /// `kind`s so the same reactor handler can multiplex both.
+    pub const KIND_CHAT_SAY: u8 = 0x20;
+
+    /// One chat line.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ChatMsg {
+        /// Human display name of the sender (the node's hostname).
+        pub from: String,
+        /// Body of the message, UTF-8, free-form.
+        pub text: String,
+        /// Wall-clock seconds since the Unix epoch on the sender. Carried
+        /// only so the receiver can show "10:42" — never trusted for
+        /// ordering or auth (clocks drift, peers lie).
+        pub ts_unix_secs: u64,
+    }
+
+    impl Codec for ChatMsg {
+        fn encode(&self, enc: &mut Encoder) {
+            self.from.encode(enc);
+            self.text.encode(enc);
+            self.ts_unix_secs.encode(enc);
+        }
+        fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            Ok(Self {
+                from: String::decode(dec)?,
+                text: String::decode(dec)?,
+                ts_unix_secs: u64::decode(dec)?,
+            })
+        }
+    }
+}
+
+// ─── discovery — LAN peer presence over UDP broadcast ────────────────
+
+/// LAN peer discovery for DrDrNet.
+///
+/// Why UDP and not the usual TCP framing
+/// ─────────────────────────────────────
+/// Finding peers and *talking* to them are different problems. Talking
+/// is a duplex byte stream — TCP, the existing [`reactor`] / [`tcp`]
+/// transports. Finding requires shouting into the void: "anyone there?"
+/// without knowing any addresses yet. That is UDP broadcast's job: one
+/// datagram, no handshake, every host on the subnet hears it.
+///
+/// Wire format of one announcement (a single UDP datagram):
+///
+/// ```text
+///   ┌──────────┬─────────┬────────┬────────────────────────────┐
+///   │  magic   │ version │  kind  │   Codec-encoded Peer body  │
+///   │  "DDRN"  │   u8    │   u8   │   (id, host, tcp_port)     │
+///   └──────────┴─────────┴────────┴────────────────────────────┘
+///     4 bytes   1 byte    1 byte           variable
+/// ```
+///
+/// - `magic` is a sanity-check tag so stray traffic on the discovery
+///   port is rejected silently. `"DDRN"` is `0x44 0x44 0x52 0x4E`.
+/// - `version` lets a future change refuse / upgrade old peers cleanly.
+/// - `kind` is [`KIND_HELLO`] for a presence announcement or
+///   [`KIND_BYE`] for a graceful "I'm leaving" notice.
+/// - The body is a [`Peer`], encoded with the same [`Codec`] machinery
+///   the rest of DrDrNet uses — no second serialiser.
+///
+/// A [`PeerDirectory`] gathers received announcements and expires stale
+/// peers after [`PEER_TTL`]. Helpers [`build_hello`] / [`build_bye`] /
+/// [`parse_announcement`] keep the wire format honest from one place;
+/// transport (binding UDP, broadcasting, the receive loop) is left to
+/// the caller so this module stays trivially testable without sockets.
+pub mod discovery {
+    use super::{Codec, DecodeError, Decoder, Encoder};
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    /// UDP port DrDrOS peers listen for HELLO/BYE on. Outside the IANA
+    /// well-known range, deliberately a "DD" mnemonic for DrDr.
+    pub const DISCOVERY_PORT: u16 = 0x0DDD; // 3549
+    /// Magic prefix on every datagram — distinguishes a DrDrNet
+    /// announcement from random LAN noise on the same port.
+    pub const MAGIC: [u8; 4] = *b"DDRN";
+    /// Protocol revision. Bump when the body's encoding changes.
+    pub const PROTOCOL_VERSION: u8 = 1;
+    /// "I'm here." Body carries the announcing peer.
+    pub const KIND_HELLO: u8 = 1;
+    /// "I'm leaving now." Best-effort: a hung peer won't send one, the
+    /// TTL expiry below catches that case.
+    pub const KIND_BYE: u8 = 2;
+
+    /// How often a healthy peer should broadcast a HELLO.
+    pub const HELLO_INTERVAL: Duration = Duration::from_secs(3);
+    /// How long after the last HELLO we keep a peer alive in the
+    /// directory. Three missed beats is the rule of thumb: it tolerates
+    /// one packet loss without flapping the UI list.
+    pub const PEER_TTL: Duration = Duration::from_secs(10);
+
+    /// One announceable node on the LAN.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Peer {
+        /// Random 64-bit value the peer picked at boot — stable for the
+        /// lifetime of that DrDrOS session, so the same host across two
+        /// HELLOs is the same entry in the directory even if its name
+        /// changes (a user renames it) or its address does (DHCP renew).
+        pub id: u64,
+        /// Display name — hostname, free-form UTF-8.
+        pub host: String,
+        /// TCP port the peer's reactor is listening on, so a chat client
+        /// knows where to connect for the actual stream.
+        pub tcp_port: u16,
+    }
+
+    impl Codec for Peer {
+        fn encode(&self, enc: &mut Encoder) {
+            self.id.encode(enc);
+            self.host.encode(enc);
+            self.tcp_port.encode(enc);
+        }
+        fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            Ok(Self {
+                id: u64::decode(dec)?,
+                host: String::decode(dec)?,
+                tcp_port: u16::decode(dec)?,
+            })
+        }
+    }
+
+    /// Why a datagram couldn't be parsed as an announcement.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AnnounceError {
+        /// First four bytes weren't [`MAGIC`] — likely traffic from
+        /// something else on the same port; the caller should drop it
+        /// silently rather than treat it as a protocol error.
+        WrongMagic,
+        /// Buffer shorter than the fixed header.
+        TooShort,
+        /// `version` byte didn't match [`PROTOCOL_VERSION`] — a future
+        /// or stale peer; ignore it for now.
+        WrongVersion { got: u8 },
+        /// `kind` byte was neither [`KIND_HELLO`] nor [`KIND_BYE`].
+        UnknownKind { got: u8 },
+        /// Body bytes failed [`Peer`]'s decoder.
+        BadBody(DecodeError),
+    }
+
+    fn build_announcement(kind: u8, peer: &Peer) -> Vec<u8> {
+        let mut out = Vec::with_capacity(6 + peer.host.len() + 16);
+        out.extend_from_slice(&MAGIC);
+        out.push(PROTOCOL_VERSION);
+        out.push(kind);
+        let mut enc = Encoder::new();
+        peer.encode(&mut enc);
+        out.extend_from_slice(enc.as_slice());
+        out
+    }
+
+    /// Build a HELLO datagram body announcing `peer`.
+    pub fn build_hello(peer: &Peer) -> Vec<u8> {
+        build_announcement(KIND_HELLO, peer)
+    }
+
+    /// Build a BYE datagram body announcing `peer` is going away.
+    pub fn build_bye(peer: &Peer) -> Vec<u8> {
+        build_announcement(KIND_BYE, peer)
+    }
+
+    /// Parse one received datagram. Returns the message kind + the peer
+    /// that sent it (i.e. who the announcement is *about* — the source
+    /// address of the UDP packet is the caller's to track separately).
+    pub fn parse_announcement(bytes: &[u8]) -> Result<(u8, Peer), AnnounceError> {
+        if bytes.len() < 6 {
+            return Err(AnnounceError::TooShort);
+        }
+        if &bytes[..4] != &MAGIC {
+            return Err(AnnounceError::WrongMagic);
+        }
+        let version = bytes[4];
+        if version != PROTOCOL_VERSION {
+            return Err(AnnounceError::WrongVersion { got: version });
+        }
+        let kind = bytes[5];
+        if kind != KIND_HELLO && kind != KIND_BYE {
+            return Err(AnnounceError::UnknownKind { got: kind });
+        }
+        let mut dec = Decoder::new(&bytes[6..]);
+        let peer = Peer::decode(&mut dec).map_err(AnnounceError::BadBody)?;
+        Ok((kind, peer))
+    }
+
+    /// What the directory knows about one currently-live peer.
+    #[derive(Debug, Clone)]
+    pub struct LivePeer {
+        pub peer: Peer,
+        /// Last source IP we received a HELLO from — what a client should
+        /// dial to reach this peer's TCP reactor.
+        pub addr: IpAddr,
+        /// Local monotonic instant of the last HELLO. Updated on every
+        /// refresh; used by [`PeerDirectory::sweep`] to expire silence.
+        pub last_seen: Instant,
+    }
+
+    /// Thread-unsafe collection of known peers. Wrap in a `Mutex` when
+    /// shared between the UDP receiver thread and a UI thread.
+    #[derive(Debug, Default)]
+    pub struct PeerDirectory {
+        by_id: HashMap<u64, LivePeer>,
+    }
+
+    impl PeerDirectory {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record a HELLO. New peers are inserted; existing ones have
+        /// their `last_seen` refreshed (and `addr` updated if the peer
+        /// roamed to a new IP since we last heard from it).
+        pub fn observe_hello(&mut self, peer: Peer, addr: IpAddr, now: Instant) {
+            let entry = self.by_id.entry(peer.id).or_insert_with(|| LivePeer {
+                peer: peer.clone(),
+                addr,
+                last_seen: now,
+            });
+            entry.peer = peer;
+            entry.addr = addr;
+            entry.last_seen = now;
+        }
+
+        /// Record a graceful BYE — drop the peer immediately.
+        pub fn observe_bye(&mut self, id: u64) {
+            self.by_id.remove(&id);
+        }
+
+        /// Drop peers whose last_seen is older than [`PEER_TTL`].
+        /// Returns how many were swept.
+        pub fn sweep(&mut self, now: Instant) -> usize {
+            let before = self.by_id.len();
+            self.by_id.retain(|_, p| now.duration_since(p.last_seen) < PEER_TTL);
+            before - self.by_id.len()
+        }
+
+        /// Snapshot of all live peers, sorted by hostname for a stable
+        /// UI list. Cheap — directories never grow large on a real LAN.
+        pub fn snapshot(&self) -> Vec<LivePeer> {
+            let mut v: Vec<_> = self.by_id.values().cloned().collect();
+            v.sort_by(|a, b| a.peer.host.cmp(&b.peer.host));
+            v
+        }
+
+        pub fn len(&self) -> usize {
+            self.by_id.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.by_id.is_empty()
+        }
+    }
+
+    /// Pick a self-id that is stable across a single boot but unique
+    /// from peers'. Uses the process id and the monotonic clock — not
+    /// cryptographic, just collision-resistant enough for a LAN.
+    pub fn fresh_self_id() -> u64 {
+        let pid = std::process::id() as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Mix so a low-pid host and a high-pid host don't collide on
+        // the bottom bits: rotate the time half and XOR with a wrapping
+        // multiply of the pid by a fixed mixing constant (the Fibonacci
+        // hash factor — wrapping_mul because release mode would silently
+        // wrap, debug mode would panic without it).
+        (nanos.rotate_left(17)) ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1514,5 +1797,115 @@ mod tests {
         assert_eq!(s1, Stat { uptime_secs: 42, requests: 1, host: "drdros".into() });
         let (_k, s2): (u8, Stat) = client.request(KIND_STAT_REQ, &StatReq).unwrap();
         assert_eq!(s2.requests, 2); // server kept state across requests
+    }
+
+    // ─── Phase 8: chat ───────────────────────────────────────────────
+
+    #[test]
+    fn chat_msg_codec_roundtrip() {
+        use chat::ChatMsg;
+        let m = ChatMsg {
+            from: "drdros-a".into(),
+            text: "hello from the LAN".into(),
+            ts_unix_secs: 1_700_000_000,
+        };
+        let back: ChatMsg = unpack(&pack(&m)).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn chat_msg_rides_an_unsolicited_frame() {
+        // A chat line is the same shape as any other unsolicited typed
+        // message: kind=KIND_CHAT_SAY, id=0, body=Codec-encoded ChatMsg.
+        use chat::{ChatMsg, KIND_CHAT_SAY};
+        let m = ChatMsg {
+            from: "h".into(),
+            text: "x".into(),
+            ts_unix_secs: 7,
+        };
+        let frame = Frame::new(KIND_CHAT_SAY, pack(&m));
+        assert_eq!(frame.id, NO_CORRELATION);
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &frame).unwrap();
+        let back = read_frame(&mut Cursor::new(wire)).unwrap();
+        assert_eq!(back.kind, KIND_CHAT_SAY);
+        assert_eq!(unpack::<ChatMsg>(&back.payload).unwrap(), m);
+    }
+
+    // ─── Phase 8: discovery ──────────────────────────────────────────
+
+    #[test]
+    fn hello_datagram_roundtrip() {
+        use discovery::{KIND_HELLO, Peer, build_hello, parse_announcement};
+        let me = Peer { id: 0xDEADBEEFCAFEBABE, host: "drdros-a".into(), tcp_port: 4001 };
+        let wire = build_hello(&me);
+        let (kind, peer) = parse_announcement(&wire).unwrap();
+        assert_eq!(kind, KIND_HELLO);
+        assert_eq!(peer, me);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_magic() {
+        use discovery::{AnnounceError, parse_announcement};
+        // Same length, magic mangled.
+        let wire = b"XXXX\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        assert_eq!(parse_announcement(wire), Err(AnnounceError::WrongMagic));
+    }
+
+    #[test]
+    fn parse_rejects_wrong_version() {
+        use discovery::{AnnounceError, parse_announcement};
+        let mut wire = b"DDRN\x02\x01".to_vec(); // version 2, unknown
+        wire.extend_from_slice(&[0u8; 16]);
+        assert_eq!(parse_announcement(&wire), Err(AnnounceError::WrongVersion { got: 2 }));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_kind() {
+        use discovery::{AnnounceError, parse_announcement};
+        let mut wire = b"DDRN\x01\x09".to_vec(); // kind 9, neither hello nor bye
+        // Still need a parseable Peer body for the kind check to be the
+        // *first* thing that errors (we sanity-check version+kind before
+        // body, so the body bytes don't matter here).
+        wire.extend_from_slice(&[0u8; 16]);
+        assert_eq!(parse_announcement(&wire), Err(AnnounceError::UnknownKind { got: 9 }));
+    }
+
+    #[test]
+    fn directory_tracks_peers_and_expires_them() {
+        use discovery::{PEER_TTL, Peer, PeerDirectory};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut dir = PeerDirectory::new();
+        let t0 = std::time::Instant::now();
+        let a = Peer { id: 1, host: "alpha".into(), tcp_port: 4001 };
+        let b = Peer { id: 2, host: "bravo".into(), tcp_port: 4001 };
+        dir.observe_hello(a.clone(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), t0);
+        dir.observe_hello(b.clone(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), t0);
+        assert_eq!(dir.len(), 2);
+
+        // BYE removes one immediately.
+        dir.observe_bye(b.id);
+        assert_eq!(dir.len(), 1);
+        let names: Vec<_> = dir.snapshot().into_iter().map(|p| p.peer.host).collect();
+        assert_eq!(names, vec!["alpha"]);
+
+        // Sweep at TTL-1 keeps the survivor; past TTL drops it.
+        let just_before = t0 + PEER_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(dir.sweep(just_before), 0);
+        let well_past = t0 + PEER_TTL + std::time::Duration::from_secs(1);
+        assert_eq!(dir.sweep(well_past), 1);
+        assert!(dir.is_empty());
+    }
+
+    #[test]
+    fn fresh_self_ids_collide_rarely() {
+        // We're not after cryptographic uniqueness — just that two
+        // calls in a row from the same process don't produce the same
+        // id, which would defeat the whole "is this the same peer?"
+        // check in PeerDirectory.
+        let a = discovery::fresh_self_id();
+        let b = discovery::fresh_self_id();
+        assert_ne!(a, b);
     }
 }

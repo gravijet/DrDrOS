@@ -13,7 +13,7 @@
 //! video* (swap fg/bg) so apps stay theme-agnostic.
 
 use std::fs;
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -23,6 +23,8 @@ use drdr_net::Conn;
 use drdr_ui::{AppControl, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp};
 
 use nix::sys::reboot::{RebootMode, reboot};
+
+use crate::net::NetState;
 
 // ─── Process-global desktop palette ──────────────────────────────────
 //
@@ -568,7 +570,7 @@ pub struct LauncherApp {
 /// never drift apart. Each entry is a label and a factory that builds
 /// the window on demand.
 pub fn app_catalog(
-    net_addr: Option<SocketAddr>,
+    net: Option<NetState>,
 ) -> Vec<(String, Box<dyn Fn() -> Spawn>)> {
     fn entry(
         label: &str,
@@ -579,6 +581,9 @@ pub fn app_catalog(
             Box::new(move || Spawn { rect: spawn_rect(), app: f() }),
         )
     }
+    let net_for_chat = net.clone();
+    let net_for_settings = net.clone();
+    let net_for_panel = net.clone();
     vec![
         entry("Files", || Box::new(FilesApp::new("/"))),
         entry("Text Editor", || Box::new(EditApp::new("/tmp/untitled.txt"))),
@@ -587,17 +592,20 @@ pub fn app_catalog(
         entry("Clock & Calendar", || Box::new(ClockApp::new())),
         entry("System Monitor", || Box::new(SysMonApp::new())),
         entry("DrDrConsole", || Box::new(ConsoleApp::new())),
+        entry("DrDrChat (LAN)", move || Box::new(ChatApp::new(net_for_chat.clone()))),
+        entry("DrDrPaint", || Box::new(PaintApp::new())),
+        entry("DrDrSnake", || Box::new(SnakeApp::new())),
         entry("Disks", || Box::new(DisksApp::new())),
-        entry("Settings", move || Box::new(SettingsApp::new(net_addr))),
-        entry("DrDrNet panel", move || Box::new(NetApp::new(net_addr))),
+        entry("Settings", move || Box::new(SettingsApp::new(net_for_settings.clone()))),
+        entry("DrDrNet panel", move || Box::new(NetApp::new(net_for_panel.clone()))),
         entry("About DrDrOS", || Box::new(AboutApp)),
         entry("System (power)", || Box::new(SystemApp::new())),
     ]
 }
 
 impl LauncherApp {
-    pub fn new(net_addr: Option<SocketAddr>) -> Self {
-        Self { items: app_catalog(net_addr), sel: 0, spawns: Vec::new() }
+    pub fn new(net: Option<NetState>) -> Self {
+        Self { items: app_catalog(net), sel: 0, spawns: Vec::new() }
     }
 
     fn launch(&mut self) {
@@ -730,19 +738,21 @@ impl WindowApp for SystemApp {
 
 // ─── DrDrNet status panel ────────────────────────────────────────────
 
-/// A live client of DrDrNet's Tier 3 async reactor.
+/// A live client of DrDrNet's Tier 3 async reactor. Phase 8: the
+/// reactor is also on the LAN, so the panel doubles as a peer-list view
+/// drawn from the discovery directory.
 pub struct NetApp {
-    addr: Option<SocketAddr>,
+    net: Option<NetState>,
     last: Result<Stat, String>,
     polls: u64,
 }
 
 impl NetApp {
-    pub fn new(addr: Option<SocketAddr>) -> Self {
-        Self { addr, last: Err("connecting...".into()), polls: 0 }
+    pub fn new(net: Option<NetState>) -> Self {
+        Self { net, last: Err("connecting...".into()), polls: 0 }
     }
 
-    fn fetch(addr: SocketAddr) -> Result<Stat, String> {
+    fn fetch(addr: std::net::SocketAddr) -> Result<Stat, String> {
         let to = Duration::from_millis(300);
         let stream =
             TcpStream::connect_timeout(&addr, to).map_err(|e| e.to_string())?;
@@ -759,7 +769,7 @@ impl NetApp {
 
 impl WindowApp for NetApp {
     fn title(&self) -> String {
-        match (&self.addr, &self.last) {
+        match (&self.net, &self.last) {
             (Some(_), Ok(_)) => "DrDrNet  * online".into(),
             _ => "DrDrNet  - offline".into(),
         }
@@ -767,8 +777,14 @@ impl WindowApp for NetApp {
 
     fn on_tick(&mut self) -> AppControl {
         self.polls += 1;
-        if let Some(addr) = self.addr {
-            self.last = Self::fetch(addr);
+        if let Some(net) = &self.net {
+            // Dial ourselves over loopback — same path real peers take,
+            // just a shorter hop. Proves the same code path the LAN uses.
+            let loopback = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                net.reactor_addr.port(),
+            );
+            self.last = Self::fetch(loopback);
         }
         AppControl::Continue
     }
@@ -778,33 +794,46 @@ impl WindowApp for NetApp {
         let red = Px::rgb(0xFF, 0x6B, 0x6B);
         let bg = g.bg();
 
-        match (&self.addr, &self.last) {
+        match (&self.net, &self.last) {
             (None, _) => {
-                g.write(1, 1, "loopback unavailable", red, bg);
-                g.text(1, 3, "lo didn't come up at boot, so the");
-                g.text(1, 4, "reactor server has nowhere to bind.");
+                g.write(1, 1, "DrDrNet offline", red, bg);
+                g.text(1, 3, "Could not bind a TCP reactor at boot.");
+                g.text(1, 4, "The desktop still works; peers and chat");
+                g.text(1, 5, "are disabled.");
             }
-            (Some(addr), Ok(s)) => {
+            (Some(net), Ok(s)) => {
                 g.write(1, 1, "* connected", teal, bg);
-                g.text(1, 3, &format!("server   {addr}"));
+                g.text(1, 3, &format!("server   {}", net.reactor_addr));
                 g.text(1, 4, &format!("host     {}", s.host));
-                g.text(1, 5, &format!("uptime   {} s", s.uptime_secs));
-                g.text(1, 6, &format!("served   {} requests", s.requests));
-                g.text(1, 7, &format!("polls    {} (this window)", self.polls));
-                g.text(1, 9, "transport: DrDrNet binary frames");
-                g.text(1, 10, "server:    Tier 3 epoll reactor");
-                g.text(1, 11, "           (async, one thread)");
+                g.text(1, 5, &format!("peer id  {:016x}", net.me.id));
+                g.text(1, 6, &format!("uptime   {} s", s.uptime_secs));
+                g.text(1, 7, &format!("served   {} requests", s.requests));
+                g.text(1, 8, &format!("polls    {} (this window)", self.polls));
+
+                let peers = net.directory.lock()
+                    .map(|d| d.snapshot())
+                    .unwrap_or_default();
+                g.text(1, 10, &format!("LAN peers: {}", peers.len()));
+                for (i, p) in peers.iter().take(6).enumerate() {
+                    g.text(
+                        3,
+                        11 + i as u32,
+                        &format!("{} @ {}:{}", p.peer.host, p.addr, p.peer.tcp_port),
+                    );
+                }
+                if peers.is_empty() {
+                    g.text(3, 11, "(none yet - waiting for HELLOs)");
+                }
             }
-            (Some(addr), Err(e)) => {
+            (Some(_), Err(e)) => {
                 g.write(1, 1, "x disconnected", red, bg);
-                g.text(1, 3, &format!("server {addr}"));
                 let msg = if e.len() > (g.cols as usize).saturating_sub(2) {
                     &e[..(g.cols as usize).saturating_sub(2)]
                 } else {
                     e
                 };
-                g.text(1, 5, msg);
-                g.text(1, 7, "retrying every heartbeat...");
+                g.text(1, 3, msg);
+                g.text(1, 5, "retrying every heartbeat...");
             }
         }
     }
@@ -817,7 +846,7 @@ impl WindowApp for NetApp {
 /// whether that survives a reboot), with a one-key jump to the Disks
 /// manager to change it.
 pub struct SettingsApp {
-    net_addr: Option<SocketAddr>,
+    net: Option<NetState>,
     sel: usize,
     spawns: Vec<Spawn>,
 }
@@ -825,8 +854,8 @@ pub struct SettingsApp {
 const SETTINGS_ROWS: usize = 3;
 
 impl SettingsApp {
-    pub fn new(net_addr: Option<SocketAddr>) -> Self {
-        Self { net_addr, sel: 0, spawns: Vec::new() }
+    pub fn new(net: Option<NetState>) -> Self {
+        Self { net, sel: 0, spawns: Vec::new() }
     }
 
     fn activate(&mut self) {
@@ -838,7 +867,7 @@ impl SettingsApp {
             }),
             _ => self.spawns.push(Spawn {
                 rect: spawn_rect(),
-                app: Box::new(NetApp::new(self.net_addr)),
+                app: Box::new(NetApp::new(self.net.clone())),
             }),
         }
     }
@@ -1974,6 +2003,504 @@ impl WindowApp for ConsoleApp {
     }
 }
 
+// ─── DrDrChat — LAN chat over DrDrNet ────────────────────────────────
+
+/// Chat client + view. The reactor receives chat frames and pushes them
+/// into `net.chat_log`; this app reads that log every tick and renders
+/// it, plus a composer at the bottom. Enter on the composer fans out
+/// the line to every live peer in the discovery directory.
+pub struct ChatApp {
+    net: Option<NetState>,
+    input: String,
+}
+
+impl ChatApp {
+    pub fn new(net: Option<NetState>) -> Self {
+        Self { net, input: String::new() }
+    }
+
+    /// Self-log the line, then dial every peer in parallel and deliver
+    /// the chat frame fire-and-forget. We don't wait for replies — chat
+    /// is best-effort, peer goes silent → message just doesn't arrive.
+    fn send(&mut self) {
+        let Some(net) = self.net.clone() else {
+            self.input.clear();
+            return;
+        };
+        let text = std::mem::take(&mut self.input);
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let msg = drdr_net::chat::ChatMsg {
+            from: net.me.host.clone(),
+            text,
+            ts_unix_secs: crate::net::now_unix_secs(),
+        };
+        crate::net::push_chat(&net.chat_log, msg.clone());
+
+        let peers = net
+            .directory
+            .lock()
+            .map(|d| d.snapshot())
+            .unwrap_or_default();
+        for p in peers {
+            let addr = std::net::SocketAddr::new(p.addr, p.peer.tcp_port);
+            let msg = msg.clone();
+            std::thread::spawn(move || {
+                let _ = Self::deliver(addr, &msg);
+            });
+        }
+    }
+
+    fn deliver(
+        addr: std::net::SocketAddr,
+        msg: &drdr_net::chat::ChatMsg,
+    ) -> std::io::Result<()> {
+        let to = Duration::from_millis(500);
+        let stream = TcpStream::connect_timeout(&addr, to)?;
+        stream.set_write_timeout(Some(to)).ok();
+        let _ = stream.set_nodelay(true);
+        let mut conn = Conn::new(stream);
+        conn.send_typed(drdr_net::chat::KIND_CHAT_SAY, msg)
+    }
+}
+
+/// Format a Unix-epoch second as `HH:MM` in UTC. Display-only — the
+/// receiver doesn't trust the sender's clock, so a wrong timezone here
+/// is at worst a wrong label, never wrong ordering.
+fn fmt_hhmm(ts: u64) -> String {
+    let mins_of_day = ((ts / 60) % (24 * 60)) as u32;
+    let h = mins_of_day / 60;
+    let m = mins_of_day % 60;
+    format!("{:02}:{:02}", h, m)
+}
+
+impl WindowApp for ChatApp {
+    fn title(&self) -> String {
+        match &self.net {
+            None => "DrDrChat - offline".into(),
+            Some(net) => {
+                let peers = net.directory.lock().map(|d| d.len()).unwrap_or(0);
+                format!("DrDrChat - {} ({} peers)", net.me.host, peers)
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match key {
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Space => self.input.push(' '),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.send(),
+            KeyCode::Escape => self.input.clear(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let teal = Px::rgb(0x3D, 0xD0, 0xBC);
+        let red = Px::rgb(0xFF, 0x6B, 0x6B);
+        let muted = Px::rgb(0x80, 0x80, 0x80);
+        let bg = g.bg();
+        let rows = g.rows;
+        let cols = g.cols as usize;
+
+        let Some(net) = &self.net else {
+            g.write(1, 1, "DrDrChat is offline", red, bg);
+            g.text(1, 3, "No reactor bound at boot, so peer discovery");
+            g.text(1, 4, "and chat are both disabled.");
+            return;
+        };
+
+        // ── Peer strip (top 4 rows) ──
+        let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();
+        g.text(0, 0, &format!("Peers ({}):", peers.len()));
+        for (i, p) in peers.iter().take(3).enumerate() {
+            g.write(2, 1 + i as u32, "*", teal, bg);
+            g.text(
+                4,
+                1 + i as u32,
+                &format!("{} @ {}:{}", p.peer.host, p.addr, p.peer.tcp_port),
+            );
+        }
+        if peers.is_empty() {
+            g.write(2, 1, "(no peers yet - waiting for HELLOs)", muted, bg);
+        }
+
+        // ── Message log: rows 5 .. rows-2 ──
+        let log_top = 5u32;
+        let log_bot = rows.saturating_sub(2); // composer + separator below
+        let log_h = log_bot.saturating_sub(log_top);
+        if log_h == 0 {
+            return;
+        }
+        let log = net.chat_log.lock().map(|l| l.clone()).unwrap_or_default();
+        let start = log.len().saturating_sub(log_h as usize);
+        for (i, m) in log[start..].iter().enumerate() {
+            let line = format!("{} {:>8}  {}", fmt_hhmm(m.ts_unix_secs), m.from, m.text);
+            let line = if line.len() > cols {
+                line[..cols].to_string()
+            } else {
+                line
+            };
+            // Tint our own lines so a thread is easy to read at a glance.
+            let fg = if m.from == net.me.host { teal } else { g.fg() };
+            g.write(0, log_top + i as u32, &line, fg, bg);
+        }
+
+        // ── Composer (last row) ──
+        let prompt_row = rows.saturating_sub(1);
+        g.write(0, prompt_row, &format!("> {}_", self.input), teal, bg);
+    }
+}
+
+// ─── DrDrPaint — mouse-driven block drawing on the TextGrid ──────────
+
+/// Paint by clicking and dragging blocks onto the TextGrid. The top row
+/// is a palette of swatches; clicking a swatch selects that colour. The
+/// rest of the grid is the canvas. Each painted cell stores its own
+/// colour — `c` clears, `e` toggles the eraser.
+pub struct PaintApp {
+    /// Canvas cells. None = transparent (theme bg), Some(px) = painted.
+    cells: Vec<Vec<Option<Px>>>,
+    palette: Vec<Px>,
+    sel: usize,
+    erasing: bool,
+    /// Last canvas size we rendered with. The grid is sized to the
+    /// window: a resize would invalidate the buffer, so we rebuild on
+    /// the first render at a new size. Cheap because we never read what
+    /// we threw away — it's "what was painted that scrolled away".
+    cur_w: u32,
+    cur_h: u32,
+}
+
+impl PaintApp {
+    pub fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            palette: vec![
+                Px::rgb(0xE6, 0x1E, 0x1E), // red
+                Px::rgb(0xE6, 0x8E, 0x1E), // orange
+                Px::rgb(0xE6, 0xE6, 0x1E), // yellow
+                Px::rgb(0x2E, 0xC8, 0x32), // green
+                Px::rgb(0x1E, 0x86, 0xE6), // blue
+                Px::rgb(0x9C, 0x39, 0xC8), // violet
+                Px::rgb(0xF0, 0xF0, 0xF0), // light
+                Px::rgb(0x20, 0x20, 0x20), // dark
+            ],
+            sel: 4, // blue
+            erasing: false,
+            cur_w: 0,
+            cur_h: 0,
+        }
+    }
+
+    fn ensure_size(&mut self, w: u32, h: u32) {
+        if self.cur_w == w && self.cur_h == h && !self.cells.is_empty() {
+            return;
+        }
+        self.cells = vec![vec![None; w as usize]; h as usize];
+        self.cur_w = w;
+        self.cur_h = h;
+    }
+
+    /// Paint or erase the cell under `(col, row)`. Row 0 is the
+    /// palette strip; row 1 is the status line; row 2+ is the canvas.
+    fn touch(&mut self, col: u32, row: u32) {
+        if row == 0 {
+            let idx = (col as usize) / 3;
+            if idx < self.palette.len() {
+                self.sel = idx;
+                self.erasing = false;
+            }
+            return;
+        }
+        if row < 2 {
+            return;
+        }
+        let cy = (row - 2) as usize;
+        let cx = col as usize;
+        if cy >= self.cells.len() || cx >= self.cells[0].len() {
+            return;
+        }
+        self.cells[cy][cx] = if self.erasing {
+            None
+        } else {
+            Some(self.palette[self.sel])
+        };
+    }
+
+    fn clear(&mut self) {
+        for row in &mut self.cells {
+            for c in row.iter_mut() {
+                *c = None;
+            }
+        }
+    }
+}
+
+impl WindowApp for PaintApp {
+    fn title(&self) -> String {
+        if self.erasing {
+            "DrDrPaint - eraser".into()
+        } else {
+            "DrDrPaint".into()
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match key {
+            KeyCode::Char('c') | KeyCode::Char('C') => self.clear(),
+            KeyCode::Char('e') | KeyCode::Char('E') => self.erasing = !self.erasing,
+            KeyCode::Char(d @ '1'..='8') => {
+                self.sel = (d as u32 - '1' as u32) as usize;
+                self.erasing = false;
+            }
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _double: bool) -> AppControl {
+        self.touch(col, row);
+        AppControl::Continue
+    }
+
+    fn on_drag(&mut self, col: u32, row: u32) -> AppControl {
+        self.touch(col, row);
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        self.ensure_size(g.cols, g.rows.saturating_sub(2));
+        let bg = g.bg();
+        // Palette row: each colour occupies three cells of solid block.
+        for (i, c) in self.palette.iter().enumerate() {
+            for k in 0..3 {
+                let col = (i * 3 + k) as u32;
+                if col < g.cols {
+                    g.put(col, 0, '\u{2588}', *c, bg);
+                }
+            }
+        }
+        // Selection marker: an underline below the chosen swatch.
+        let sel_col = (self.sel * 3 + 1) as u32;
+        if sel_col < g.cols {
+            let mark = if self.erasing { 'X' } else { '^' };
+            g.text(sel_col, 1, &mark.to_string());
+        }
+        // Status hint to the right of the palette.
+        let hint_col = (self.palette.len() * 3 + 2) as u32;
+        if hint_col < g.cols {
+            g.text(
+                hint_col,
+                0,
+                "click/drag to paint  |  1-8 colour  e eraser  c clear",
+            );
+        }
+        // Canvas rows: render only painted cells; unpainted = theme bg.
+        for (cy, row) in self.cells.iter().enumerate() {
+            for (cx, cell) in row.iter().enumerate() {
+                if let Some(px) = cell {
+                    g.put(cx as u32, 2 + cy as u32, '\u{2588}', *px, bg);
+                }
+            }
+        }
+    }
+}
+
+// ─── DrDrSnake — the game ────────────────────────────────────────────
+
+/// Classic Snake on a `TextGrid`. Tick-driven (the WM's `on_tick`
+/// already fires periodically), so the snake advances even while no
+/// keys are pressed — the same heartbeat the clock + DrDrNet panel use.
+pub struct SnakeApp {
+    body: std::collections::VecDeque<(i32, i32)>,
+    /// Current direction unit vector (dx, dy). Snake moves one cell per
+    /// game tick; we coalesce real ticks into game ticks below.
+    dir: (i32, i32),
+    /// Buffered next direction — applied at the next game tick so two
+    /// rapid keypresses can't fold the snake on itself in one frame.
+    next_dir: (i32, i32),
+    food: (i32, i32),
+    score: u32,
+    over: bool,
+    /// Width/height the canvas was last seen with. The board shrinks /
+    /// grows with the window; on resize we recentre everything.
+    cw: i32,
+    ch: i32,
+    /// PRNG state for placing food. xorshift64 — tiny, no crate.
+    rng: u64,
+    /// Real ticks since the last game step. The WM's heartbeat is
+    /// faster than we want the snake to crawl, so we step every
+    /// `STEP_TICKS` ticks.
+    tick_accum: u32,
+}
+
+const SNAKE_STEP_TICKS: u32 = 1; // tweak if the WM tick rate changes
+
+impl SnakeApp {
+    pub fn new() -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xCAFE_BABE);
+        let mut s = Self {
+            body: std::collections::VecDeque::new(),
+            dir: (1, 0),
+            next_dir: (1, 0),
+            food: (0, 0),
+            score: 0,
+            over: false,
+            cw: 0,
+            ch: 0,
+            rng: now.max(1),
+            tick_accum: 0,
+        };
+        s.reset_for(40, 20);
+        s
+    }
+
+    fn reset_for(&mut self, w: i32, h: i32) {
+        self.cw = w.max(8);
+        self.ch = h.max(6);
+        self.body.clear();
+        let cx = self.cw / 2;
+        let cy = self.ch / 2;
+        // Front of the deque is the *head*; tail is at the back. We're
+        // heading right, so the head sits at (cx, cy) and earlier body
+        // cells extend left. push_back ensures front == head.
+        for i in 0..4 {
+            self.body.push_back((cx - i, cy));
+        }
+        self.dir = (1, 0);
+        self.next_dir = (1, 0);
+        self.score = 0;
+        self.over = false;
+        self.place_food();
+    }
+
+    fn xorshift(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn place_food(&mut self) {
+        // Try a few times to land on an empty cell; if the body fills the
+        // board we'd loop forever, so cap attempts and just plant on the
+        // head if every cell is taken (the user has won).
+        for _ in 0..64 {
+            let r = self.xorshift();
+            let x = (r as i32).rem_euclid(self.cw);
+            let y = ((r >> 32) as i32).rem_euclid(self.ch);
+            if !self.body.iter().any(|&p| p == (x, y)) {
+                self.food = (x, y);
+                return;
+            }
+        }
+        self.food = *self.body.front().unwrap_or(&(0, 0));
+    }
+
+    fn step(&mut self) {
+        if self.over {
+            return;
+        }
+        // Apply the buffered direction unless it's a direct reversal.
+        let (ndx, ndy) = self.next_dir;
+        if (ndx, ndy) != (-self.dir.0, -self.dir.1) {
+            self.dir = (ndx, ndy);
+        }
+        let head = self.body.front().copied().unwrap_or((0, 0));
+        let nx = head.0 + self.dir.0;
+        let ny = head.1 + self.dir.1;
+        // Wall collision = game over (no wrap; classic).
+        if nx < 0 || ny < 0 || nx >= self.cw || ny >= self.ch {
+            self.over = true;
+            return;
+        }
+        // Self-collision = game over.
+        if self.body.iter().any(|&p| p == (nx, ny)) {
+            self.over = true;
+            return;
+        }
+        self.body.push_front((nx, ny));
+        if (nx, ny) == self.food {
+            self.score += 1;
+            self.place_food();
+        } else {
+            self.body.pop_back();
+        }
+    }
+}
+
+impl WindowApp for SnakeApp {
+    fn title(&self) -> String {
+        if self.over {
+            format!("DrDrSnake - GAME OVER (score {}) - R to restart", self.score)
+        } else {
+            format!("DrDrSnake - score {}  (arrows to steer)", self.score)
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match key {
+            KeyCode::Up => self.next_dir = (0, -1),
+            KeyCode::Down => self.next_dir = (0, 1),
+            KeyCode::Left => self.next_dir = (-1, 0),
+            KeyCode::Right => self.next_dir = (1, 0),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.reset_for(self.cw, self.ch);
+            }
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        self.tick_accum += 1;
+        if self.tick_accum >= SNAKE_STEP_TICKS {
+            self.tick_accum = 0;
+            self.step();
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        // First render at this size, or a resized window? Re-fit the board
+        // so the snake never leaves the canvas after the user maximises.
+        if self.cw != g.cols as i32 || self.ch != g.rows as i32 {
+            self.reset_for(g.cols as i32, g.rows as i32);
+        }
+        let bg = g.bg();
+        let snake = Px::rgb(0x2E, 0xC8, 0x32);
+        let head_c = Px::rgb(0x6E, 0xFF, 0x72);
+        let food = Px::rgb(0xE6, 0x1E, 0x1E);
+        for (i, &(x, y)) in self.body.iter().enumerate() {
+            let c = if i == 0 { head_c } else { snake };
+            g.put(x as u32, y as u32, '\u{2588}', c, bg);
+        }
+        g.put(self.food.0 as u32, self.food.1 as u32, '\u{25CF}', food, bg);
+        if self.over {
+            let msg = format!(" GAME OVER  score {}  - press R ", self.score);
+            let col = (g.cols.saturating_sub(msg.len() as u32)) / 2;
+            let row = g.rows / 2;
+            g.write(col, row, &msg, g.bg(), Px::rgb(0xFF, 0xFF, 0xFF));
+        }
+    }
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -2012,5 +2539,78 @@ mod app_tests {
         assert_eq!(bar(50, 10), "[#####-----]  50%");
         assert_eq!(bar(100, 10), "[##########] 100%");
         assert_eq!(bar(150, 10), "[##########] 100%"); // clamped
+    }
+
+    // ─── phase 8 ─────────────────────────────────────────────────
+
+    #[test]
+    fn snake_wall_collision_ends_the_game() {
+        let mut s = SnakeApp::new();
+        s.reset_for(8, 6);
+        // Force the head right against the right wall, then step once.
+        // Body is 4 cells long centred → head at (cw/2 + 0, cy). Direction
+        // is (1, 0). Stepping (cw/2 + 1) times will walk off the edge.
+        for _ in 0..(s.cw - s.body.front().unwrap().0 + 1) {
+            s.step();
+        }
+        assert!(s.over, "snake should die when it walks off the right wall");
+    }
+
+    #[test]
+    fn snake_eating_food_grows_the_body_and_scores() {
+        let mut s = SnakeApp::new();
+        s.reset_for(40, 20);
+        // Plant food directly in front of the head and step once.
+        let head = *s.body.front().unwrap();
+        s.food = (head.0 + 1, head.1);
+        let len_before = s.body.len();
+        s.step();
+        assert!(!s.over);
+        assert_eq!(s.score, 1);
+        assert_eq!(s.body.len(), len_before + 1);
+    }
+
+    #[test]
+    fn snake_cannot_reverse_into_its_own_neck() {
+        let mut s = SnakeApp::new();
+        s.reset_for(40, 20);
+        // Moving right; ask for "left" — engine must ignore the reversal
+        // so the snake doesn't fold onto itself.
+        s.next_dir = (-1, 0);
+        let head = *s.body.front().unwrap();
+        s.step();
+        let new_head = *s.body.front().unwrap();
+        assert_eq!(new_head, (head.0 + 1, head.1));
+        assert!(!s.over);
+    }
+
+    #[test]
+    fn paint_palette_click_selects_swatch() {
+        let mut p = PaintApp::new();
+        // Each swatch is 3 cells wide on row 0; cell 6 lands in swatch 2.
+        p.touch(6, 0);
+        assert_eq!(p.sel, 2);
+        assert!(!p.erasing);
+    }
+
+    #[test]
+    fn paint_drag_writes_canvas_cells() {
+        let mut p = PaintApp::new();
+        p.ensure_size(20, 10);
+        p.sel = 0;
+        p.touch(3, 5); // row 5 in window-space → canvas row 3
+        assert!(p.cells[3][3].is_some());
+        p.erasing = true;
+        p.touch(3, 5);
+        assert!(p.cells[3][3].is_none());
+    }
+
+    #[test]
+    fn chat_timestamp_formats_as_hhmm() {
+        assert_eq!(fmt_hhmm(0), "00:00");
+        assert_eq!(fmt_hhmm(60), "00:01");
+        // 10:42 UTC on any day past epoch — minutes of day = 10*60+42.
+        let ts = (10 * 60 + 42) * 60;
+        assert_eq!(fmt_hhmm(ts), "10:42");
     }
 }
