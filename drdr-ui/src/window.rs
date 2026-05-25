@@ -200,6 +200,14 @@ pub trait WindowApp {
         AppControl::Continue
     }
 
+    /// The pointer moved over this window's content area **with the
+    /// left button held**. Used by drawing apps to support drag — the
+    /// default ignores motion, so existing apps don't see new events.
+    fn on_drag(&mut self, col: u32, row: u32) -> AppControl {
+        let _ = (col, row);
+        AppControl::Continue
+    }
+
     /// Periodic heartbeat (~ every `InputHub` tick), even when not
     /// focused — lets a clock or a network panel keep itself current.
     fn on_tick(&mut self) -> AppControl {
@@ -421,6 +429,11 @@ pub struct WindowManager {
     pointer_x: i32,
     pointer_y: i32,
     drag: Option<Drag>,
+    /// Whether the left mouse button is currently held. Set by
+    /// MouseButton(Left, pressed), cleared on release. Lets motion
+    /// events synthesise "drag inside a content area" for drawing apps
+    /// without also delivering motion when the user is just hovering.
+    mouse_down: bool,
     last_click: Option<(std::time::Instant, i32, i32)>,
     dirty: bool,
     /// Builds a fresh launcher window when the desktop empties.
@@ -443,6 +456,7 @@ impl WindowManager {
             pointer_x: (screen_w / 2) as i32,
             pointer_y: (screen_h / 2) as i32,
             drag: None,
+            mouse_down: false,
             last_click: None,
             dirty: true,
             launcher: None,
@@ -711,13 +725,16 @@ impl WindowManager {
                 let nx = (self.pointer_x + dx).clamp(0, self.screen_w as i32 - 1);
                 let ny = (self.pointer_y + dy).clamp(0, self.screen_h as i32 - 1);
                 self.move_pointer(nx, ny);
+                self.deliver_drag(nx, ny);
             }
             MouseEvent::MovedTo { x, y } => {
                 let nx = x.clamp(0, self.screen_w as i32 - 1);
                 let ny = y.clamp(0, self.screen_h as i32 - 1);
                 self.move_pointer(nx, ny);
+                self.deliver_drag(nx, ny);
             }
             MouseEvent::Button { button: MouseButton::Left, pressed: true } => {
+                self.mouse_down = true;
                 let (x, y) = (self.pointer_x, self.pointer_y);
                 let now = std::time::Instant::now();
                 let double = matches!(self.last_click, Some((t, lx, ly))
@@ -766,8 +783,32 @@ impl WindowManager {
             }
             MouseEvent::Button { button: MouseButton::Left, pressed: false } => {
                 self.drag = None;
+                self.mouse_down = false;
             }
             _ => {}
+        }
+    }
+
+    /// While the left button is held, hand pointer motion over the
+    /// focused window's content area to its app as `on_drag`. The
+    /// title-bar drag (window move) and the start-menu state both
+    /// suppress this — you never start a paint stroke while moving a
+    /// window.
+    fn deliver_drag(&mut self, x: i32, y: i32) {
+        if !self.mouse_down || self.drag.is_some() {
+            return;
+        }
+        let Some(idx) = self.windows.len().checked_sub(1) else {
+            return;
+        };
+        let Some((col, row)) = self.windows[idx].cell_at(x, y) else {
+            return;
+        };
+        let ctrl = self.windows[idx].app.on_drag(col, row);
+        self.drain_spawns(idx);
+        if ctrl == AppControl::Close {
+            self.windows.remove(idx);
+            self.refill_if_empty();
         }
     }
 

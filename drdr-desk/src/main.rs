@@ -26,23 +26,22 @@
 //! Keys: Alt-Tab cycles windows; the focused window's app gets the rest.
 
 mod apps;
+mod net;
 
 use std::env;
-use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use drdr_fb::Framebuffer;
 use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
-use drdr_net::status::{KIND_STAT_OK, Stat};
-use drdr_net::{Frame, pack, reactor};
 use drdr_ui::{
     HubEvent, InputHub, KeyReader, PointerReader, Px, Rect, Spawn, Theme, VtGuard,
     WindowManager, detect_keyboard, detect_mouse, detect_touch,
 };
 
 use apps::{AboutApp, FilesApp, LauncherApp, NetApp};
+use net::NetState;
 
 fn main() -> ExitCode {
     let args = match parse_args(env::args().collect()) {
@@ -57,17 +56,25 @@ fn main() -> ExitCode {
     // flip light/dark at runtime; we re-read it before every repaint.
     let mut theme = apps::current_theme();
 
-    // Bring DrDrNet's async reactor up first so the "DrDrNet" window has
-    // somewhere to connect. Returns None if loopback isn't usable — the
-    // desktop still runs, the panel just shows "offline".
-    let net_addr = start_status_server();
+    // Bring DrDrNet up first so the "DrDrNet" window has somewhere to
+    // connect. Phase 8: the reactor binds to *all* interfaces (so peers
+    // on the LAN can reach us) and a discovery service broadcasts our
+    // presence over UDP. Returns None on hard bind failures — the
+    // desktop still runs, the DrDrNet/Chat panels just show "offline".
+    let net_state = NetState::start(hostname()).ok();
+    if let Some(s) = &net_state {
+        eprintln!(
+            "[drdr-desk] DrDrNet reactor listening on {}  (peer id {:016x})",
+            s.reactor_addr, s.me.id
+        );
+    }
 
     // Snapshot mode: one frame to a heap framebuffer → PPM. No devices.
     // We tick once so the DrDrNet panel shows real data in the image.
     if let Some(path) = &args.ppm_path {
         let mut fb = Framebuffer::in_memory(1024, 768);
         let mut wm = WindowManager::new(fb.width, fb.height);
-        build_desktop(&mut wm, net_addr);
+        build_desktop(&mut wm, net_state.clone());
         wm.tick();
         wm.draw(&mut fb, &theme);
         return match fb.write_ppm(path) {
@@ -108,12 +115,13 @@ fn main() -> ExitCode {
     };
 
     let mut wm = WindowManager::new(fb.width, fb.height);
-    build_desktop(&mut wm, net_addr);
+    build_desktop(&mut wm, net_state.clone());
     // The way back: when the last window closes, the WM rebuilds this
     // Launcher so closed windows can always be reopened.
+    let launcher_net = net_state.clone();
     wm.set_launcher(move || Spawn {
         rect: Rect::new(360, 250, 470, 280),
-        app: Box::new(LauncherApp::new(net_addr)),
+        app: Box::new(LauncherApp::new(launcher_net.clone())),
     });
 
     // Double buffering: render the whole scene off-screen, then blit it
@@ -285,7 +293,7 @@ fn draw_waiting_banner(fb: &mut Framebuffer, theme: &Theme) {
 /// Open the default set of overlapping windows. Order matters: the last
 /// one opened is on top and focused, so DrDrNet (the headline Tier-3
 /// demo) gets the accent title bar in the boot screenshot.
-fn build_desktop(wm: &mut WindowManager, net_addr: Option<SocketAddr>) {
+fn build_desktop(wm: &mut WindowManager, net_state: Option<NetState>) {
     let (sw, sh) = wm.screen();
 
     // Lay out relative to the screen, clamped so nothing falls off a
@@ -300,49 +308,15 @@ fn build_desktop(wm: &mut WindowManager, net_addr: Option<SocketAddr>) {
 
     // The Start menu (taskbar) and the Launcher window share one app
     // catalogue, so a new app shows up in both for free.
-    wm.set_start_menu(apps::app_catalog(net_addr));
+    wm.set_start_menu(apps::app_catalog(net_state.clone()));
 
     // Distinct positions (no two windows stacked exactly). The Launcher
     // opens last so it's on top and focused — it's the "what can I do"
     // hub, the right thing to greet the user with.
     wm.open(clamp(40, 56, 560, 280), Box::new(AboutApp));
-    wm.open(clamp(600, 70, 440, 330), Box::new(NetApp::new(net_addr)));
+    wm.open(clamp(600, 70, 440, 330), Box::new(NetApp::new(net_state.clone())));
     wm.open(clamp(70, 380, 560, 360), Box::new(FilesApp::new("/")));
-    wm.open(clamp(380, 180, 470, 360), Box::new(LauncherApp::new(net_addr)));
-}
-
-/// Start DrDrNet's Tier 3 reactor on an ephemeral loopback port and
-/// serve the `status` protocol from a background thread. Returns the
-/// bound address, or `None` if loopback is down (non-fatal).
-fn start_status_server() -> Option<SocketAddr> {
-    let listener = match reactor::Listener::bind("127.0.0.1:0") {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[drdr-desk] DrDrNet server bind failed: {e} (panel offline)");
-            return None;
-        }
-    };
-    let addr = listener.local_addr().ok()?;
-    eprintln!("[drdr-desk] DrDrNet reactor listening on {addr}");
-
-    thread::spawn(move || {
-        let start = Instant::now();
-        let host = hostname();
-        let mut served: u64 = 0;
-        // One thread, many short connections — exactly what the reactor
-        // is for. The handler echoes the request's correlation id.
-        let _ = listener.run(move |f: &Frame| {
-            served += 1;
-            let stat = Stat {
-                uptime_secs: start.elapsed().as_secs(),
-                requests: served,
-                host: host.clone(),
-            };
-            Some(Frame::with_id(KIND_STAT_OK, f.id, pack(&stat)))
-        });
-    });
-
-    Some(addr)
+    wm.open(clamp(380, 180, 470, 360), Box::new(LauncherApp::new(net_state)));
 }
 
 /// Best-effort node name: prefer the configured `/etc/hostname`, then
