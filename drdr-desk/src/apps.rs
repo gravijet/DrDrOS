@@ -20,11 +20,19 @@ use std::time::Duration;
 
 use drdr_net::status::{KIND_STAT_REQ, Stat, StatReq};
 use drdr_net::Conn;
-use drdr_ui::{AppControl, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp};
+use drdr_ui::{AppControl, DesktopIcon, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp};
 
 use nix::sys::reboot::{RebootMode, reboot};
 
 use crate::net::NetState;
+use crate::SharedNet;
+
+/// Snapshot the shared DrDrNet state for read-only use inside an app.
+/// Returns `None` while the background thread is still bringing it up
+/// (or if networking never came up).
+fn net_snapshot(net: &SharedNet) -> Option<NetState> {
+    net.lock().ok().and_then(|g| g.clone())
+}
 
 // ─── Process-global desktop palette ──────────────────────────────────
 //
@@ -369,6 +377,9 @@ pub struct EditApp {
     top: usize,
     modified: bool,
     status: String,
+    /// `Some(buf)` while the user is typing a new file name in the
+    /// "Save As" prompt (F2). Enter commits, Esc cancels.
+    save_as: Option<String>,
 }
 
 impl EditApp {
@@ -384,7 +395,7 @@ impl EditApp {
             }
             Err(_) => (vec![String::new()], "new file".into()),
         };
-        Self { path, lines, cx: 0, cy: 0, top: 0, modified: false, status }
+        Self { path, lines, cx: 0, cy: 0, top: 0, modified: false, status, save_as: None }
     }
 
     fn cur_len(&self) -> usize {
@@ -400,13 +411,38 @@ impl EditApp {
         match fs::write(&self.path, body) {
             Ok(()) => {
                 self.modified = false;
-                self.status = "saved".into();
+                let where_ = if drdr_store::data_is_persistent() {
+                    "saved (persistent)"
+                } else {
+                    "saved to RAM - mount a disk in Disks to keep it!"
+                };
+                self.status = format!("{where_}: {}", self.path.display());
                 true
             }
             Err(e) => {
                 self.status = format!("save failed: {e}");
                 false
             }
+        }
+    }
+
+    /// Commit the "Save As" prompt: route through drdr-store::save so
+    /// the file lands in the persistent (or RAM) Documents folder no
+    /// matter where the editor was opened from.
+    fn save_as_commit(&mut self, name: &str) {
+        let body = self.lines.join("\n");
+        match drdr_store::save(name, body.as_bytes()) {
+            Ok(path) => {
+                self.path = path.clone();
+                self.modified = false;
+                let where_ = if drdr_store::data_is_persistent() {
+                    "saved (persistent)"
+                } else {
+                    "saved to RAM - mount a disk in Disks to keep it!"
+                };
+                self.status = format!("{where_}: {}", path.display());
+            }
+            Err(e) => self.status = format!("save failed: {e}"),
         }
     }
 
@@ -455,7 +491,42 @@ impl WindowApp for EditApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
+        // "Save As" modal — captures all input until Enter / Esc.
+        // Entered via the Backtab (Shift+Tab) shortcut so an unmapped
+        // function key isn't a blocker — Tier 3 should add a real
+        // ctrl/F-key path through the input layer.
+        if let Some(buf) = self.save_as.as_mut() {
+            match key {
+                KeyCode::Char(c) => buf.push(c),
+                KeyCode::Space => buf.push(' '),
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Enter => {
+                    let name = std::mem::take(buf);
+                    self.save_as = None;
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        self.save_as_commit(trimmed);
+                    }
+                }
+                KeyCode::Escape => {
+                    self.save_as = None;
+                    self.status = "Save As cancelled".into();
+                }
+                _ => {}
+            }
+            return AppControl::Continue;
+        }
+
         match key {
+            // Shift+Tab → "Save As" prompt. Tab inserts indentation;
+            // Shift+Tab is otherwise free in the editor and easy to
+            // reach without an F-key mapping.
+            KeyCode::BackTab => {
+                self.save_as = Some(String::new());
+                self.status = "Save As: type a name then Enter (Esc to cancel)".into();
+            }
             // Save then close. If the save fails we stay open (the
             // status line shows why) so work isn't lost to a bad path.
             KeyCode::Escape if self.save() => return AppControl::Close,
@@ -524,15 +595,16 @@ impl WindowApp for EditApp {
         }
 
         let star = if self.modified { " *modified" } else { "" };
-        g.text(
-            0,
-            0,
-            &format!(
-                "Esc save&close  arrows move  [{}]{star}  {}",
+        let header = if let Some(buf) = &self.save_as {
+            format!("Save As: {buf}_  (Enter=ok Esc=cancel)")
+        } else {
+            format!(
+                "Esc save&close  Shift+Tab save-as  [{}]{star}  {}",
                 self.lines.len(),
                 self.status
-            ),
-        );
+            )
+        };
+        g.text(0, 0, &header);
 
         for vis in 0..text_rows {
             let li = self.top + vis;
@@ -566,11 +638,11 @@ pub struct LauncherApp {
 }
 
 /// The single source of truth for "every app you can open" — used by
-/// both the Launcher window and the taskbar Start menu, so they can
-/// never drift apart. Each entry is a label and a factory that builds
-/// the window on demand.
+/// the desktop icons, the Launcher window, and the taskbar Start menu,
+/// so they can never drift apart. Each entry is a label and a factory
+/// that builds the window on demand.
 pub fn app_catalog(
-    net: Option<NetState>,
+    net: SharedNet,
 ) -> Vec<(String, Box<dyn Fn() -> Spawn>)> {
     fn entry(
         label: &str,
@@ -585,13 +657,16 @@ pub fn app_catalog(
     let net_for_settings = net.clone();
     let net_for_panel = net.clone();
     vec![
-        entry("Files", || Box::new(FilesApp::new("/"))),
-        entry("Text Editor", || Box::new(EditApp::new("/tmp/untitled.txt"))),
+        // Default to the user's writable Documents folder — that's where
+        // Notes / drdr-store::save live, and it shows the user where
+        // their files actually go (RAM or a mounted disk).
+        entry("Files", || Box::new(FilesApp::new(drdr_store::documents_dir()))),
+        entry("Text Editor", || Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))),
         entry("Notes (saved)", || Box::new(NotesApp::new())),
+        entry("Terminal (Shell)", || Box::new(ConsoleApp::new())),
         entry("Calculator", || Box::new(CalcApp::new())),
         entry("Clock & Calendar", || Box::new(ClockApp::new())),
         entry("System Monitor", || Box::new(SysMonApp::new())),
-        entry("DrDrConsole", || Box::new(ConsoleApp::new())),
         entry("DrDrChat (LAN)", move || Box::new(ChatApp::new(net_for_chat.clone()))),
         entry("DrDrPaint", || Box::new(PaintApp::new())),
         entry("DrDrSnake", || Box::new(SnakeApp::new())),
@@ -599,12 +674,52 @@ pub fn app_catalog(
         entry("Settings", move || Box::new(SettingsApp::new(net_for_settings.clone()))),
         entry("DrDrNet panel", move || Box::new(NetApp::new(net_for_panel.clone()))),
         entry("About DrDrOS", || Box::new(AboutApp)),
-        entry("System (power)", || Box::new(SystemApp::new())),
+        entry("Power", || Box::new(SystemApp::new())),
+    ]
+}
+
+/// The icons that appear on the empty desktop. Sub-set of `app_catalog`
+/// (we don't put every app on the desktop — Power and the DrDrNet
+/// diagnostic panel stay in the Start menu only), each with a glyph
+/// and a soft tint that helps the eye scan the grid.
+pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
+    fn icon(
+        label: &str,
+        glyph: char,
+        tint: Px,
+        f: impl Fn() -> Box<dyn WindowApp> + 'static,
+    ) -> DesktopIcon {
+        DesktopIcon {
+            label: label.to_string(),
+            glyph,
+            tint,
+            factory: Box::new(move || Spawn { rect: spawn_rect(), app: f() }),
+        }
+    }
+    let net_for_chat = net.clone();
+    let net_for_settings = net.clone();
+    vec![
+        icon("Files",      'F', Px::rgb(0x2D, 0x82, 0xF0), || {
+            Box::new(FilesApp::new(drdr_store::documents_dir()))
+        }),
+        icon("Editor",     'T', Px::rgb(0x5E, 0xB2, 0x4F), || {
+            Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))
+        }),
+        icon("Notes",      'N', Px::rgb(0xF2, 0xC0, 0x32), || Box::new(NotesApp::new())),
+        icon("Terminal",   '>', Px::rgb(0x33, 0x33, 0x3A), || Box::new(ConsoleApp::new())),
+        icon("Calculator", '=', Px::rgb(0x6B, 0x4F, 0xC9), || Box::new(CalcApp::new())),
+        icon("Clock",      'C', Px::rgb(0xE8, 0x6B, 0x3D), || Box::new(ClockApp::new())),
+        icon("Monitor",    'M', Px::rgb(0x36, 0xB9, 0xB0), || Box::new(SysMonApp::new())),
+        icon("Chat",       '@', Px::rgb(0xE8, 0x4E, 0x95), move || Box::new(ChatApp::new(net_for_chat.clone()))),
+        icon("Paint",      'P', Px::rgb(0xC8, 0x36, 0x52), || Box::new(PaintApp::new())),
+        icon("Snake",      'S', Px::rgb(0x4F, 0xB8, 0x35), || Box::new(SnakeApp::new())),
+        icon("Disks",      'D', Px::rgb(0x6E, 0x6E, 0x82), || Box::new(DisksApp::new())),
+        icon("Settings",   '*', Px::rgb(0x6B, 0x73, 0x80), move || Box::new(SettingsApp::new(net_for_settings.clone()))),
     ]
 }
 
 impl LauncherApp {
-    pub fn new(net: Option<NetState>) -> Self {
+    pub fn new(net: SharedNet) -> Self {
         Self { items: app_catalog(net), sel: 0, spawns: Vec::new() }
     }
 
@@ -742,13 +857,13 @@ impl WindowApp for SystemApp {
 /// reactor is also on the LAN, so the panel doubles as a peer-list view
 /// drawn from the discovery directory.
 pub struct NetApp {
-    net: Option<NetState>,
+    net: SharedNet,
     last: Result<Stat, String>,
     polls: u64,
 }
 
 impl NetApp {
-    pub fn new(net: Option<NetState>) -> Self {
+    pub fn new(net: SharedNet) -> Self {
         Self { net, last: Err("connecting...".into()), polls: 0 }
     }
 
@@ -769,15 +884,16 @@ impl NetApp {
 
 impl WindowApp for NetApp {
     fn title(&self) -> String {
-        match (&self.net, &self.last) {
+        match (net_snapshot(&self.net), &self.last) {
             (Some(_), Ok(_)) => "DrDrNet  * online".into(),
+            (None, _) => "DrDrNet  - starting...".into(),
             _ => "DrDrNet  - offline".into(),
         }
     }
 
     fn on_tick(&mut self) -> AppControl {
         self.polls += 1;
-        if let Some(net) = &self.net {
+        if let Some(net) = net_snapshot(&self.net) {
             // Dial ourselves over loopback — same path real peers take,
             // just a shorter hop. Proves the same code path the LAN uses.
             let loopback = std::net::SocketAddr::new(
@@ -792,14 +908,17 @@ impl WindowApp for NetApp {
     fn render(&mut self, g: &mut TextGrid) {
         let teal = Px::rgb(0x3D, 0xD0, 0xBC);
         let red = Px::rgb(0xFF, 0x6B, 0x6B);
+        let amber = Px::rgb(0xE0, 0xB0, 0x40);
         let bg = g.bg();
 
-        match (&self.net, &self.last) {
+        let snap = net_snapshot(&self.net);
+        match (&snap, &self.last) {
             (None, _) => {
-                g.write(1, 1, "DrDrNet offline", red, bg);
-                g.text(1, 3, "Could not bind a TCP reactor at boot.");
-                g.text(1, 4, "The desktop still works; peers and chat");
-                g.text(1, 5, "are disabled.");
+                g.write(1, 1, ". starting up...", amber, bg);
+                g.text(1, 3, "DrDrNet is coming online in the background.");
+                g.text(1, 4, "The reactor binds to all interfaces and");
+                g.text(1, 5, "broadcasts a HELLO so peers can find us.");
+                g.text(1, 7, "This window updates as soon as it's ready.");
             }
             (Some(net), Ok(s)) => {
                 g.write(1, 1, "* connected", teal, bg);
@@ -846,7 +965,7 @@ impl WindowApp for NetApp {
 /// whether that survives a reboot), with a one-key jump to the Disks
 /// manager to change it.
 pub struct SettingsApp {
-    net: Option<NetState>,
+    net: SharedNet,
     sel: usize,
     spawns: Vec<Spawn>,
 }
@@ -854,7 +973,7 @@ pub struct SettingsApp {
 const SETTINGS_ROWS: usize = 3;
 
 impl SettingsApp {
-    pub fn new(net: Option<NetState>) -> Self {
+    pub fn new(net: SharedNet) -> Self {
         Self { net, sel: 0, spawns: Vec::new() }
     }
 
@@ -2010,12 +2129,12 @@ impl WindowApp for ConsoleApp {
 /// it, plus a composer at the bottom. Enter on the composer fans out
 /// the line to every live peer in the discovery directory.
 pub struct ChatApp {
-    net: Option<NetState>,
+    net: SharedNet,
     input: String,
 }
 
 impl ChatApp {
-    pub fn new(net: Option<NetState>) -> Self {
+    pub fn new(net: SharedNet) -> Self {
         Self { net, input: String::new() }
     }
 
@@ -2023,7 +2142,7 @@ impl ChatApp {
     /// the chat frame fire-and-forget. We don't wait for replies — chat
     /// is best-effort, peer goes silent → message just doesn't arrive.
     fn send(&mut self) {
-        let Some(net) = self.net.clone() else {
+        let Some(net) = net_snapshot(&self.net) else {
             self.input.clear();
             return;
         };
@@ -2078,8 +2197,8 @@ fn fmt_hhmm(ts: u64) -> String {
 
 impl WindowApp for ChatApp {
     fn title(&self) -> String {
-        match &self.net {
-            None => "DrDrChat - offline".into(),
+        match net_snapshot(&self.net) {
+            None => "DrDrChat - starting...".into(),
             Some(net) => {
                 let peers = net.directory.lock().map(|d| d.len()).unwrap_or(0);
                 format!("DrDrChat - {} ({} peers)", net.me.host, peers)
@@ -2113,12 +2232,15 @@ impl WindowApp for ChatApp {
         let rows = g.rows;
         let cols = g.cols as usize;
 
-        let Some(net) = &self.net else {
-            g.write(1, 1, "DrDrChat is offline", red, bg);
-            g.text(1, 3, "No reactor bound at boot, so peer discovery");
-            g.text(1, 4, "and chat are both disabled.");
+        let Some(net) = net_snapshot(&self.net) else {
+            g.write(1, 1, "DrDrChat is connecting...", muted, bg);
+            g.text(1, 3, "DrDrNet is still standing up on this machine.");
+            g.text(1, 4, "Once the reactor is bound (a moment after");
+            g.text(1, 5, "boot) chat opens up on its own.");
+            let _ = red; // kept for symmetry with the offline branch
             return;
         };
+        let net = &net;
 
         // ── Peer strip (top 4 rows) ──
         let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();

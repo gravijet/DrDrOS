@@ -243,6 +243,16 @@ impl PixelFmt {
     }
 }
 
+/// Which corner an AA pass paints. Internal helper for
+/// [`Framebuffer::fill_round_rect_corners`].
+#[derive(Copy, Clone)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 /// Where the pixel bytes live. `Mmap` is the production case; `Heap` is a
 /// Vec-backed buffer used by host tests, the `write_ppm` snapshot path,
 /// and as the double-buffer back surface.
@@ -479,6 +489,220 @@ impl Framebuffer {
         for py in y..y_end {
             for px in x..x_end {
                 self.blend_pixel(px, py, color);
+            }
+        }
+    }
+
+    /// Fill a rounded rectangle with the same corner radius on all four
+    /// corners. Anti-aliased at the corners via 4×4 sub-pixel sampling
+    /// alpha-blended onto the back buffer. Only call on a canonical heap
+    /// surface (the back buffer) — `blend_pixel` is only correct there.
+    pub fn fill_round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: Pixel) {
+        self.fill_round_rect_corners(x, y, w, h, radius, radius, radius, radius, color);
+    }
+
+    /// Fill a rounded rectangle with **separately specified** corner
+    /// radii — top-left, top-right, bottom-left, bottom-right. Lets the
+    /// window manager paint title bars whose top corners are rounded
+    /// but bottom corners are flush with the body.
+    pub fn fill_round_rect_corners(
+        &mut self,
+        x: u32, y: u32, w: u32, h: u32,
+        r_tl: u32, r_tr: u32, r_bl: u32, r_br: u32,
+        color: Pixel,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let max_r = (w / 2).min(h / 2);
+        let r_tl = r_tl.min(max_r);
+        let r_tr = r_tr.min(max_r);
+        let r_bl = r_bl.min(max_r);
+        let r_br = r_br.min(max_r);
+        if r_tl == 0 && r_tr == 0 && r_bl == 0 && r_br == 0 {
+            return self.fill_rect(x, y, w, h, color);
+        }
+
+        // Body — paint everything that's NOT in a corner box. We split
+        // the rectangle into a top band (rows 0..max(r_tl,r_tr)), a
+        // middle band, and a bottom band; each band has its own left/
+        // right corner cut-outs.
+        let top_h = r_tl.max(r_tr);
+        let bot_h = r_bl.max(r_br);
+        let mid_y = y + top_h;
+        let mid_h = h.saturating_sub(top_h + bot_h);
+        // Middle band: full-width straight rectangle.
+        if mid_h > 0 {
+            self.fill_rect(x, mid_y, w, mid_h, color);
+        }
+        // Top band: inside the corner heights only — strip is the part
+        // of the top band between the left and right corner boxes.
+        for row in 0..top_h {
+            let py = y + row;
+            // Within this row, the left edge starts after r_tl arc, the
+            // right edge stops before r_tr arc — but only on rows that
+            // actually fall inside each corner.
+            let left_skip = if row < r_tl { r_tl } else { 0 };
+            let right_skip = if row < r_tr { r_tr } else { 0 };
+            let strip_x = x + left_skip;
+            let strip_w = w.saturating_sub(left_skip + right_skip);
+            if strip_w > 0 {
+                self.fill_rect(strip_x, py, strip_w, 1, color);
+            }
+        }
+        // Bottom band: mirror.
+        for row in 0..bot_h {
+            let py = y + h - 1 - row;
+            let left_skip = if row < r_bl { r_bl } else { 0 };
+            let right_skip = if row < r_br { r_br } else { 0 };
+            let strip_x = x + left_skip;
+            let strip_w = w.saturating_sub(left_skip + right_skip);
+            if strip_w > 0 {
+                self.fill_rect(strip_x, py, strip_w, 1, color);
+            }
+        }
+
+        // Four AA corner passes, each guarded so radius 0 corners are
+        // already painted as straight by the band loop above.
+        if r_tl > 0 {
+            self.paint_corner(x, y, r_tl, color, Corner::TopLeft);
+        }
+        if r_tr > 0 {
+            self.paint_corner(x + w - r_tr, y, r_tr, color, Corner::TopRight);
+        }
+        if r_bl > 0 {
+            self.paint_corner(x, y + h - r_bl, r_bl, color, Corner::BottomLeft);
+        }
+        if r_br > 0 {
+            self.paint_corner(x + w - r_br, y + h - r_br, r_br, color, Corner::BottomRight);
+        }
+    }
+
+    fn paint_corner(&mut self, ox: u32, oy: u32, r: u32, color: Pixel, which: Corner) {
+        let r_i = r as i32;
+        let r2_q = r_i * 4 * (r_i * 4);
+        for cy in 0..r {
+            for cx in 0..r {
+                // Sample point relative to "perfect" arc center placed
+                // at the inside-corner of the rounded square.
+                let (sample_cx, sample_cy) = match which {
+                    Corner::TopLeft => (r_i - 1 - cx as i32, r_i - 1 - cy as i32),
+                    Corner::TopRight => (cx as i32, r_i - 1 - cy as i32),
+                    Corner::BottomLeft => (r_i - 1 - cx as i32, cy as i32),
+                    Corner::BottomRight => (cx as i32, cy as i32),
+                };
+                let mut hits = 0i32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let fx = sample_cx * 4 + sx * 2 + 1;
+                        let fy = sample_cy * 4 + sy * 2 + 1;
+                        // The arc is centered at (r, r) in quarter-pixel
+                        // units; squared distance against r².
+                        let dx = fx;
+                        let dy = fy;
+                        if dx * dx + dy * dy <= r2_q {
+                            hits += 1;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    continue;
+                }
+                let alpha = ((hits * 255) / 16) as u8;
+                let c = Pixel::rgba(color.r, color.g, color.b, alpha);
+                self.blend_pixel(ox + cx, oy + cy, c);
+            }
+        }
+    }
+
+    /// Per-pixel soft drop shadow that fans out from `r` with quadratic
+    /// falloff in distance. Slight down/right offset matches a top-lit
+    /// look. Only meaningful on the canonical heap back buffer (uses
+    /// `blend_pixel`).
+    pub fn drop_shadow(&mut self, r_x: i32, r_y: i32, r_w: i32, r_h: i32, reach: i32, alpha_peak: u32) {
+        let off_x = 1;
+        let off_y = 3;
+        let inner_x0 = r_x + off_x;
+        let inner_y0 = r_y + off_y;
+        let inner_x1 = r_x + r_w + off_x;
+        let inner_y1 = r_y + r_h + off_y;
+        let x0 = (inner_x0 - reach).max(0);
+        let y0 = (inner_y0 - reach).max(0);
+        let x1 = (inner_x1 + reach).min(self.width as i32);
+        let y1 = (inner_y1 + reach).min(self.height as i32);
+        let reach2 = reach * reach;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                // Distance to nearest edge of the offset window. Negative
+                // would mean "inside the window"; we skip those (the
+                // window itself paints over them anyway).
+                let dx = (inner_x0 - px).max(px - inner_x1 + 1).max(0);
+                let dy = (inner_y0 - py).max(py - inner_y1 + 1).max(0);
+                let d2 = dx * dx + dy * dy;
+                if d2 == 0 || d2 >= reach2 {
+                    continue;
+                }
+                // Quadratic falloff in integer math:
+                //   t² ∝ (reach² - d²)² / reach⁴
+                let lin = ((reach2 - d2) as u64) * 256 / (reach2 as u64); // 0..256
+                let quad = (lin * lin) / 256; // 0..256
+                let a = ((quad * alpha_peak as u64) / 256) as u8;
+                if a == 0 {
+                    continue;
+                }
+                self.blend_pixel(px as u32, py as u32, Pixel::rgba(0, 0, 0, a));
+            }
+        }
+    }
+
+    /// 1-pixel rounded outline. Same anti-aliasing as `fill_round_rect`
+    /// at the corners; the four straight edges are plain 1-px strips.
+    #[allow(dead_code)]
+    pub fn stroke_round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: Pixel) {
+        let r = radius.min(w / 2).min(h / 2);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if r == 0 {
+            self.fill_rect(x, y, w, 1, color);
+            self.fill_rect(x, y + h - 1, w, 1, color);
+            self.fill_rect(x, y, 1, h, color);
+            self.fill_rect(x + w - 1, y, 1, h, color);
+            return;
+        }
+        // Edges (skip the corner regions).
+        self.fill_rect(x + r, y, w - 2 * r, 1, color);
+        self.fill_rect(x + r, y + h - 1, w - 2 * r, 1, color);
+        self.fill_rect(x, y + r, 1, h - 2 * r, color);
+        self.fill_rect(x + w - 1, y + r, 1, h - 2 * r, color);
+
+        // Corners: paint only the pixels whose 4×4 sample has *some*
+        // coverage on the arc band r-1 ≤ d ≤ r (a 1-px-ish ring).
+        let r_i = r as i32;
+        let r_out2 = r_i * 4 * (r_i * 4);
+        let r_in2 = (r_i.saturating_sub(1)) * 4 * (r_i.saturating_sub(1) * 4);
+        for cy in 0..r {
+            for cx in 0..r {
+                let mut hits = 0i32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let fx = (cx as i32) * 4 + sx * 2 + 1 - r_i * 4;
+                        let fy = (cy as i32) * 4 + sy * 2 + 1 - r_i * 4;
+                        let d2 = fx * fx + fy * fy;
+                        if d2 <= r_out2 && d2 >= r_in2 {
+                            hits += 1;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    continue;
+                }
+                let alpha = ((hits * 255) / 16) as u8;
+                let c = Pixel::rgba(color.r, color.g, color.b, alpha);
+                self.blend_pixel(x + cx, y + cy, c);
+                self.blend_pixel(x + w - 1 - cx, y + cy, c);
+                self.blend_pixel(x + cx, y + h - 1 - cy, c);
+                self.blend_pixel(x + w - 1 - cx, y + h - 1 - cy, c);
             }
         }
     }

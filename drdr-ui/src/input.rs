@@ -56,6 +56,19 @@ pub enum KeyCode {
     /// while an Alt key is held, so a window manager can switch focus
     /// without inventing its own modifier bookkeeping.
     AltTab,
+    /// The Super / Meta / Windows key, pressed on its own — opens the
+    /// Start menu (Windows convention; macOS uses Cmd-Space, GNOME uses
+    /// Super-S, we pick the most familiar default).
+    Super,
+    /// Super + arrow key chords for window snapping. The WM resizes the
+    /// focused window to the workarea's left half / right half / full /
+    /// restores it, matching Win + arrows on every modern OS.
+    SnapLeft,
+    SnapRight,
+    SnapUp,
+    SnapDown,
+    /// F1 — open the keyboard shortcut help overlay.
+    Help,
     Backspace,
     Space,
     /// A printable ASCII character with Shift state already applied.
@@ -106,6 +119,11 @@ const KEY_PAGEDOWN: u16 = 109;
 const KEY_HOME: u16 = 102;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_LEFTMETA: u16 = 125;
+const KEY_RIGHTMETA: u16 = 126;
+const KEY_F1: u16 = 59;
 
 // Mouse / pointer event types and codes (linux/input-event-codes.h).
 // A mouse reports motion as *relative* deltas: an `EV_REL` record with
@@ -160,12 +178,21 @@ nix::ioctl_read!(ev_get_abs_mt_y, b'E', 0x40 + 0x36, InputAbsinfo);
 
 // ─── KeyReader ───────────────────────────────────────────────────────
 
-/// Opens an evdev device and yields [`Event`]s. Holds the Shift state
-/// across calls so the right `Char` cases come out for letters.
+/// Opens an evdev device and yields [`Event`]s. Holds the Shift / Alt /
+/// Super / Ctrl state across calls so chords (Alt-Tab, Super-Arrow,
+/// Super alone) come out as the right [`KeyCode`].
 pub struct KeyReader {
     file: File,
     shift: bool,
     alt: bool,
+    /// Super / Meta / Windows key currently held.
+    super_: bool,
+    ctrl: bool,
+    /// Has the Super key been used in a chord since it was pressed?
+    /// If `false` when Super releases, we emit `KeyCode::Super` (open
+    /// Start menu); if `true`, the chord already fired and the release
+    /// is silent. Matches how Windows / GNOME handle the Super key.
+    super_chorded: bool,
 }
 
 impl KeyReader {
@@ -174,7 +201,14 @@ impl KeyReader {
     /// running as root or being in the `input` group.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self { file, shift: false, alt: false })
+        Ok(Self {
+            file,
+            shift: false,
+            alt: false,
+            super_: false,
+            ctrl: false,
+            super_chorded: false,
+        })
     }
 
     /// Borrow the device fd so [`InputHub`] can `poll` keyboard and
@@ -196,6 +230,8 @@ impl KeyReader {
         if ev.type_ != EV_KEY {
             return Ok(None);
         }
+        // Modifier tracking — note that Super has the special "open Start
+        // on release if not chorded" behaviour everyone is used to.
         match ev.code {
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                 self.shift = ev.value != 0;
@@ -205,14 +241,47 @@ impl KeyReader {
                 self.alt = ev.value != 0;
                 return Ok(None);
             }
+            KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                self.ctrl = ev.value != 0;
+                return Ok(None);
+            }
+            KEY_LEFTMETA | KEY_RIGHTMETA => {
+                if ev.value != 0 {
+                    self.super_ = true;
+                    self.super_chorded = false;
+                    return Ok(None);
+                }
+                // Release: fire Super on tap, silent if chord already used.
+                self.super_ = false;
+                let chorded = std::mem::take(&mut self.super_chorded);
+                return Ok(if chorded { None } else { Some(KeyCode::Super) });
+            }
             _ => {}
         }
         if ev.value == 0 {
             return Ok(None); // release
         }
+        // Super + arrow → snap chords.
+        if self.super_ {
+            let snap = match ev.code {
+                KEY_LEFT => Some(KeyCode::SnapLeft),
+                KEY_RIGHT => Some(KeyCode::SnapRight),
+                KEY_UP => Some(KeyCode::SnapUp),
+                KEY_DOWN => Some(KeyCode::SnapDown),
+                _ => None,
+            };
+            if let Some(k) = snap {
+                self.super_chorded = true;
+                return Ok(Some(k));
+            }
+        }
         // Alt+Tab is a chord the WM wants as one logical key.
         if ev.code == KEY_TAB && self.alt {
             return Ok(Some(KeyCode::AltTab));
+        }
+        // F1 → help overlay.
+        if ev.code == KEY_F1 {
+            return Ok(Some(KeyCode::Help));
         }
         Ok(map_key(ev.code, self.shift))
     }
@@ -220,7 +289,8 @@ impl KeyReader {
     /// Block until the next *real* press (value=1) of a key we care
     /// about. Key-up events and auto-repeat (value=2) currently fall
     /// through to the next read so apps that just want "did the user
-    /// press something" stay simple.
+    /// press something" stay simple. Modifier-state tracking matches
+    /// [`decode_one`] so a held Shift/Alt/Super never gets stuck.
     pub fn next_event(&mut self) -> io::Result<Event> {
         loop {
             let mut raw = [0u8; 24];
@@ -231,19 +301,30 @@ impl KeyReader {
                 continue;
             }
 
-            // Track modifier state on press AND release so it never gets stuck.
+            // Track modifier state on press AND release so it never gets
+            // stuck. Every modifier we know about goes through here.
             match ev.code {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                     self.shift = ev.value != 0;
                     continue;
                 }
+                KEY_LEFTALT | KEY_RIGHTALT => {
+                    self.alt = ev.value != 0;
+                    continue;
+                }
+                KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                    self.ctrl = ev.value != 0;
+                    continue;
+                }
+                KEY_LEFTMETA | KEY_RIGHTMETA => {
+                    self.super_ = ev.value != 0;
+                    continue;
+                }
                 _ => {}
             }
 
-            // value: 0 = release, 1 = press, 2 = auto-repeat.
-            // For Tier 2 we treat press + repeat the same so holding a key
-            // delivers events — this is what users expect of arrow keys
-            // in a menu.
+            // value: 0 = release, 1 = press, 2 = auto-repeat. We treat
+            // press + repeat the same so holding a key delivers events.
             if ev.value == 0 {
                 continue;
             }
@@ -564,51 +645,95 @@ pub enum HubEvent {
     Tick,
 }
 
-/// Watches the keyboard and the mouse **at the same time**.
+/// Watches **every** keyboard and pointer the system has at the same time.
 ///
-/// A window manager can't block reading the keyboard — the mouse might
-/// move first, or vice-versa. The kernel's answer is `poll(2)`: hand it
-/// the set of fds you care about and it sleeps until *any* of them is
-/// readable (or a timeout fires). That timeout doubles as a heartbeat
-/// so the desktop can refresh time-based windows without input. This is
-/// the same idea as DrDrNet's epoll reactor, one tier smaller: a fixed
-/// couple of fds instead of thousands.
+/// A window manager can't block reading any one device — anything might
+/// move first. The kernel's answer is `poll(2)`: hand it the set of fds
+/// you care about and it sleeps until *any* of them is readable (or a
+/// timeout fires). That timeout doubles as a heartbeat so the desktop
+/// can refresh time-based windows without input.
+///
+/// Multi-device matters on real hardware: a Surface Go 2 may have the
+/// Type Cover keyboard *and* an external USB keyboard plugged in; a
+/// ThinkPad has the internal PS/2 keyboard *plus* a Synaptics touchpad
+/// *plus* a TrackPoint *plus* whatever USB peripherals are attached.
+/// We open and poll all of them so the user never has to think about
+/// which device is "the" one.
 pub struct InputHub {
-    keys: Option<KeyReader>,
-    pointer: Option<PointerReader>,
+    keys: Vec<KeyReader>,
+    pointers: Vec<PointerReader>,
+    /// Paths already opened — used so re-scans don't re-add the same
+    /// device twice (each evdev fd is a one-reader interface).
+    opened_paths: std::collections::HashSet<String>,
 }
 
 impl InputHub {
+    /// Build an empty hub. Callers add devices with `add_keyboard` /
+    /// `add_pointer` (one per real device).
+    pub fn empty() -> Self {
+        Self {
+            keys: Vec::new(),
+            pointers: Vec::new(),
+            opened_paths: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Single-device constructor — kept for back-compat with `--kbd` /
+    /// `--mouse` explicit paths and unit tests.
     pub fn new(keys: Option<KeyReader>, pointer: Option<PointerReader>) -> Self {
-        Self { keys, pointer }
+        let mut h = Self::empty();
+        if let Some(k) = keys {
+            h.keys.push(k);
+        }
+        if let Some(p) = pointer {
+            h.pointers.push(p);
+        }
+        h
     }
 
-    /// Hot-swap the keyboard in once it finally enumerates (USB on real
-    /// hardware shows up a beat after boot; a Surface Type Cover may be
-    /// attached after the desktop is already up).
+    /// Attach an already-opened keyboard. The path string is recorded so
+    /// subsequent rescans skip the same device.
+    pub fn add_keyboard(&mut self, k: KeyReader, path: impl Into<String>) {
+        self.opened_paths.insert(path.into());
+        self.keys.push(k);
+    }
+
+    /// Attach an already-opened pointer / touchscreen.
+    pub fn add_pointer(&mut self, p: PointerReader, path: impl Into<String>) {
+        self.opened_paths.insert(path.into());
+        self.pointers.push(p);
+    }
+
+    /// Has this path already been opened? Lets callers skip a rescan hit.
+    pub fn has_path(&self, path: &str) -> bool {
+        self.opened_paths.contains(path)
+    }
+
+    /// Back-compat single-keyboard setter — replaces any existing set.
     pub fn set_keyboard(&mut self, k: KeyReader) {
-        self.keys = Some(k);
+        self.keys.clear();
+        self.keys.push(k);
     }
 
-    /// Hot-swap the pointer/touchscreen in when it appears.
+    /// Back-compat single-pointer setter.
     pub fn set_pointer(&mut self, p: PointerReader) {
-        self.pointer = Some(p);
+        self.pointers.clear();
+        self.pointers.push(p);
     }
 
     pub fn has_keyboard(&self) -> bool {
-        self.keys.is_some()
+        !self.keys.is_empty()
     }
 
     pub fn has_pointer(&self) -> bool {
-        self.pointer.is_some()
+        !self.pointers.is_empty()
     }
 
     /// Block until a key, a mouse event, or `timeout` elapses.
     ///
-    /// Keyboard is checked before mouse so typing stays responsive under
-    /// a moving mouse. Records that don't decode to a logical event
-    /// (key-up, a modifier, an idle `SYN`) are drained transparently —
-    /// the caller only ever sees real events or a `Tick`.
+    /// Records that don't decode to a logical event (key-up, a modifier,
+    /// an idle `SYN`) are drained transparently — the caller only ever
+    /// sees real events or a `Tick`.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<HubEvent> {
         let to: PollTimeout = timeout
             .as_millis()
@@ -622,22 +747,21 @@ impl InputHub {
             // Type Cover / USB has enumerated) there is nothing to poll —
             // just sleep out the timeout and tick so the desktop stays
             // live and the caller can keep retrying device attach.
-            if self.keys.is_none() && self.pointer.is_none() {
+            if self.keys.is_empty() && self.pointers.is_empty() {
                 std::thread::sleep(timeout.min(Duration::from_millis(250)));
                 return Ok(HubEvent::Tick);
             }
 
-            // PollFd borrows the fds, so the set is rebuilt each pass.
-            // `kbd_idx` / `ptr_idx` track which slot each device took.
-            let mut fds = Vec::with_capacity(2);
-            let kbd_idx = self.keys.as_ref().map(|k| {
+            // PollFd borrows the fds. Slots in `fds` line up with
+            // (keys ++ pointers); `kbd_count` tells the boundary.
+            let kbd_count = self.keys.len();
+            let mut fds = Vec::with_capacity(kbd_count + self.pointers.len());
+            for k in &self.keys {
                 fds.push(PollFd::new(k.as_fd(), PollFlags::POLLIN));
-                fds.len() - 1
-            });
-            let ptr_idx = self.pointer.as_ref().map(|p| {
+            }
+            for p in &self.pointers {
                 fds.push(PollFd::new(p.as_fd(), PollFlags::POLLIN));
-                fds.len() - 1
-            });
+            }
 
             let n = match poll(&mut fds, to) {
                 Ok(n) => n,
@@ -648,33 +772,61 @@ impl InputHub {
                 return Ok(HubEvent::Tick);
             }
 
-            let ready = |i: usize| {
-                fds[i]
-                    .revents()
-                    .is_some_and(|r| r.intersects(PollFlags::POLLIN))
-            };
+            // Walk the slots looking for the first one with data. The
+            // revents check below also clears EV_HUP/EV_ERR slots so a
+            // device that unplugged is dropped from the set instead of
+            // wedging the poll loop.
+            let mut drop_kbd: Option<usize> = None;
+            let mut drop_ptr: Option<usize> = None;
 
-            if let Some(ki) = kbd_idx {
-                if ready(ki) {
-                    if let Some(k) = self.keys.as_mut().unwrap().decode_one()? {
-                        return Ok(HubEvent::Key(k));
-                    }
-                    continue; // modifier / release — keep polling
-                }
-            }
-
-            if let Some(pi) = ptr_idx {
-                if ready(pi) {
-                    if let Some(m) = self.pointer.as_mut().unwrap().decode_one()? {
-                        return Ok(HubEvent::Mouse(m));
+            for (i, fd) in fds.iter().enumerate() {
+                let Some(r) = fd.revents() else { continue };
+                if r.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+                    if i < kbd_count {
+                        drop_kbd = Some(i);
+                    } else {
+                        drop_ptr = Some(i - kbd_count);
                     }
                     continue;
                 }
+                if !r.intersects(PollFlags::POLLIN) {
+                    continue;
+                }
+                if i < kbd_count {
+                    match self.keys[i].decode_one() {
+                        Ok(Some(k)) => return Ok(HubEvent::Key(k)),
+                        Ok(None) => break, // modifier / release — re-poll
+                        Err(_) => {
+                            drop_kbd = Some(i);
+                            break;
+                        }
+                    }
+                } else {
+                    let pi = i - kbd_count;
+                    match self.pointers[pi].decode_one() {
+                        Ok(Some(m)) => return Ok(HubEvent::Mouse(m)),
+                        Ok(None) => break, // accumulated, awaiting SYN_REPORT
+                        Err(_) => {
+                            drop_ptr = Some(pi);
+                            break;
+                        }
+                    }
+                }
             }
 
-            // POLLERR/POLLHUP or a spurious wake — treat as a tick so the
-            // caller stays alive and just redraws.
-            return Ok(HubEvent::Tick);
+            // Borrows from `fds` have ended; safe to mutate the vectors.
+            if let Some(i) = drop_kbd {
+                if i < self.keys.len() {
+                    self.keys.remove(i);
+                }
+            }
+            if let Some(i) = drop_ptr {
+                if i < self.pointers.len() {
+                    self.pointers.remove(i);
+                }
+            }
+            // Loop back: if we mutated and have nothing to return yet,
+            // re-poll the remaining fds.
         }
     }
 }
@@ -774,12 +926,30 @@ pub fn detect_keyboard() -> Option<String> {
     })
 }
 
+/// Detect **every** keyboard on the system. A real laptop may have the
+/// internal keyboard *and* a Type Cover *and* an external USB keyboard
+/// all live at the same time — the desktop wants every one of them
+/// usable without forcing the user to unplug. Returned in detection
+/// order; deduplicated against the same eventN node.
+pub fn detect_all_keyboards() -> Vec<String> {
+    pick_all_keyboards(&parse_input_devices())
+}
+
 /// Keyboard selection over an already-parsed device list (pure, tested).
 fn pick_keyboard(devs: &[InputDev]) -> Option<String> {
     devs.iter()
         .find(|d| d.ev & EVBIT_KEY != 0 && d.ev & EVBIT_REP != 0)
         .or_else(|| devs.iter().find(|d| d.ev & EVBIT_KEY != 0))
         .map(|d| format!("/dev/input/{}", d.event))
+}
+
+/// Pick every real keyboard (EV_KEY + EV_REP). The autorepeat filter is
+/// what keeps the ACPI Power/Sleep buttons out of the set.
+fn pick_all_keyboards(devs: &[InputDev]) -> Vec<String> {
+    devs.iter()
+        .filter(|d| d.ev & EVBIT_KEY != 0 && d.ev & EVBIT_REP != 0)
+        .map(|d| format!("/dev/input/{}", d.event))
+        .collect()
 }
 
 /// Auto-detect the mouse's evdev node: the device that reports relative
@@ -793,11 +963,23 @@ pub fn detect_mouse() -> Option<String> {
     pick_mouse(&parse_input_devices())
 }
 
+/// Every relative pointer (real mouse, PS/2 touchpad, TrackPoint).
+pub fn detect_all_mice() -> Vec<String> {
+    pick_all_mice(&parse_input_devices())
+}
+
 /// Mouse selection over an already-parsed device list (pure, tested).
 fn pick_mouse(devs: &[InputDev]) -> Option<String> {
     devs.iter()
         .find(|d| d.ev & EVBIT_REL != 0)
         .map(|d| format!("/dev/input/{}", d.event))
+}
+
+fn pick_all_mice(devs: &[InputDev]) -> Vec<String> {
+    devs.iter()
+        .filter(|d| d.ev & EVBIT_REL != 0)
+        .map(|d| format!("/dev/input/{}", d.event))
+        .collect()
 }
 
 /// Auto-detect a **touchscreen / absolute pointer** (`EV_ABS`).
@@ -810,11 +992,23 @@ pub fn detect_touch() -> Option<String> {
     pick_touch(&parse_input_devices())
 }
 
+/// Every touchscreen / absolute pointer.
+pub fn detect_all_touch() -> Vec<String> {
+    pick_all_touch(&parse_input_devices())
+}
+
 /// Touchscreen selection over an already-parsed device list (pure).
 fn pick_touch(devs: &[InputDev]) -> Option<String> {
     devs.iter()
         .find(|d| d.ev & EVBIT_ABS != 0 && d.ev & EVBIT_REL == 0)
         .map(|d| format!("/dev/input/{}", d.event))
+}
+
+fn pick_all_touch(devs: &[InputDev]) -> Vec<String> {
+    devs.iter()
+        .filter(|d| d.ev & EVBIT_ABS != 0 && d.ev & EVBIT_REL == 0)
+        .map(|d| format!("/dev/input/{}", d.event))
+        .collect()
 }
 
 #[cfg(test)]
