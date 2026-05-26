@@ -148,10 +148,10 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 | Rust source | **13616 lines** across **21 files** |
 | Workspace crates | **12** (every `drdr-*`) |
 | Tests | **80** (`cargo test`, all green) |
-| Git commits | **40** |
+| Git commits | **41** |
 | Tracked files (excl. `buildroot/`) | **49** |
 | Development window | 2026-05-14
-? → 2026-05-25 |
+? → 2026-05-26 |
 
 Lines of Rust per crate (largest first):
 
