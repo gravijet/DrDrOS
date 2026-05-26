@@ -96,25 +96,57 @@ fn main() {
 ///   3. block in [`reap_until`], which reaps every child the kernel hands
 ///      us and only returns when *our* session child is the one that died,
 ///   4. small backoff, then respawn.
+///
+/// If the chosen program crashes back-to-back (e.g. drdr-desk can't open
+/// /dev/fb0 on a headless boot) we *demote* it: skip that candidate and
+/// try the next one in `SESSION_CANDIDATES`. That turns a stuck splash
+/// into a usable serial/TTY shell instead of an infinite respawn loop.
 fn supervise() -> ! {
+    // Index into SESSION_CANDIDATES we're currently trying. Bumped on
+    // repeated rapid failures so a broken graphical session falls through
+    // to drdr-shell / /bin/sh and the user still gets something.
+    let mut start_at = 0usize;
+    // How many times the *current* candidate has died fast in a row.
+    let mut fast_fails: u32 = 0;
+    // A session is "fast-failing" if it dies within this window of its
+    // spawn — that's a "couldn't even initialise" failure, not a normal
+    // user-driven exit (the desktop running for 10 minutes then closing).
+    const FAST_FAIL_MS: u128 = 4_000;
+    const FAST_FAIL_LIMIT: u32 = 3;
+
     loop {
-        let Some(prog) = SESSION_CANDIDATES.iter().find(|p| Path::new(p).exists()) else {
-            // Nothing to run yet. Don't busy-spin: wait a few seconds and
-            // re-check (a device or mount might still be settling).
+        let pick = SESSION_CANDIDATES
+            .iter()
+            .enumerate()
+            .skip(start_at)
+            .find(|(_, p)| Path::new(p).exists());
+        let Some((idx, prog)) = pick else {
             eprintln!(
-                "[drdr-init] no session program found ({}); retrying in 3s",
+                "[drdr-init] no session program found from {} onwards ({}); \
+                 resetting and retrying in 3s",
+                start_at,
                 SESSION_CANDIDATES.join(", ")
             );
+            start_at = 0;
+            fast_fails = 0;
             thread::sleep(Duration::from_secs(3));
             continue;
         };
 
         println!("[drdr-init] starting session: {prog}");
+        // Friendly basename for on-screen messages (e.g. "drdr-desk").
+        let short = Path::new(prog).file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(prog);
+        draw_splash_status(&format!("starting {short}..."));
+        let started = std::time::Instant::now();
         let child = match Command::new(prog).spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[drdr-init] could not spawn {prog}: {e}; retrying in 2s");
-                thread::sleep(Duration::from_secs(2));
+                eprintln!("[drdr-init] could not spawn {prog}: {e}; trying next candidate");
+                draw_splash_status(&format!("could not run {short} - trying next..."));
+                start_at = idx + 1;
+                thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
@@ -135,6 +167,36 @@ fn supervise() -> ! {
             SessionEnd::NoChildren => {
                 eprintln!("[drdr-init] session {prog} vanished before we could wait; respawning");
             }
+        }
+
+        // Demote a candidate that can't even stay alive a few seconds —
+        // most likely it crashed in initialisation (missing device, bad
+        // pixel format, whatever) and re-spawning it won't help. Fall
+        // through to the next candidate so the user gets *something*.
+        let lived_ms = started.elapsed().as_millis();
+        if lived_ms < FAST_FAIL_MS {
+            fast_fails += 1;
+            eprintln!(
+                "[drdr-init] {prog} fast-failed ({lived_ms} ms) — strike {fast_fails}/{FAST_FAIL_LIMIT}"
+            );
+            draw_splash_status(&format!(
+                "{short} exited after {} ms - retry {}/{}",
+                lived_ms, fast_fails, FAST_FAIL_LIMIT
+            ));
+            if fast_fails >= FAST_FAIL_LIMIT {
+                eprintln!(
+                    "[drdr-init] {prog} keeps dying — falling back to the next session candidate"
+                );
+                draw_splash_status(&format!("{short} keeps crashing - falling back..."));
+                start_at = idx + 1;
+                fast_fails = 0;
+            }
+        } else {
+            // It ran long enough to be a real session — reset so a later
+            // crash starts the demotion logic fresh, and reset start_at
+            // so the next boot prefers the best candidate again.
+            fast_fails = 0;
+            start_at = 0;
         }
 
         // Backoff so a session that crashes immediately can't peg the CPU
@@ -248,6 +310,19 @@ fn print_banner() {
 /// screen itself — the splash just covers the gap so the user never stares
 /// at a blank/garbage framebuffer.
 fn draw_splash(path: &str) -> std::io::Result<String> {
+    draw_splash_with(path, "starting the desktop...")
+}
+
+/// Same as [`draw_splash`] but with a custom status line — the supervisor
+/// uses this to tell the user *what is happening* instead of leaving the
+/// "starting the desktop..." line frozen when a session keeps crashing.
+fn draw_splash_status(status: &str) {
+    if let Err(e) = draw_splash_with("/dev/fb0", status) {
+        eprintln!("[drdr-init] could not update splash: {e}");
+    }
+}
+
+fn draw_splash_with(path: &str, status: &str) -> std::io::Result<String> {
     let mut fb = Framebuffer::open(path)?;
     let desc = fb.describe();
 
@@ -261,7 +336,7 @@ fn draw_splash(path: &str) -> std::io::Result<String> {
 
     // Centre two short lines vertically around the middle of the screen.
     let title = "DrDrOS";
-    let sub = "starting the desktop...";
+    let sub = status;
 
     let title_w = GLYPH_WIDTH * title.len() as u32;
     let sub_w = GLYPH_WIDTH * sub.len() as u32;

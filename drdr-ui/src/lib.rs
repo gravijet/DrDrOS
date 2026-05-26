@@ -34,11 +34,12 @@ use drdr_font::{draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
 pub use input::{
-    detect_keyboard, detect_mouse, detect_touch, Event, EventResponse, HubEvent, InputHub,
-    KeyCode, KeyReader, MouseButton, MouseEvent, PointerReader,
+    detect_all_keyboards, detect_all_mice, detect_all_touch, detect_keyboard, detect_mouse,
+    detect_touch, Event, EventResponse, HubEvent, InputHub, KeyCode, KeyReader, MouseButton,
+    MouseEvent, PointerReader,
 };
 pub use vt::VtGuard;
-pub use window::{AppControl, Cell, Spawn, TextGrid, Window, WindowApp, WindowManager};
+pub use window::{AppControl, Cell, DesktopIcon, Spawn, TextGrid, Window, WindowApp, WindowManager};
 
 // ─── Geometry ────────────────────────────────────────────────────────
 

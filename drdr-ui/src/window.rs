@@ -36,15 +36,20 @@ use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph};
 /// 1px window frame all the way round.
 const BORDER: u32 = 1;
 /// Title bar height — taller than Tier 1 for a modern, roomy feel.
-const TITLE_H: u32 = GLYPH_HEIGHT + 12;
+const TITLE_H: u32 = GLYPH_HEIGHT + 14;
 /// Each window-control button (minimise / maximise / close) is a square
 /// the height of the title bar. The close button is the right-most one,
 /// so [`Window::close_rect`] stays a `TITLE_H` square at the far edge.
 const BTN_W: u32 = TITLE_H;
 /// Bottom taskbar height.
-const TASKBAR_H: u32 = GLYPH_HEIGHT + 18;
-/// Soft drop-shadow reach, in pixels, down and to the right of a window.
-const SHADOW: u32 = 9;
+const TASKBAR_H: u32 = GLYPH_HEIGHT + 22;
+/// Soft drop-shadow reach (px) — how far the shadow extends past the
+/// window edge. Larger = softer, Win11/macOS look.
+const SHADOW_REACH: i32 = 18;
+/// Corner radius for windows, taskbar and Start menu — modern UIs use
+/// 6-10px; 8 reads clearly without eating too many pixels on small
+/// framebuffers.
+const RADIUS: u32 = 8;
 
 // ─── TextGrid — the surface apps draw into ───────────────────────────
 
@@ -419,6 +424,38 @@ struct Drag {
 const DOUBLE_CLICK_MS: u128 = 450;
 const DOUBLE_CLICK_SLOP: i32 = 6;
 
+/// How close (px) the pointer must be to a screen edge while dragging
+/// to trigger a snap preview. Wide enough to be discoverable, narrow
+/// enough that you can drop a window near an edge without snapping.
+const SNAP_EDGE: i32 = 20;
+
+// ─── Desktop-icon layout ─────────────────────────────────────────────
+//
+// The desktop greets the user with a grid of large clickable icons,
+// one per app — single click selects, double-click (or Enter) opens
+// the app in a window. No auto-opened windows; if you close everything
+// you land back on the same icon grid.
+
+/// Pixel side length of an icon tile (the rounded square).
+const ICON_TILE: u32 = 92;
+/// Gap between icons (horizontal AND vertical), in px.
+const ICON_GAP: u32 = 24;
+/// Rounded-corner radius of the icon tile.
+const ICON_RADIUS: u32 = 14;
+/// Vertical padding above the icon grid (under the screen top).
+const ICON_GRID_TOP: u32 = 64;
+
+/// One icon on the desktop: a label, the app factory it should launch,
+/// and an optional "glyph" character (drawn 4x scaled inside the tile).
+pub struct DesktopIcon {
+    pub label: String,
+    pub glyph: char,
+    /// Background tint (paints behind the glyph). A soft, distinct
+    /// colour per app helps the eye scan the grid.
+    pub tint: Pixel,
+    pub factory: Box<dyn Fn() -> Spawn>,
+}
+
 /// A stacking window manager plus the desktop shell (taskbar + Start
 /// menu). Windows are a back-to-front list; the top one is focused.
 pub struct WindowManager {
@@ -429,6 +466,9 @@ pub struct WindowManager {
     pointer_x: i32,
     pointer_y: i32,
     drag: Option<Drag>,
+    /// While dragging, the rect this window will snap to on release if
+    /// the pointer is in an edge zone. Cleared on every move + release.
+    snap_preview: Option<Rect>,
     /// Whether the left mouse button is currently held. Set by
     /// MouseButton(Left, pressed), cleared on release. Lets motion
     /// events synthesise "drag inside a content area" for drawing apps
@@ -441,9 +481,21 @@ pub struct WindowManager {
     /// Start-menu entries: a label and a factory that builds the window.
     start_items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
     start_open: bool,
+    /// While true, the keyboard-shortcut help overlay is drawn over the
+    /// desktop (any key / click dismisses it).
+    help_open: bool,
     /// Cached `HH:MM` / date, refreshed on tick (taskbar clock).
     clock: String,
     date: String,
+    /// Icons that live on the wallpaper. A click on one launches its
+    /// app; a double-click on a selected icon does the same. The order
+    /// is the painting/tab-order.
+    desktop_icons: Vec<DesktopIcon>,
+    /// Currently keyboard-selected icon (Tab cycles, Enter launches).
+    /// `None` when no icon has the keyboard focus (default).
+    icon_sel: Option<usize>,
+    /// Index of the icon the pointer is hovering, for the hover lift.
+    icon_hover: Option<usize>,
 }
 
 impl WindowManager {
@@ -456,14 +508,61 @@ impl WindowManager {
             pointer_x: (screen_w / 2) as i32,
             pointer_y: (screen_h / 2) as i32,
             drag: None,
+            snap_preview: None,
             mouse_down: false,
             last_click: None,
             dirty: true,
             launcher: None,
             start_items: Vec::new(),
             start_open: false,
+            help_open: false,
             clock,
             date,
+            desktop_icons: Vec::new(),
+            icon_sel: None,
+            icon_hover: None,
+        }
+    }
+
+    /// Replace the desktop icon set. Each icon launches its `factory`
+    /// when activated.
+    pub fn set_desktop_icons(&mut self, icons: Vec<DesktopIcon>) {
+        self.desktop_icons = icons;
+        self.icon_sel = None;
+        self.icon_hover = None;
+        self.dirty = true;
+    }
+
+    /// How many icons fit per row at the current screen size. Used by
+    /// both the layout and the hit-test, so they can never disagree.
+    fn icons_per_row(&self) -> u32 {
+        let avail = self.screen_w.saturating_sub(ICON_GAP * 2);
+        let stride = ICON_TILE + ICON_GAP;
+        ((avail + ICON_GAP) / stride).max(1)
+    }
+
+    /// Pixel rect of icon `i` in the grid, including the label strip
+    /// below the tile (so a click on the label still counts).
+    fn icon_rect(&self, i: usize) -> Rect {
+        let cols = self.icons_per_row();
+        let row = (i as u32) / cols;
+        let col = (i as u32) % cols;
+        let x = ICON_GAP + col * (ICON_TILE + ICON_GAP);
+        let y = ICON_GRID_TOP + row * (ICON_TILE + ICON_GAP + GLYPH_HEIGHT + 8);
+        Rect::new(x, y, ICON_TILE, ICON_TILE + GLYPH_HEIGHT + 8)
+    }
+
+    /// Index of the icon under `(x, y)`, if any. Misses on windows /
+    /// taskbar are silently ignored.
+    fn icon_at(&self, x: i32, y: i32) -> Option<usize> {
+        (0..self.desktop_icons.len()).find(|&i| hit(self.icon_rect(i), x, y))
+    }
+
+    /// Launch the icon at `i`: invoke the factory and open the window.
+    fn launch_icon(&mut self, i: usize) {
+        if let Some(icon) = self.desktop_icons.get(i) {
+            let s = (icon.factory)();
+            self.open(s.rect, s.app);
         }
     }
 
@@ -535,9 +634,11 @@ impl WindowManager {
         }
     }
 
-    /// If the desktop just emptied, bring the launcher back.
+    /// If the desktop just emptied, bring the launcher back — but only
+    /// when no desktop icons are configured. With icons, an empty
+    /// desktop IS the launcher: clicking an icon opens a fresh window.
     fn refill_if_empty(&mut self) {
-        if self.windows.is_empty() {
+        if self.windows.is_empty() && self.desktop_icons.is_empty() {
             if let Some(f) = &self.launcher {
                 let s = f();
                 self.windows.push(Window::new(s.rect, s.app));
@@ -596,14 +697,96 @@ impl WindowManager {
         }
     }
 
-    /// Feed a key to the focused window. AltTab and the Super/Start key
-    /// are handled by the WM; everything else goes to the top app.
+    /// Compute the snap target when the pointer is in an edge zone during
+    /// a title-bar drag. Returns the rect the focused window will jump to
+    /// on release; `None` means "drop where you let go". Edge zones are
+    /// SNAP_EDGE pixels wide.
+    fn compute_snap(&self, x: i32, y: i32) -> Option<Rect> {
+        let wa = self.workarea();
+        // Top edge → maximise. Tested first so a slow upward drag that
+        // also brushes the left edge still maximises (matches Win11).
+        if y < SNAP_EDGE {
+            return Some(wa);
+        }
+        let half_w = wa.w / 2;
+        if x < SNAP_EDGE {
+            return Some(Rect::new(0, 0, half_w, wa.h));
+        }
+        if x >= self.screen_w as i32 - SNAP_EDGE {
+            return Some(Rect::new(half_w, 0, wa.w - half_w, wa.h));
+        }
+        None
+    }
+
+    /// Apply a snap rect to the focused window, remembering the pre-snap
+    /// rect so a later double-click on the title bar can restore it.
+    fn snap_focused(&mut self, target: Rect) {
+        let Some(idx) = self.windows.len().checked_sub(1) else {
+            return;
+        };
+        let w = &mut self.windows[idx];
+        if w.restore.is_none() {
+            w.restore = Some(w.rect);
+        }
+        w.rect = target;
+        self.dirty = true;
+    }
+
+    /// Feed a key to the focused window. AltTab, the Super/Start key,
+    /// the snap chords and F1 are handled by the WM; everything else
+    /// goes to the top app.
     pub fn handle_key(&mut self, key: KeyCode) {
         self.dirty = true;
-        if key == KeyCode::AltTab {
-            self.start_open = false;
-            self.cycle_focus();
+        // The help overlay is modal — any keystroke dismisses it.
+        if self.help_open {
+            self.help_open = false;
             return;
+        }
+        match key {
+            KeyCode::AltTab => {
+                self.start_open = false;
+                self.cycle_focus();
+                return;
+            }
+            KeyCode::Super => {
+                // Tapping Super on its own toggles the Start menu, the
+                // Windows / GNOME convention.
+                self.start_open = !self.start_open;
+                return;
+            }
+            KeyCode::Help => {
+                self.help_open = true;
+                return;
+            }
+            KeyCode::SnapLeft => {
+                let wa = self.workarea();
+                self.snap_focused(Rect::new(0, 0, wa.w / 2, wa.h));
+                return;
+            }
+            KeyCode::SnapRight => {
+                let wa = self.workarea();
+                let hw = wa.w / 2;
+                self.snap_focused(Rect::new(hw, 0, wa.w - hw, wa.h));
+                return;
+            }
+            KeyCode::SnapUp => {
+                let wa = self.workarea();
+                self.snap_focused(wa);
+                return;
+            }
+            KeyCode::SnapDown => {
+                // Restore the pre-snap rect, or minimise if not snapped.
+                if let Some(idx) = self.windows.len().checked_sub(1) {
+                    let w = &mut self.windows[idx];
+                    if let Some(prev) = w.restore.take() {
+                        w.rect = prev;
+                    } else {
+                        w.minimized = true;
+                    }
+                }
+                return;
+            }
+            _ => {}
         }
         if self.start_open {
             // The Start menu is keyboard-navigable too (Esc closes it).
@@ -613,6 +796,8 @@ impl WindowManager {
             return;
         }
         let Some(idx) = self.windows.len().checked_sub(1) else {
+            // No window has focus → keystrokes drive icon selection.
+            self.handle_icon_key(key);
             return;
         };
         let ctrl = self.windows[idx].app.on_key(key);
@@ -623,9 +808,42 @@ impl WindowManager {
         }
     }
 
+    /// Keyboard navigation for the desktop-icon grid (active only when
+    /// no window has focus). Arrows + Tab move the selection; Enter
+    /// opens the selected app.
+    fn handle_icon_key(&mut self, key: KeyCode) {
+        let n = self.desktop_icons.len();
+        if n == 0 {
+            return;
+        }
+        let cols = self.icons_per_row() as i32;
+        let mut sel = self.icon_sel.unwrap_or(0) as i32;
+        match key {
+            KeyCode::Tab => sel = (sel + 1) % n as i32,
+            KeyCode::BackTab => sel = (sel - 1).rem_euclid(n as i32),
+            KeyCode::Right => sel = (sel + 1).min(n as i32 - 1),
+            KeyCode::Left => sel = (sel - 1).max(0),
+            KeyCode::Down => sel = (sel + cols).min(n as i32 - 1),
+            KeyCode::Up => sel = (sel - cols).max(0),
+            KeyCode::Home => sel = 0,
+            KeyCode::End => sel = n as i32 - 1,
+            KeyCode::Enter | KeyCode::Space => {
+                let i = self.icon_sel.unwrap_or(0);
+                if i < n {
+                    self.launch_icon(i);
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.icon_sel = Some(sel.clamp(0, n as i32 - 1) as usize);
+    }
+
     /// Move the cursor to an already-clamped absolute screen position
     /// and carry any in-progress title-bar drag with it. Shared by
-    /// relative mice (`Moved`) and touchscreens (`MovedTo`).
+    /// relative mice (`Moved`) and touchscreens (`MovedTo`). While
+    /// dragging, also recompute the snap preview so a drop near a
+    /// screen edge can snap the window to that half / fill.
     fn move_pointer(&mut self, nx: i32, ny: i32) {
         self.pointer_x = nx;
         self.pointer_y = ny;
@@ -638,7 +856,19 @@ impl WindowManager {
                 w.rect.x = wx.max(0) as u32;
                 w.rect.y = wy.max(0) as u32;
             }
+            self.snap_preview = self.compute_snap(nx, ny);
+        } else {
+            self.snap_preview = None;
         }
+        // Update icon hover only when no window blocks the pointer —
+        // otherwise the hover ring chases the cursor through windows.
+        let on_window = self.hit_window(nx, ny).is_some();
+        let on_taskbar = hit(self.taskbar_rect(), nx, ny);
+        self.icon_hover = if on_window || on_taskbar {
+            None
+        } else {
+            self.icon_at(nx, ny)
+        };
     }
 
     /// A left-press on the taskbar / Start menu. Returns true if the
@@ -676,7 +906,9 @@ impl WindowManager {
             return false;
         }
 
-        // Taskbar window buttons: one slot per window after Start.
+        // Taskbar window buttons (one slot per window after Start).
+        // Falls through to the icon-click handler in `handle_mouse` if
+        // the click was outside the taskbar.
         let slot_x0 = self.start_btn_rect().w + 4;
         let slot_w = self.taskbar_slot_w();
         if x as u32 >= slot_x0 {
@@ -720,6 +952,17 @@ impl WindowManager {
     /// Feed a pointer event.
     pub fn handle_mouse(&mut self, ev: MouseEvent) {
         self.dirty = true;
+        // The help overlay is modal — any click dismisses it (motion
+        // does not, so the user can scan the legend without flicker).
+        if self.help_open {
+            if matches!(
+                ev,
+                MouseEvent::Button { button: MouseButton::Left, pressed: true }
+            ) {
+                self.help_open = false;
+                return;
+            }
+        }
         match ev {
             MouseEvent::Moved { dx, dy } => {
                 let nx = (self.pointer_x + dx).clamp(0, self.screen_w as i32 - 1);
@@ -776,12 +1019,30 @@ impl WindowManager {
                             self.refill_if_empty();
                         }
                     }
+                } else if let Some(i) = self.icon_at(x, y) {
+                    // Single click selects; a second click within the
+                    // double-click window opens the app — same idiom
+                    // as every modern file manager.
+                    self.icon_sel = Some(i);
+                    if double {
+                        self.launch_icon(i);
+                    }
                 } else {
-                    // Clicking the empty desktop closes the Start menu.
+                    // Clicking the empty desktop closes the Start menu
+                    // and deselects any selected icon.
                     self.start_open = false;
+                    self.icon_sel = None;
                 }
             }
             MouseEvent::Button { button: MouseButton::Left, pressed: false } => {
+                // If the drag ended over a snap zone, jump the window
+                // to the snap target instead of leaving it where it lay.
+                if self.drag.is_some() {
+                    if let Some(target) = self.snap_preview.take() {
+                        self.snap_focused(target);
+                    }
+                }
+                self.snap_preview = None;
                 self.drag = None;
                 self.mouse_down = false;
             }
@@ -846,15 +1107,24 @@ impl WindowManager {
         let top = theme.bg;
         let bot = theme.bg.lerp(theme.accent, 22);
         fb.fill_rect_v(0, 0, w, h, top, bot);
-        let mark = "DrDrOS";
-        let mw = GLYPH_WIDTH * 2 * mark.len() as u32;
-        draw_text_2x(
-            fb,
-            w.saturating_sub(mw) / 2,
-            h / 3,
-            mark,
-            theme.bg.lerp(theme.fg, 40),
-        );
+        // Soft DrDrOS wordmark watermark only when nothing else fills
+        // the wallpaper — once the user has icons the mark becomes
+        // visual noise, so we skip it.
+        if self.desktop_icons.is_empty() {
+            let mark = "DrDrOS";
+            let mw = GLYPH_WIDTH * 2 * mark.len() as u32;
+            draw_text_2x(
+                fb,
+                w.saturating_sub(mw) / 2,
+                h / 3,
+                mark,
+                theme.bg.lerp(theme.fg, 40),
+            );
+        }
+
+        // Desktop icons sit BELOW window shadows / windows, so an
+        // opened window covers them cleanly.
+        self.draw_desktop_icons(fb, theme);
 
         let last = self.windows.len().saturating_sub(1);
         for i in 0..self.windows.len() {
@@ -867,22 +1137,212 @@ impl WindowManager {
             draw_window(fb, &mut self.windows[i], theme, focused);
         }
 
+        // Snap preview, drawn UNDER the cursor and chrome so the user
+        // sees the target landing zone without losing sight of the
+        // dragged window.
+        if let Some(p) = self.snap_preview {
+            let glow = Pixel::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 70);
+            fb.shade_rect(p.x, p.y, p.w, p.h, glow);
+            // 2-px accent border so the preview reads as an active target.
+            fb.fill_rect(p.x, p.y, p.w, 2, theme.accent);
+            fb.fill_rect(p.x, p.y + p.h.saturating_sub(2), p.w, 2, theme.accent);
+            fb.fill_rect(p.x, p.y, 2, p.h, theme.accent);
+            fb.fill_rect(p.x + p.w.saturating_sub(2), p.y, 2, p.h, theme.accent);
+        }
+
         self.draw_taskbar(fb, theme);
         if self.start_open {
             self.draw_start_menu(fb, theme);
+        }
+
+        if self.help_open {
+            self.draw_help_overlay(fb, theme);
         }
 
         draw_cursor(fb, self.pointer_x, self.pointer_y);
         self.dirty = false;
     }
 
+    /// Centred keyboard-shortcut legend over a dimmed wallpaper. Any
+    /// key / click dismisses it (handle_key / handle_mouse).
+    fn draw_help_overlay(&self, fb: &mut Framebuffer, theme: &Theme) {
+        // Dim the desktop so the panel reads as a focused modal.
+        fb.shade_rect(0, 0, self.screen_w, self.screen_h, Pixel::rgba(0, 0, 0, 120));
+
+        let lines: &[(&str, &str)] = &[
+            ("Alt + Tab",        "Cycle window focus"),
+            ("Super",            "Open / close the Start menu"),
+            ("Super + Left",     "Snap window to left half"),
+            ("Super + Right",    "Snap window to right half"),
+            ("Super + Up",       "Maximise window"),
+            ("Super + Down",     "Restore / minimise window"),
+            ("F1",               "Show / hide this help"),
+            ("",                 ""),
+            ("Mouse",            "Drag title bar to move"),
+            ("",                 "Drag to edges to snap"),
+            ("",                 "Double-click title to maximise"),
+            ("",                 "Click [x] to close"),
+        ];
+
+        let pad = 14u32;
+        let key_w = 18 * GLYPH_WIDTH;
+        let desc_w = 32 * GLYPH_WIDTH;
+        let row_h = GLYPH_HEIGHT + 4;
+        let header_h = GLYPH_HEIGHT * 2 + 12;
+        let w = (key_w + desc_w + pad * 3).min(self.screen_w.saturating_sub(40));
+        let h = header_h + lines.len() as u32 * row_h + pad * 2;
+        let x = self.screen_w.saturating_sub(w) / 2;
+        let y = self.screen_h.saturating_sub(h) / 2;
+
+        draw_shadow(fb, Rect::new(x, y, w, h));
+        fb.fill_round_rect(x, y, w, h, RADIUS, theme.surface);
+        // Header band
+        fb.fill_round_rect_corners(x, y, w, header_h, RADIUS, RADIUS, 0, 0, theme.accent);
+        let title = "DrDrOS shortcuts";
+        let title_w = GLYPH_WIDTH * title.len() as u32 * 2;
+        // Big centred title
+        for (i, ch) in title.bytes().enumerate() {
+            let glyph = drdr_font::glyph_for(ch);
+            let gx = x + (w.saturating_sub(title_w)) / 2 + i as u32 * GLYPH_WIDTH * 2;
+            let gy = y + 8;
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..8u32 {
+                    if *bits & (0x80u8 >> col) != 0 {
+                        fb.fill_rect(gx + col * 2, gy + row as u32 * 2, 2, 2, theme.accent_fg);
+                    }
+                }
+            }
+        }
+
+        let mut ry = y + header_h + pad;
+        for (key, desc) in lines {
+            drdr_font::draw_text(fb, x + pad, ry, key, theme.accent, theme.surface);
+            drdr_font::draw_text(fb, x + pad + key_w + pad, ry, desc, theme.fg, theme.surface);
+            ry += row_h;
+        }
+
+        // Footer hint
+        let hint = "press any key to close";
+        let hw = GLYPH_WIDTH * hint.len() as u32;
+        drdr_font::draw_text(
+            fb,
+            x + (w.saturating_sub(hw)) / 2,
+            y + h.saturating_sub(GLYPH_HEIGHT + 6),
+            hint,
+            theme.muted,
+            theme.surface,
+        );
+    }
+
+    /// Paint the desktop icon grid: a rounded tile per app with a 4×
+    /// scaled glyph inside and a label below. Selected = accent ring;
+    /// hovered = a slightly raised surface fill.
+    fn draw_desktop_icons(&self, fb: &mut Framebuffer, theme: &Theme) {
+        for (i, icon) in self.desktop_icons.iter().enumerate() {
+            let r = self.icon_rect(i);
+            // Don't paint icons that would land off-screen on a small
+            // panel (rare; we still want a clean clip).
+            if r.x + r.w > self.screen_w || r.y + ICON_TILE > self.screen_h {
+                continue;
+            }
+            let tile_x = r.x;
+            let tile_y = r.y;
+            let selected = self.icon_sel == Some(i);
+            let hovered = self.icon_hover == Some(i);
+
+            // Soft drop shadow under every tile — gives the grid a
+            // floating "card" feel matching the window shadows.
+            fb.drop_shadow(
+                tile_x as i32,
+                tile_y as i32,
+                ICON_TILE as i32,
+                ICON_TILE as i32,
+                10,
+                70,
+            );
+
+            // Subtle hover/selection halo behind the tile.
+            if selected || hovered {
+                let halo = if selected { 90 } else { 50 };
+                fb.shade_rect(
+                    tile_x.saturating_sub(6),
+                    tile_y.saturating_sub(6),
+                    ICON_TILE + 12,
+                    ICON_TILE + 12,
+                    Pixel::rgba(theme.accent.r, theme.accent.g, theme.accent.b, halo),
+                );
+            }
+
+            // Tile body — coloured background derived from the app's
+            // tint with a translucent overlay so it reads as a button.
+            let body = icon.tint;
+            fb.fill_round_rect(tile_x, tile_y, ICON_TILE, ICON_TILE, ICON_RADIUS, body);
+            // Soft vertical gradient ON TOP of the body for depth.
+            // We can't do gradients via blend on mmap, but a single
+            // dim band along the bottom edge sells it.
+            let dim = body.lerp(theme.bg, 30);
+            for row in 0..(ICON_TILE / 2) {
+                let py = tile_y + ICON_TILE / 2 + row;
+                let t = ((row * 255) / (ICON_TILE / 2).max(1)) as u8;
+                let c = body.lerp(dim, t);
+                fb.fill_rect(tile_x, py, ICON_TILE, 1, c);
+            }
+            // 1-px highlight along the top edge — fakes a glassy lift.
+            let light = body.lerp(Pixel::WHITE, 60);
+            fb.fill_rect(tile_x + ICON_RADIUS, tile_y, ICON_TILE - ICON_RADIUS * 2, 1, light);
+
+            // Selection ring — 2-px accent stroke on the outside.
+            if selected {
+                let ring = theme.accent;
+                fb.fill_rect(tile_x, tile_y, ICON_TILE, 2, ring);
+                fb.fill_rect(tile_x, tile_y + ICON_TILE - 2, ICON_TILE, 2, ring);
+                fb.fill_rect(tile_x, tile_y, 2, ICON_TILE, ring);
+                fb.fill_rect(tile_x + ICON_TILE - 2, tile_y, 2, ICON_TILE, ring);
+            }
+
+            // 4× scaled glyph in the centre — readable from a metre
+            // away on a 1080p screen; reuses the bitmap font.
+            let scale: u32 = 4;
+            let gw = GLYPH_WIDTH * scale;
+            let gh = GLYPH_HEIGHT * scale;
+            let gx = tile_x + (ICON_TILE.saturating_sub(gw)) / 2;
+            let gy = tile_y + (ICON_TILE.saturating_sub(gh)) / 2;
+            let glyph_fg = if luminance_for(body) > 140 {
+                Pixel::rgb(0x10, 0x10, 0x14)
+            } else {
+                Pixel::WHITE
+            };
+            draw_glyph_scaled(fb, gx, gy, icon.glyph, glyph_fg, scale);
+
+            // Label under the tile, centred.
+            let label_y = tile_y + ICON_TILE + 4;
+            let label = &icon.label;
+            // Trim to what fits at 1x glyph width.
+            let max_chars = (r.w / GLYPH_WIDTH).max(1) as usize;
+            let shown: String = if label.chars().count() > max_chars {
+                let mut s: String = label.chars().take(max_chars - 1).collect();
+                s.push('…');
+                s
+            } else {
+                label.clone()
+            };
+            let lw = GLYPH_WIDTH * shown.chars().count() as u32;
+            let lx = tile_x + (ICON_TILE.saturating_sub(lw)) / 2;
+            // Subtle dark shadow behind label so it stays legible over
+            // both light and dark wallpapers without per-theme tuning.
+            drdr_font::draw_text(fb, lx + 1, label_y + 1, &shown, Pixel::rgba(0, 0, 0, 90).over(theme.bg), theme.bg);
+            drdr_font::draw_text(fb, lx, label_y, &shown, theme.fg, theme.bg);
+        }
+    }
+
     fn draw_taskbar(&self, fb: &mut Framebuffer, theme: &Theme) {
         let tb = self.taskbar_rect();
-        // Frosted bar: solid surface with a 1px accent top hairline.
+        // Frosted bar: solid surface with a 1px accent-tinted hairline
+        // at the top so the bar reads as floating above the wallpaper.
         fb.fill_rect(tb.x, tb.y, tb.w, tb.h, theme.surface);
-        fb.fill_rect(tb.x, tb.y, tb.w, 1, theme.border);
+        fb.fill_rect(tb.x, tb.y, tb.w, 1, theme.accent.lerp(theme.bg, 80));
 
-        // Start button — accent chip with the wordmark.
+        // Start button — accent chip with rounded corners + wordmark.
         let sb = self.start_btn_rect();
         let sb_hot = hit(sb, self.pointer_x, self.pointer_y) || self.start_open;
         let (sbg, sfg) = if sb_hot {
@@ -890,14 +1350,25 @@ impl WindowManager {
         } else {
             (theme.surface, theme.accent)
         };
-        fb.fill_rect(sb.x + 4, sb.y + 4, sb.w - 8, sb.h - 8, sbg);
+        let chip_pad = 5;
+        let chip_r = (tb.h - chip_pad * 2) / 2;
+        fb.fill_round_rect(
+            sb.x + chip_pad,
+            sb.y + chip_pad,
+            sb.w - chip_pad * 2,
+            tb.h - chip_pad * 2,
+            chip_r,
+            sbg,
+        );
         let ty = sb.y + (tb.h.saturating_sub(GLYPH_HEIGHT)) / 2;
         // Bitmap font is ASCII-only — a clean word beats a tofu glyph.
-        drdr_font::draw_text(fb, sb.x + 12, ty, "DrDrOS", sfg, sbg);
+        drdr_font::draw_text(fb, sb.x + 14, ty, "DrDrOS", sfg, sbg);
 
-        // One button per window.
+        // One rounded chip per open window.
         let slot_w = self.taskbar_slot_w();
         let mut x = sb.w + 4;
+        let chip_h = tb.h - chip_pad * 2;
+        let chip_radius = (chip_h / 2).min(6);
         for (i, win) in self.windows.iter().enumerate() {
             if x + slot_w > tb.x + tb.w - GLYPH_WIDTH * 11 {
                 break;
@@ -906,28 +1377,52 @@ impl WindowManager {
             let (bg, fg) = if focused {
                 (theme.bg.lerp(theme.accent, 30), theme.fg)
             } else if win.minimized {
-                (theme.surface, theme.muted)
+                (theme.surface.lerp(theme.bg, 80), theme.muted)
             } else {
-                (theme.surface, theme.fg)
+                (theme.surface.lerp(theme.bg, 30), theme.fg)
             };
-            fb.fill_rect(x + 2, tb.y + 4, slot_w - 4, tb.h - 8, bg);
-            // A focused/active accent underline, Windows-style.
+            fb.fill_round_rect(
+                x + 2,
+                tb.y + chip_pad,
+                slot_w - 4,
+                chip_h,
+                chip_radius,
+                bg,
+            );
+            // A focused/active accent underline — Windows 11 style.
             if !win.minimized {
                 let uw = if focused { slot_w - 4 } else { slot_w / 3 };
-                fb.fill_rect(x + 2, tb.y + tb.h - 5, uw, 2, theme.accent);
+                fb.fill_rect(x + 2, tb.y + tb.h - 3, uw, 2, theme.accent);
             }
             let label = win.app.title();
             let maxc = ((slot_w - 12) / GLYPH_WIDTH) as usize;
             let label: String = label.chars().take(maxc).collect();
-            drdr_font::draw_text(fb, x + 8, ty, &label, fg, bg);
+            drdr_font::draw_text(fb, x + 10, ty, &label, fg, bg);
             x += slot_w;
         }
 
-        // Clock + date, right-aligned.
+        // Clock + date, right-aligned, with a subtle hover chip so the
+        // tray area reads as interactive (matches modern Win11 + macOS).
         let cw = GLYPH_WIDTH * self.clock.len() as u32;
         let dw = GLYPH_WIDTH * self.date.len() as u32;
-        let cx = tb.x + tb.w - cw.max(dw) - 12;
+        let cx = tb.x + tb.w - cw.max(dw) - 14;
         let mid = tb.y + (tb.h.saturating_sub(GLYPH_HEIGHT * 2)) / 2;
+        let tray_w = cw.max(dw) + 12;
+        let tray_x = tb.x + tb.w - tray_w - 4;
+        if hit(
+            Rect::new(tray_x, tb.y + chip_pad, tray_w, chip_h),
+            self.pointer_x,
+            self.pointer_y,
+        ) {
+            fb.fill_round_rect(
+                tray_x,
+                tb.y + chip_pad,
+                tray_w,
+                chip_h,
+                chip_radius,
+                theme.bg.lerp(theme.accent, 30),
+            );
+        }
         drdr_font::draw_text(fb, cx, mid, &self.clock, theme.fg, theme.surface);
         drdr_font::draw_text(
             fb,
@@ -941,11 +1436,16 @@ impl WindowManager {
 
     fn draw_start_menu(&self, fb: &mut Framebuffer, theme: &Theme) {
         let m = self.start_menu_rect();
+        // The Start menu sits ABOVE the taskbar — only the TOP corners
+        // are rounded; its bottom edge meets the taskbar flush.
         draw_shadow(fb, m);
-        fb.fill_rect(m.x, m.y, m.w, m.h, theme.surface);
-        fb.fill_rect(m.x, m.y, m.w, 1, theme.accent);
-        fb.fill_rect(m.x, m.y + m.h - 1, m.w, 1, theme.border);
-        fb.fill_rect(m.x + m.w - 1, m.y, 1, m.h, theme.border);
+        fb.fill_round_rect_corners(
+            m.x, m.y, m.w, m.h,
+            RADIUS, RADIUS, 0, 0,
+            theme.surface,
+        );
+        // 1-px accent hairline at the very top edge to lift the menu.
+        fb.fill_rect(m.x + RADIUS / 2, m.y, m.w.saturating_sub(RADIUS), 1, theme.accent);
 
         let row_h = GLYPH_HEIGHT + 6;
         for (i, (label, _)) in self.start_items.iter().enumerate() {
@@ -959,26 +1459,54 @@ impl WindowManager {
                 (theme.surface, theme.fg)
             };
             if hot {
-                fb.fill_rect(m.x + 3, ry - 1, m.w - 6, row_h, bg);
+                fb.fill_round_rect(
+                    m.x + 4,
+                    ry,
+                    m.w - 8,
+                    row_h - 2,
+                    4,
+                    bg,
+                );
             }
-            drdr_font::draw_text(fb, m.x + 14, ry + 3, label, fg, bg);
+            drdr_font::draw_text(fb, m.x + 16, ry + 3, label, fg, bg);
         }
     }
 }
 
-/// A blurry-ish drop shadow: a few translucent rectangles fanning down
-/// and to the right of `r`, so floating windows lift off the wallpaper
-/// like a modern compositor (we just alpha-blend onto the back buffer).
+/// A soft, blurred drop shadow — proper per-pixel quadratic falloff,
+/// not the chunky-rectangles approximation. The shadow fades to zero
+/// alpha at `SHADOW_REACH` from the (slightly offset) window edge so a
+/// floating window reads as "above the surface" without the harsh
+/// staircase that stacked translucent rects produce.
 fn draw_shadow(fb: &mut Framebuffer, r: Rect) {
-    for i in 1..=SHADOW {
-        let a = (70 / SHADOW * (SHADOW - i + 1)) as u8;
-        fb.shade_rect(
-            r.x + i,
-            r.y + i,
-            r.w,
-            r.h,
-            Pixel::rgba(0, 0, 0, a),
-        );
+    fb.drop_shadow(
+        r.x as i32,
+        r.y as i32,
+        r.w as i32,
+        r.h as i32,
+        SHADOW_REACH,
+        90, // peak alpha — visible but not heavy
+    );
+}
+
+/// Quick relative-luminance proxy (0..255). Cheap; not WCAG — used to
+/// pick a readable foreground over an arbitrary tile colour.
+fn luminance_for(p: Pixel) -> u32 {
+    // ITU-R BT.601-ish weighting on linear 0..255 — good enough to
+    // pick black vs white text over a coloured tile.
+    (p.r as u32 * 299 + p.g as u32 * 587 + p.b as u32 * 114) / 1000
+}
+
+/// Draw a single bitmap glyph scaled `scale`× by replicating pixels —
+/// used by the desktop icons (large logos) and the boot wordmark.
+fn draw_glyph_scaled(fb: &mut Framebuffer, x: u32, y: u32, ch: char, fg: Pixel, scale: u32) {
+    let glyph = drdr_font::glyph_for(ch as u8);
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..8u32 {
+            if *bits & (0x80u8 >> col) != 0 {
+                fb.fill_rect(x + col * scale, y + row as u32 * scale, scale, scale, fg);
+            }
+        }
     }
 }
 
@@ -998,46 +1526,78 @@ fn draw_text_2x(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: Pixel) {
     }
 }
 
-/// Paint a single window: shadow is already down; here we do the frame,
-/// the modern title bar (title + minimise/maximise/close), and the
-/// app's grid blitted cell by cell.
+/// Paint a single window: shadow is already down; here we do the rounded
+/// frame, the modern title bar (title + minimise/maximise/close), and
+/// the app's grid blitted cell by cell.
 fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: bool) {
     let r = win.rect;
+    let radius = RADIUS.min(r.w / 2).min(r.h / 2);
 
-    // Body + 1px frame (accent edge when focused).
-    fb.fill_rect(r.x, r.y, r.w, r.h, theme.surface);
-    let edge = if focused { theme.accent } else { theme.border };
-    fb.fill_rect(r.x, r.y, r.w, BORDER, edge);
-    fb.fill_rect(r.x, r.y + r.h.saturating_sub(BORDER), r.w, BORDER, edge);
-    fb.fill_rect(r.x, r.y, BORDER, r.h, edge);
-    fb.fill_rect(r.x + r.w.saturating_sub(BORDER), r.y, BORDER, r.h, edge);
-
-    // Title bar — a subtle gradient; accent when focused.
-    let (bar_a, bar_b, bar_fg) = if focused {
-        (theme.accent, theme.accent.lerp(Pixel::BLACK, 26), theme.accent_fg)
+    // ── Title bar — flat color, only the TOP two corners rounded so it
+    //    meets the content area below with a clean straight seam.
+    let (bar_color, bar_fg) = if focused {
+        (theme.accent, theme.accent_fg)
     } else {
-        (theme.surface, theme.bg, theme.muted)
+        // A slightly tinted surface so an unfocused bar still reads as
+        // chrome (distinct from the content area below).
+        (theme.surface.lerp(theme.muted, 26), theme.muted)
     };
-    fb.fill_rect_v(r.x + BORDER, r.y + BORDER, r.w - BORDER * 2, TITLE_H - BORDER, bar_a, bar_b);
+    fb.fill_round_rect_corners(
+        r.x, r.y, r.w, TITLE_H,
+        radius, radius, 0, 0,
+        bar_color,
+    );
+
+    // ── Window body (content fill) — only the BOTTOM two corners rounded.
+    //    The two rounded fills meet edge-to-edge at y = TITLE_H with
+    //    square corners on both sides — no overlap, no half-painted
+    //    rounded region.
+    fb.fill_round_rect_corners(
+        r.x, r.y + TITLE_H, r.w, r.h.saturating_sub(TITLE_H),
+        0, 0, radius, radius,
+        theme.surface,
+    );
+
+    // ── 1-pixel divider under the title bar — a quiet hairline so the
+    //    bar reads as a separate strip even when both halves share the
+    //    same surface color.
+    let sep = if focused {
+        theme.accent.lerp(theme.bg, 60)
+    } else {
+        theme.border
+    };
+    fb.fill_rect(
+        r.x + radius / 2,
+        r.y + TITLE_H,
+        r.w.saturating_sub(radius),
+        1,
+        sep,
+    );
+
+    // ── Title text ──────────────────────────────────────────────────
     let title = win.app.title();
     let ty = r.y + (TITLE_H.saturating_sub(GLYPH_HEIGHT)) / 2;
-    let maxc = ((r.w.saturating_sub(BTN_W * 3 + 12)) / GLYPH_WIDTH) as usize;
+    let maxc = ((r.w.saturating_sub(BTN_W * 3 + 16)) / GLYPH_WIDTH) as usize;
     let title: String = title.chars().take(maxc.max(1)).collect();
-    drdr_font::draw_text(fb, r.x + 10, ty, &title, bar_fg, bar_a);
+    drdr_font::draw_text(fb, r.x + 14, ty, &title, bar_fg, bar_color);
 
-    // Control buttons: minimise, maximise/restore, close. The close
-    // button reddens on hover (Windows convention); the maximise glyph
-    // becomes a "restore" mark while the window is maximised.
+    // ── Window controls: minimise / maximise / close ────────────────
+    // Close reddens on hover (Windows convention); maximise toggles
+    // between `#` (maximise) and `+` (restore). The close-button hover
+    // fill uses a rounded top-right corner so it stays inside the title
+    // bar's rounded shape.
     let (px, py) = fb_pointer();
-    for (b, g, danger) in [
-        (win.min_rect(), '_', false),
+    let buttons = [
+        (win.min_rect(), '_', false, false),
         (
             win.max_rect(),
             if win.restore.is_some() { '+' } else { '#' },
             false,
+            false,
         ),
-        (win.close_rect(), 'x', true),
-    ] {
+        (win.close_rect(), 'x', true, true), // last = round top-right
+    ];
+    for (b, g, danger, last) in buttons {
         let hot = px >= b.x as i32
             && px < (b.x + b.w) as i32
             && py >= b.y as i32
@@ -1048,32 +1608,51 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
             } else {
                 theme.bg.lerp(theme.accent, 40)
             };
-            fb.fill_rect(b.x, b.y + BORDER, b.w, b.h - BORDER, c);
+            if last {
+                fb.fill_round_rect_corners(
+                    b.x, b.y, b.w, b.h,
+                    0, radius, 0, 0,
+                    c,
+                );
+            } else {
+                fb.fill_rect(b.x, b.y, b.w, b.h, c);
+            }
             (c, if danger { Pixel::WHITE } else { theme.fg })
         } else {
-            // Over the title-bar gradient — bar_a is a close-enough bg
-            // at button size.
-            (bar_a, bar_fg)
+            (bar_color, bar_fg)
         };
         let gx = b.x + (b.w.saturating_sub(GLYPH_WIDTH)) / 2;
         let gy = b.y + (b.h.saturating_sub(GLYPH_HEIGHT)) / 2;
         draw_glyph(fb, gx, gy, g, glyph_fg, cell_bg);
     }
 
-    // Content: size the grid, let the app paint, blit the cells.
+    // ── App content ─────────────────────────────────────────────────
+    // Size the grid, let the app paint, blit the cells. We inset the
+    // grid-bg fill by `radius` at the bottom so the rounded body's
+    // alpha-blended corner pixels stay visible underneath.
     let content = win.content_rect();
     let (cols, rows) = Window::grid_dims(r);
     win.grid.resize(cols, rows, theme.fg, theme.surface);
     win.grid.clear();
     win.app.render(&mut win.grid);
 
-    fb.fill_rect(content.x, content.y, content.w, content.h, win.grid.bg());
+    // Paint the grid-bg as a rounded rectangle at the bottom so a
+    // custom grid bg (e.g. the Notes app) doesn't blast over the body
+    // corners. Top is square (it meets the title-bar hairline).
+    if win.grid.bg() != theme.surface {
+        fb.fill_round_rect_corners(
+            content.x, content.y, content.w, content.h,
+            0, 0, radius.saturating_sub(1), radius.saturating_sub(1),
+            win.grid.bg(),
+        );
+    }
+    // Cell glyphs — same as before.
     for gy in 0..win.grid.rows {
         for gx in 0..win.grid.cols {
             let cell = win.grid.cell(gx, gy);
-            let px = content.x + gx * GLYPH_WIDTH;
-            let py = content.y + gy * GLYPH_HEIGHT;
-            draw_glyph(fb, px, py, cell.ch, cell.fg, cell.bg);
+            let pxg = content.x + gx * GLYPH_WIDTH;
+            let pyg = content.y + gy * GLYPH_HEIGHT;
+            draw_glyph(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
         }
     }
 }
@@ -1247,6 +1826,64 @@ mod tests {
         m.handle_mouse(MouseEvent::Button { button: MouseButton::Left, pressed: true });
         assert!(!m.windows.last().unwrap().minimized);
         assert_eq!(top_title(&m), "c");
+    }
+
+    #[test]
+    fn super_arrow_snaps_focused_window_to_half() {
+        let mut m = wm();
+        let (sw, _) = m.screen();
+        m.handle_key(KeyCode::SnapLeft);
+        let r = m.windows.last().unwrap().rect;
+        assert_eq!(r.x, 0);
+        assert_eq!(r.w, sw / 2);
+        m.handle_key(KeyCode::SnapRight);
+        let r = m.windows.last().unwrap().rect;
+        assert_eq!(r.x, sw / 2);
+        // Snap-up = maximise to the workarea (full width).
+        m.handle_key(KeyCode::SnapUp);
+        let r = m.windows.last().unwrap().rect;
+        assert_eq!(r.x, 0);
+        assert_eq!(r.w, sw);
+    }
+
+    #[test]
+    fn super_tap_toggles_start_menu() {
+        let mut m = WindowManager::new(1000, 800);
+        m.set_start_menu(vec![]);
+        assert!(!m.start_open);
+        m.handle_key(KeyCode::Super);
+        assert!(m.start_open);
+        m.handle_key(KeyCode::Super);
+        assert!(!m.start_open);
+    }
+
+    #[test]
+    fn f1_opens_help_overlay_any_key_closes() {
+        let mut m = wm();
+        m.handle_key(KeyCode::Help);
+        assert!(m.help_open);
+        // Any keystroke dismisses the overlay (it's modal).
+        m.handle_key(KeyCode::Escape);
+        assert!(!m.help_open);
+    }
+
+    #[test]
+    fn drag_to_top_edge_snaps_to_maximise_on_release() {
+        let mut m = WindowManager::new(1000, 800);
+        m.open(Rect::new(200, 200, 300, 200), Box::new(Dummy("a")));
+        // Grab the title bar.
+        let r = m.windows.last().unwrap().rect;
+        m.pointer_x = (r.x + 50) as i32;
+        m.pointer_y = (r.y + 5) as i32;
+        m.handle_mouse(MouseEvent::Button { button: MouseButton::Left, pressed: true });
+        // Drag the cursor up to the screen top → triggers snap preview.
+        m.handle_mouse(MouseEvent::Moved { dx: 0, dy: -500 });
+        assert!(m.snap_preview.is_some());
+        // Release → window snaps to the work area.
+        m.handle_mouse(MouseEvent::Button { button: MouseButton::Left, pressed: false });
+        let r = m.windows.last().unwrap().rect;
+        let wa = m.workarea();
+        assert_eq!((r.w, r.h), (wa.w, wa.h));
     }
 
     #[test]

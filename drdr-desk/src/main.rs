@@ -30,6 +30,7 @@ mod net;
 
 use std::env;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,11 +38,19 @@ use drdr_fb::Framebuffer;
 use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_text};
 use drdr_ui::{
     HubEvent, InputHub, KeyReader, PointerReader, Px, Rect, Spawn, Theme, VtGuard,
-    WindowManager, detect_keyboard, detect_mouse, detect_touch,
+    WindowManager, detect_all_keyboards, detect_all_mice, detect_all_touch,
 };
 
-use apps::{AboutApp, FilesApp, LauncherApp, NetApp};
+use apps::LauncherApp;
 use net::NetState;
+
+/// Shared, late-bound DrDrNet state. Networking can take a while to
+/// stand up on real hardware (UDP discovery bind, broadcast setup,
+/// reactor port pickup) — too long to keep the user staring at the
+/// splash. We start it in a background thread and write the resulting
+/// `NetState` into this `Arc<Mutex<…>>` so apps that need it can read
+/// it any time, gracefully showing "offline" until the value lands.
+pub type SharedNet = Arc<Mutex<Option<NetState>>>;
 
 fn main() -> ExitCode {
     let args = match parse_args(env::args().collect()) {
@@ -56,25 +65,27 @@ fn main() -> ExitCode {
     // flip light/dark at runtime; we re-read it before every repaint.
     let mut theme = apps::current_theme();
 
-    // Bring DrDrNet up first so the "DrDrNet" window has somewhere to
-    // connect. Phase 8: the reactor binds to *all* interfaces (so peers
-    // on the LAN can reach us) and a discovery service broadcasts our
-    // presence over UDP. Returns None on hard bind failures — the
-    // desktop still runs, the DrDrNet/Chat panels just show "offline".
-    let net_state = NetState::start(hostname()).ok();
-    if let Some(s) = &net_state {
-        eprintln!(
-            "[drdr-desk] DrDrNet reactor listening on {}  (peer id {:016x})",
-            s.reactor_addr, s.me.id
-        );
-    }
+    // ── A shared, late-bound DrDrNet handle. Networking goes up in a
+    // background thread; apps read it whenever they need to. Until
+    // it lands the DrDrNet/Chat panels show "offline" — that is the
+    // graceful-degradation contract the desktop already had, just
+    // without blocking boot if a UDP bind / broadcast is slow on
+    // real hardware. THE single biggest source of the "stuck on
+    // splash" report was doing this work BEFORE the first present(),
+    // so it now happens AFTER the desktop is already on screen.
+    let shared_net: SharedNet = Arc::new(Mutex::new(None));
 
     // Snapshot mode: one frame to a heap framebuffer → PPM. No devices.
-    // We tick once so the DrDrNet panel shows real data in the image.
+    // We start net synchronously here so the panel shows real data in
+    // the image; in real boots we defer it (see below).
     if let Some(path) = &args.ppm_path {
+        let net_state = NetState::start(hostname()).ok();
+        if let Some(s) = &net_state {
+            *shared_net.lock().unwrap() = Some(s.clone());
+        }
         let mut fb = Framebuffer::in_memory(1024, 768);
         let mut wm = WindowManager::new(fb.width, fb.height);
-        build_desktop(&mut wm, net_state.clone());
+        build_desktop(&mut wm, shared_net.clone());
         wm.tick();
         wm.draw(&mut fb, &theme);
         return match fb.write_ppm(path) {
@@ -89,6 +100,9 @@ fn main() -> ExitCode {
         };
     }
 
+    // ── Step 1: framebuffer. If THIS fails the desktop genuinely has
+    //    no screen — fail loud so the supervisor can demote.
+    eprintln!("[drdr-desk] opening framebuffer {}", &args.fb_path);
     let mut fb = match Framebuffer::open(&args.fb_path) {
         Ok(f) => f,
         Err(e) => {
@@ -96,13 +110,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    eprintln!("[drdr-desk] framebuffer: {}", fb.describe());
 
-    // Take the virtual terminal away from the kernel BEFORE we draw, so
-    // fbcon stops repainting /dev/fb0 underneath us (flicker + the
-    // "always-open terminal"), and keystrokes stop being echoed to the
-    // dead console (we read evdev, which is unaffected). Held in `_vt`
-    // for the whole program; Drop restores a usable text console on any
-    // exit. Non-fatal like the splash — a serial-only boot has no VT.
+    // ── Step 2: take the VT so fbcon stops repainting on top of us.
+    //    Non-fatal — a serial-only boot just runs without it.
     let _vt = match VtGuard::acquire() {
         Ok(g) => {
             eprintln!("[drdr-desk] virtual terminal acquired (graphics mode)");
@@ -114,30 +125,46 @@ fn main() -> ExitCode {
         }
     };
 
+    // ── Step 3: build the WM with the icon grid + start menu, then
+    //    paint the FIRST FRAME immediately. No windows are auto-opened;
+    //    the desktop greets the user with clickable icons.
     let mut wm = WindowManager::new(fb.width, fb.height);
-    build_desktop(&mut wm, net_state.clone());
-    // The way back: when the last window closes, the WM rebuilds this
-    // Launcher so closed windows can always be reopened.
-    let launcher_net = net_state.clone();
+    build_desktop(&mut wm, shared_net.clone());
+    let launcher_net = shared_net.clone();
     wm.set_launcher(move || Spawn {
         rect: Rect::new(360, 250, 470, 280),
         app: Box::new(LauncherApp::new(launcher_net.clone())),
     });
 
-    // Double buffering: render the whole scene off-screen, then blit it
+    // Double buffering: render the whole scene off-screen, then blit
     // to /dev/fb0 in one pass — the monitor only ever sees whole frames.
     let mut back = Framebuffer::in_memory(fb.width, fb.height);
-
-    // Paint OUR first frame NOW, before touching input. This is the
-    // single most important line for debugging real hardware: the
-    // instant it runs, drdr-init's splash is gone and what's on the
-    // panel is ours. So "stuck on starting the desktop…" can ONLY mean
-    // present() didn't reach the panel (a pixel-format problem, which
-    // drdr-fb now handles for 16/24/32bpp + RGB-order), never that we
-    // were blocked waiting for a device.
-    eprintln!("[drdr-desk] framebuffer: {}", fb.describe());
+    eprintln!("[drdr-desk] painting first frame");
     wm.draw(&mut back, &theme);
     fb.present(&back);
+    eprintln!("[drdr-desk] first frame on screen");
+
+    // ── Step 4: start DrDrNet in the background. The desktop is now
+    //    on screen, so a slow UDP-broadcast bind on real hardware can
+    //    take as long as it needs — the user already has a usable UI.
+    {
+        let shared_net = shared_net.clone();
+        let host = hostname();
+        thread::spawn(move || match NetState::start(host) {
+            Ok(s) => {
+                eprintln!(
+                    "[drdr-desk] DrDrNet reactor listening on {}  (peer id {:016x})",
+                    s.reactor_addr, s.me.id
+                );
+                if let Ok(mut g) = shared_net.lock() {
+                    *g = Some(s);
+                }
+            }
+            Err(e) => {
+                eprintln!("[drdr-desk] DrDrNet disabled: {e} (continuing)");
+            }
+        });
+    }
 
     // Attach input WITHOUT EVER BLOCKING. The old code looped forever
     // until a keyboard opened — fatal on a Surface Go 2, which is a
@@ -147,10 +174,14 @@ fn main() -> ExitCode {
     // exists right now (possibly nothing) and keep (re)attaching live in
     // the loop, so the desktop is always on screen and becomes usable
     // the moment a finger, mouse or keyboard appears.
-    let mut hub = InputHub::new(
-        attach_keyboard(args.kbd_path.as_deref()),
-        attach_pointer(&args, fb.width, fb.height),
-    );
+    //
+    // Real hardware almost always has more than one input device live at
+    // once — internal keyboard + Type Cover, touchpad + TrackPoint + USB
+    // mouse, etc. The hub now polls them all in parallel so a user
+    // never has to think about which device "the system listens to".
+    let mut hub = InputHub::empty();
+    attach_all_keyboards(&mut hub, args.kbd_path.as_deref());
+    attach_all_pointers(&mut hub, &args, fb.width, fb.height);
     let mut last_scan = Instant::now();
 
     // Event loop. Block for input or the heartbeat, then COALESCE every
@@ -161,23 +192,14 @@ fn main() -> ExitCode {
     // desktop is free and motion stays smooth.
     loop {
         // Live hot-plug: USB enumerates a beat after boot and a Type
-        // Cover can be attached after the desktop is already up. Retry
-        // the missing devices a few times a second — cheap, and it means
-        // the user never has to reboot to get input recognised.
-        if (!hub.has_keyboard() || !hub.has_pointer())
-            && last_scan.elapsed() >= Duration::from_millis(700)
-        {
+        // Cover can be attached after the desktop is already up. Rescan
+        // a couple of times a second and add ANY newly-appeared device
+        // (the hub deduplicates by path) — cheap, and it means the user
+        // never has to reboot to get input recognised.
+        if last_scan.elapsed() >= Duration::from_millis(700) {
             last_scan = Instant::now();
-            if !hub.has_keyboard() {
-                if let Some(k) = attach_keyboard(args.kbd_path.as_deref()) {
-                    hub.set_keyboard(k);
-                }
-            }
-            if !hub.has_pointer() {
-                if let Some(p) = attach_pointer(&args, fb.width, fb.height) {
-                    hub.set_pointer(p);
-                }
-            }
+            attach_all_keyboards(&mut hub, args.kbd_path.as_deref());
+            attach_all_pointers(&mut hub, &args, fb.width, fb.height);
         }
 
         match hub.poll_event(Duration::from_millis(250)) {
@@ -211,55 +233,72 @@ fn main() -> ExitCode {
     }
 }
 
-/// Open the keyboard if one is present *right now*, else `None` — never
-/// blocks. An explicit `--kbd` path wins; otherwise auto-detect.
-fn attach_keyboard(explicit: Option<&str>) -> Option<KeyReader> {
-    let path = explicit.map(str::to_string).or_else(detect_keyboard)?;
-    match KeyReader::open(&path) {
-        Ok(k) => {
-            eprintln!("[drdr-desk] keyboard: {path}");
-            Some(k)
+/// Open every keyboard the system currently exposes and add it to the
+/// hub. Already-open paths are skipped, so calling this on every rescan
+/// (700 ms) just picks up newly-attached devices. An explicit `--kbd`
+/// is opened in addition to auto-detected ones (it's just a hint).
+fn attach_all_keyboards(hub: &mut InputHub, explicit: Option<&str>) {
+    let mut paths: Vec<String> = detect_all_keyboards();
+    if let Some(p) = explicit {
+        if !paths.iter().any(|x| x == p) {
+            paths.push(p.to_string());
         }
-        Err(e) => {
-            eprintln!("[drdr-desk] keyboard {path}: {e} (retrying live)");
-            None
+    }
+    for path in paths {
+        if hub.has_path(&path) {
+            continue;
+        }
+        match KeyReader::open(&path) {
+            Ok(k) => {
+                eprintln!("[drdr-desk] keyboard: {path}");
+                hub.add_keyboard(k, path);
+            }
+            Err(e) => {
+                eprintln!("[drdr-desk] keyboard {path}: {e} (will retry)");
+            }
         }
     }
 }
 
-/// Open a pointer if one is present *right now*, else `None` — never
-/// blocks. Preference: an explicit `--mouse`, then a relative mouse,
-/// then a **touchscreen** (the Surface Go 2's only pointer) opened in
-/// absolute mode and calibrated to the screen.
-fn attach_pointer(args: &Args, sw: u32, sh: u32) -> Option<PointerReader> {
+/// Open every relative pointer (real mouse, PS/2 touchpad, TrackPoint)
+/// AND every touchscreen / absolute pointer, calibrated to the screen.
+fn attach_all_pointers(hub: &mut InputHub, args: &Args, sw: u32, sh: u32) {
+    // Explicit --mouse wins as a relative pointer.
     if let Some(p) = args.mouse_path.as_deref() {
-        return match PointerReader::open(p) {
-            Ok(pr) => {
-                eprintln!("[drdr-desk] mouse (explicit): {p}");
-                Some(pr)
+        if !hub.has_path(p) {
+            match PointerReader::open(p) {
+                Ok(pr) => {
+                    eprintln!("[drdr-desk] mouse (explicit): {p}");
+                    hub.add_pointer(pr, p.to_string());
+                }
+                Err(e) => eprintln!("[drdr-desk] mouse {p}: {e}"),
             }
-            Err(e) => {
-                eprintln!("[drdr-desk] mouse {p}: {e}");
-                None
-            }
-        };
-    }
-    if let Some(p) = detect_mouse() {
-        if let Ok(pr) = PointerReader::open(&p) {
-            eprintln!("[drdr-desk] mouse: {p}");
-            return Some(pr);
         }
     }
-    if let Some(p) = detect_touch() {
-        match PointerReader::open_abs(&p, sw, sh) {
+    for path in detect_all_mice() {
+        if hub.has_path(&path) {
+            continue;
+        }
+        match PointerReader::open(&path) {
             Ok(pr) => {
-                eprintln!("[drdr-desk] touchscreen: {p} (absolute, {sw}x{sh})");
-                return Some(pr);
+                eprintln!("[drdr-desk] pointer: {path}");
+                hub.add_pointer(pr, path);
             }
-            Err(e) => eprintln!("[drdr-desk] touch {p}: {e}"),
+            Err(e) => eprintln!("[drdr-desk] pointer {path}: {e} (will retry)"),
         }
     }
-    None
+    for path in detect_all_touch() {
+        if hub.has_path(&path) {
+            continue;
+        }
+        match PointerReader::open_abs(&path, sw, sh) {
+            Ok(pr) => {
+                eprintln!("[drdr-desk] touchscreen: {path} (absolute, {sw}x{sh})");
+                hub.add_pointer(pr, path);
+            }
+            Err(e) => eprintln!("[drdr-desk] touch {path}: {e} (will retry)"),
+        }
+    }
 }
 
 /// A centred, hard-to-miss message while no input device has attached —
@@ -290,33 +329,16 @@ fn draw_waiting_banner(fb: &mut Framebuffer, theme: &Theme) {
     );
 }
 
-/// Open the default set of overlapping windows. Order matters: the last
-/// one opened is on top and focused, so DrDrNet (the headline Tier-3
-/// demo) gets the accent title bar in the boot screenshot.
-fn build_desktop(wm: &mut WindowManager, net_state: Option<NetState>) {
-    let (sw, sh) = wm.screen();
-
-    // Lay out relative to the screen, clamped so nothing falls off a
-    // smaller framebuffer than the QEMU default 1024x768.
-    let clamp = |x: u32, y: u32, w: u32, h: u32| -> Rect {
-        let w = w.min(sw.saturating_sub(8));
-        let h = h.min(sh.saturating_sub(8));
-        let x = x.min(sw.saturating_sub(w));
-        let y = y.min(sh.saturating_sub(h));
-        Rect::new(x, y, w, h)
-    };
-
-    // The Start menu (taskbar) and the Launcher window share one app
+/// Greet the user with a clean desktop: an icon grid (one tile per
+/// app), a Start menu mirror of the same catalogue, and **no**
+/// auto-opened windows. Earlier phases opened four windows on boot
+/// which felt cluttered and made the shell hard to find — a clear
+/// icon launcher is what a normal user expects.
+fn build_desktop(wm: &mut WindowManager, net_state: SharedNet) {
+    // The Start menu (taskbar) and the desktop icons share one app
     // catalogue, so a new app shows up in both for free.
     wm.set_start_menu(apps::app_catalog(net_state.clone()));
-
-    // Distinct positions (no two windows stacked exactly). The Launcher
-    // opens last so it's on top and focused — it's the "what can I do"
-    // hub, the right thing to greet the user with.
-    wm.open(clamp(40, 56, 560, 280), Box::new(AboutApp));
-    wm.open(clamp(600, 70, 440, 330), Box::new(NetApp::new(net_state.clone())));
-    wm.open(clamp(70, 380, 560, 360), Box::new(FilesApp::new("/")));
-    wm.open(clamp(380, 180, 470, 360), Box::new(LauncherApp::new(net_state)));
+    wm.set_desktop_icons(apps::desktop_icons(net_state));
 }
 
 /// Best-effort node name: prefer the configured `/etc/hostname`, then

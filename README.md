@@ -145,28 +145,28 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **12128 lines** across **20 files** |
+| Rust source | **13616 lines** across **21 files** |
 | Workspace crates | **12** (every `drdr-*`) |
-| Tests | **76** (`cargo test`, all green) |
-| Git commits | **39** |
-| Tracked files (excl. `buildroot/`) | **48** |
+| Tests | **80** (`cargo test`, all green) |
+| Git commits | **40** |
+| Tracked files (excl. `buildroot/`) | **49** |
 | Development window | 2026-05-14
-? → 2026-05-17 |
+? → 2026-05-25 |
 
 Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  3212 | window manager + apps |
-| drdr-ui    |  2943 | GUI framework + WM + shell |
+| drdr-ui    |  3775 | GUI framework + WM + shell |
+| drdr-desk  |  3356 | window manager + apps |
 | drdr-net   |  1911 | binary proto + reactor |
-| drdr-fb    |   664 | framebuffer (all bpp) |
+| drdr-fb    |   888 | framebuffer (all bpp) |
 | drdr-font  |   659 | 8x16 glyphs |
 | drdr-shell |   562 | shell |
+| drdr-init  |   537 | PID 1 / supervisor |
 | drdr-store |   513 | persistent storage |
 | drdr-files |   498 | file browser |
 | drdr-edit  |   463 | modal editor |
-| drdr-init  |   462 | PID 1 / supervisor |
 | drdr-demo  |   268 | widget showcase |
 | drdr-tty   |   186 | raw-mode helper |
 <!-- STATS:END -->
@@ -239,12 +239,12 @@ cargo build --release --target x86_64-unknown-linux-musl -p drdr-init
 bash scripts/build-buildroot.sh    # ~15-30 min the first time
 
 # Boot kernel + initramfs in QEMU (dev loop).
-bash scripts/qemu.sh               # GTK window + serial on stdio
-bash scripts/qemu.sh --kvm         # KVM if /dev/kvm exists
+sudo bash scripts/qemu.sh               # GTK window + serial on stdio
+sudo bash scripts/qemu.sh --kvm         # KVM if /dev/kvm exists
 
 # Or a bootable hybrid ISO (works under Ventoy on real hardware).
-bash iso/build.sh                  # → iso/drdros.iso
-bash scripts/qemu.sh --iso --uefi  # boot it via UEFI/OVMF
+sudo bash iso/build.sh                  # → iso/drdros.iso
+sudo bash scripts/qemu.sh --iso --uefi  # boot it via UEFI/OVMF
 ```
 
 ## Running the core apps on the host
