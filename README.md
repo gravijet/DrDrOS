@@ -17,7 +17,7 @@ and scheduling; everything above it is ours.
 | **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop: taskbar + Start menu, draggable windows, **anti-aliased text**, ~20 apps incl. games, automatic disk persistence |
+| **Status** | Boots to a modern desktop: taskbar + Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons**, ~20 apps incl. a browser, an image viewer, a Wi-Fi/network panel and games, a **menu bar with text formatting** in the editor, and automatic disk persistence |
 
 ### What you actually get when it boots
 
@@ -33,12 +33,27 @@ graphical desktop — no login, no shell, no X11:
 - **A real window manager** — overlapping, titled windows, Alt-Tab to
   cycle, a hand-drawn cursor, a Launcher that returns if you close
   everything, so the desktop is never a dead end.
-- **A dozen-plus windowed apps** — Files, Text Editor, **Notes**
-  (persistent + autosaving), **Tasks** (a persistent to-do list),
-  **Calculator** (our own expression parser), **Clock & Calendar**,
-  **System Monitor** (live CPU/RAM/load from `/proc`), **System Info**
-  (a neofetch-style card), **DrDrConsole** (a no-PTY command
-  interpreter), **DrDrChat** (LAN chat between DrDrOS machines),
+- **Real, hand-drawn app icons** — every desktop tile and Start-menu
+  row now shows a proper pictographic icon (a folder, a sheet of paper,
+  a calculator with a keypad, a globe, a gear, a floppy disk…) drawn
+  from framebuffer primitives, not a single scaled font letter. Same
+  from-scratch spirit as the bitmap font: no image files, no SVG parser,
+  just shapes composed at draw time (`drdr-ui/src/icon.rs`).
+- **A dozen-plus windowed apps** — Files (now type-aware: it knows a
+  `.png` from a `.rs` and opens each in the right viewer), **Text
+  Editor** with a **Windows-style menu bar** (File / Format / Colour /
+  View) for **colouring text, making it bigger/smaller, and toggling
+  syntax highlighting** — all with the mouse, no shortcuts to memorise —
+  plus per-language **syntax highlighting** for Rust/JS/Java/C/Python/…,
+  **Notes** (persistent + autosaving), **Tasks** (a persistent to-do
+  list), a **Browser** (`DrDrBrowser` — a from-scratch local renderer
+  for HTML and Markdown), an **Image viewer** (decodes PPM and BMP into
+  full-colour cells; reports PNG/JPEG dimensions), a **Network & Wi-Fi**
+  panel (lists the kernel's interfaces, flags wireless radios, shows
+  DrDrNet peers), **Calculator** (our own expression parser), **Clock &
+  Calendar**, **System Monitor** (live CPU/RAM/load from `/proc`),
+  **System Info** (a neofetch-style card), **DrDrConsole** (a no-PTY
+  command interpreter), **DrDrChat** (LAN chat between DrDrOS machines),
   **DrDrPaint** (mouse-driven block drawing), and the games
   **DrDrSnake**, **DrDr2048** and **DrDrMines** (Minesweeper), plus
   **Disks**, **Settings**, the DrDrNet panel, About, and the power menu.
@@ -130,13 +145,13 @@ Every pixel and keystroke above is handled by code in this repository.
 | **drdr-shell** | binary | DrDrShell — custom shell with pipes, redirects, quoting |
 | **drdr-edit** | binary | DrDrEdit — vi-style modal text editor |
 | **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
-| **drdr-fb** | library | DrDrFb — framebuffer access for **16/24/32bpp, any channel order** |
+| **drdr-fb** | library | DrDrFb — framebuffer access for **16/24/32bpp, any channel order**, now with anti-aliased `fill_circle` / `draw_line` primitives for the icon renderer |
 | **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyphs **+ a software anti-aliaser** (crisp strokes, soft edges, smooth scaled logos) |
-| **drdr-ui** | library | DrDrUI — widgets, Theme (light + dark), `TextGrid`/`WindowApp`, the WM **+ taskbar/Start-menu shell**, `InputHub` (kbd + mouse + **touchscreen**), VT takeover |
+| **drdr-ui** | library | DrDrUI — widgets, Theme (light + dark), `TextGrid`/`WindowApp` (now with per-window **text zoom**), the WM **+ taskbar/Start-menu shell**, a **pictographic icon renderer** (`icon.rs`), `InputHub` (kbd + mouse + **touchscreen**), VT takeover |
 | **drdr-store** | library | DrDrStore — block-device discovery, mounting, and a `save`/`load` API so files persist beyond RAM |
 | **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
 | **drdr-net** | library | DrDrNet — custom binary protocol + a hand-rolled epoll reactor (Tier 3 async) **+ UDP-broadcast peer discovery + a chat sub-protocol** so two DrDrOS machines on a LAN find each other and talk |
-| **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) + `linux-storage.config` (USB-storage/SCSI/NVMe/MMC + ext4/vfat/exfat/ntfs3 so disks mount + persist) |
+| **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) + `linux-storage.config` (USB-storage/SCSI/NVMe/MMC + ext4/vfat/exfat/ntfs3 so disks mount + persist) + `linux-wifi.config` (cfg80211/mac80211 + Intel/Broadcom/Atheros/Realtek Wi-Fi + Ethernet so a real radio enumerates) |
 | **iso/** | tooling | xorriso pipeline producing the bootable `drdros.iso` |
 | **scripts/** | tooling | `qemu.sh` runner · `stats.sh` (auto-updates the numbers below) |
 
@@ -157,10 +172,11 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **14832 lines** across **21 files** |
-| Workspace crates | **12** (every `drdr-*`) |
-| Tests | **86** (`cargo test`, all green) |
-| Git commits | **45** |
+| Rust source | **16250 lines** across **21 files** |
+| Workspace crates | **0
+0** (every `drdr-*`) |
+| Tests | **95** (`cargo test`, all green) |
+| Git commits | **46** |
 | Tracked files (excl. `buildroot/`) | **49** |
 | Development window | 2026-05-14
 ? → 2026-05-31 |
@@ -169,10 +185,10 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  4309 | window manager + apps |
-| drdr-ui    |  3758 | GUI framework + WM + shell |
+| drdr-desk  |  5620 | window manager + apps |
+| drdr-ui    |  4133 | GUI framework + WM + shell |
 | drdr-net   |  1911 | binary proto + reactor |
-| drdr-fb    |   888 | framebuffer (all bpp) |
+| drdr-fb    |   976 | framebuffer (all bpp) |
 | drdr-font  |   886 | 8x16 glyphs |
 | drdr-store |   562 | persistent storage |
 | drdr-shell |   562 | shell |
@@ -250,6 +266,28 @@ Lines of Rust per crate (largest first):
       UEFI GRUB and prints exact **Secure-Boot-off** steps for the
       Surface Go 2 / ThinkPad T14 (the real reason a custom ISO won't
       boot on them).
+- [x] **Phase 10 — Real icons, a formatting menu bar, more apps, more
+      formats, Wi-Fi** *(this release)*
+      The desktop stops looking like a debug build: every app tile and
+      Start-menu row gets a **real pictographic icon** — a folder, a
+      sheet of paper, a calculator keypad, a globe, a gear, a floppy —
+      hand-drawn from new anti-aliased `fill_circle`/`draw_line`
+      framebuffer primitives (`drdr-ui/src/icon.rs`), no font letters,
+      no image files · the **Text Editor gains a Windows-style menu bar**
+      (File / Format / Colour / View) so you **colour text, size it
+      up/down and toggle highlighting with the mouse** — backed by a real
+      per-character colour buffer kept in lock-step with edits and
+      per-window **text zoom** in the WM · **syntax highlighting** for
+      Rust/JS/Java/C/Python/Shell/JSON · the file manager is now
+      **type-aware** (it knows `.png` from `.rs` from `.pdf`) and routes
+      each file to the right viewer · **three new apps**: **DrDrBrowser**
+      (a from-scratch local HTML/Markdown renderer), an **Image viewer**
+      (decodes PPM + BMP into full-colour cells, reports PNG/JPEG
+      dimensions) and a **Network & Wi-Fi** panel (enumerates
+      `/sys/class/net`, flags wireless radios, shows DrDrNet peers) · a
+      **`linux-wifi.config`** kernel fragment brings up the 802.11 stack
+      and the Wi-Fi/Ethernet drivers the target machines use · a third,
+      maximally-conservative GRUB boot entry for stubborn firmware.
 
 ---
 

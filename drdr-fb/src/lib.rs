@@ -707,6 +707,74 @@ impl Framebuffer {
         }
     }
 
+    /// Fill an anti-aliased disc centred at `(cx, cy)` with radius `r`.
+    /// Edge pixels are 4×4 supersampled and alpha-blended, so a small
+    /// icon circle reads as round, not as a staircase. Only correct on
+    /// the canonical heap back buffer (uses `blend_pixel`).
+    pub fn fill_circle(&mut self, cx: i32, cy: i32, r: i32, color: Pixel) {
+        if r <= 0 {
+            return;
+        }
+        let r2_q = (r * 4) * (r * 4);
+        let x0 = (cx - r).max(0);
+        let y0 = (cy - r).max(0);
+        let x1 = (cx + r + 1).min(self.width as i32);
+        let y1 = (cy + r + 1).min(self.height as i32);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let mut hits = 0i32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        // sub-pixel sample centre, in quarter-pixel units
+                        let fx = (px - cx) * 4 + sx * 2 + 1 - 2;
+                        let fy = (py - cy) * 4 + sy * 2 + 1 - 2;
+                        if fx * fx + fy * fy <= r2_q {
+                            hits += 1;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    continue;
+                }
+                let a = ((hits * color.a as i32) / 16) as u8;
+                self.blend_pixel(px as u32, py as u32, Pixel::rgba(color.r, color.g, color.b, a));
+            }
+        }
+    }
+
+    /// Draw a `thickness`-pixel line from `(x0, y0)` to `(x1, y1)` with a
+    /// soft (anti-aliased) edge. Implemented as a per-pixel distance to
+    /// the line segment over the bounding box — slower than Bresenham but
+    /// it gives smooth, rounded-cap strokes for the hand-drawn icons.
+    /// Only correct on the canonical heap back buffer.
+    pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, thickness: f32, color: Pixel) {
+        let half = (thickness * 0.5).max(0.5);
+        let pad = half.ceil() as i32 + 1;
+        let bx0 = (x0.min(x1) - pad).max(0);
+        let by0 = (y0.min(y1) - pad).max(0);
+        let bx1 = (x0.max(x1) + pad).min(self.width as i32);
+        let by1 = (y0.max(y1) + pad).min(self.height as i32);
+        let (ax, ay) = (x0 as f32, y0 as f32);
+        let (dx, dy) = ((x1 - x0) as f32, (y1 - y0) as f32);
+        let len2 = (dx * dx + dy * dy).max(1e-6);
+        for py in by0..by1 {
+            for px in bx0..bx1 {
+                let (qx, qy) = (px as f32 + 0.5, py as f32 + 0.5);
+                // project (q-a) onto the segment, clamp to [0,1]
+                let t = (((qx - ax) * dx + (qy - ay) * dy) / len2).clamp(0.0, 1.0);
+                let (cxp, cyp) = (ax + t * dx, ay + t * dy);
+                let dist = ((qx - cxp).powi(2) + (qy - cyp).powi(2)).sqrt();
+                // coverage: 1 inside, fading to 0 across one pixel at the edge
+                let cov = (half - dist + 0.5).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let a = (cov * color.a as f32).round() as u8;
+                self.blend_pixel(px as u32, py as u32, Pixel::rgba(color.r, color.g, color.b, a));
+            }
+        }
+    }
+
     /// Fill the entire screen with a single color.
     pub fn clear(&mut self, color: Pixel) {
         self.fill_rect(0, 0, self.width, self.height, color);
@@ -808,6 +876,26 @@ impl Drop for Framebuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_circle_paints_centre_and_clears_corners() {
+        let mut fb = Framebuffer::in_memory(20, 20);
+        fb.fill_circle(10, 10, 6, Pixel::WHITE);
+        // Centre is solidly inside the disc.
+        assert_eq!(fb.get_pixel(10, 10), Pixel::WHITE);
+        // A far corner is well outside the radius → untouched.
+        assert_eq!(fb.get_pixel(0, 0), Pixel::BLACK);
+    }
+
+    #[test]
+    fn draw_line_paints_along_the_segment() {
+        let mut fb = Framebuffer::in_memory(20, 20);
+        fb.draw_line(2, 2, 16, 2, 2.0, Pixel::WHITE);
+        // A pixel on the horizontal run is lit…
+        assert!(fb.get_pixel(9, 2).r > 100);
+        // …and a pixel far from the line is not.
+        assert_eq!(fb.get_pixel(9, 15), Pixel::BLACK);
+    }
 
     #[test]
     fn canonical_roundtrips_through_ppm_bytes() {

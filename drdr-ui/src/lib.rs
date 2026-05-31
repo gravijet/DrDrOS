@@ -25,6 +25,7 @@
 //! Coordinate system: (0, 0) is the top-left pixel; +x goes right, +y
 //! goes down — same as the framebuffer underneath.
 
+pub mod icon;
 pub mod input;
 pub mod vt;
 pub mod window;
@@ -33,6 +34,7 @@ use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{draw_text_aa as draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
+pub use icon::{draw_icon, IconKind};
 pub use input::{
     detect_all_keyboards, detect_all_mice, detect_all_touch, detect_keyboard, detect_mouse,
     detect_touch, Event, EventResponse, HubEvent, InputHub, KeyCode, KeyReader, MouseButton,

@@ -26,11 +26,13 @@
 //! buffer. Apps compose into the desktop for free; there is no
 //! sub-process, no pseudo-terminal, nothing borrowed from xterm.
 
+use crate::icon::{draw_icon, IconKind};
 use crate::input::{KeyCode, MouseButton, MouseEvent};
 use crate::{Rect, Theme};
 use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{
-    GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph_aa, draw_glyph_scaled_aa, draw_text_aa,
+    GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph_aa, draw_glyph_scaled_aa, draw_glyph_scaled_aa_over,
+    draw_text_aa,
 };
 
 // ─── Layout constants ────────────────────────────────────────────────
@@ -226,6 +228,14 @@ pub trait WindowApp {
     fn take_spawns(&mut self) -> Vec<Spawn> {
         Vec::new()
     }
+
+    /// Text magnification for this window's grid: 1 = normal, 2 = double
+    /// size, etc. Lets an app offer a "bigger / smaller text" control (the
+    /// editor's Format menu) — the WM sizes the grid in `zoom`-scaled
+    /// cells and draws every glyph at that scale. Clamped to 1..=3.
+    fn zoom(&self) -> u32 {
+        1
+    }
 }
 
 // ─── Window ──────────────────────────────────────────────────────────
@@ -246,7 +256,7 @@ pub struct Window {
 
 impl Window {
     pub fn new(rect: Rect, app: Box<dyn WindowApp>) -> Self {
-        let (cols, rows) = Self::grid_dims(rect);
+        let (cols, rows) = Self::grid_dims(rect, app.zoom());
         Self {
             rect,
             app,
@@ -266,11 +276,13 @@ impl Window {
         )
     }
 
-    /// How many character cells fit in `rect`'s content area.
-    fn grid_dims(rect: Rect) -> (u32, u32) {
+    /// How many character cells fit in `rect`'s content area at the given
+    /// text `zoom` (1 = normal, 2 = double-size glyphs, …).
+    fn grid_dims(rect: Rect, zoom: u32) -> (u32, u32) {
+        let zoom = zoom.clamp(1, 3);
         let cw = rect.w.saturating_sub(BORDER * 2);
         let ch = rect.h.saturating_sub(TITLE_H + BORDER);
-        ((cw / GLYPH_WIDTH).max(1), (ch / GLYPH_HEIGHT).max(1))
+        ((cw / (GLYPH_WIDTH * zoom)).max(1), (ch / (GLYPH_HEIGHT * zoom)).max(1))
     }
 
     /// The draggable strip — the title bar minus the control buttons.
@@ -321,9 +333,10 @@ impl Window {
         if !hit(c, x, y) {
             return None;
         }
-        let col = (x - c.x as i32) as u32 / GLYPH_WIDTH;
-        let row = (y - c.y as i32) as u32 / GLYPH_HEIGHT;
-        let (cols, rows) = Self::grid_dims(self.rect);
+        let zoom = self.app.zoom().clamp(1, 3);
+        let col = (x - c.x as i32) as u32 / (GLYPH_WIDTH * zoom);
+        let row = (y - c.y as i32) as u32 / (GLYPH_HEIGHT * zoom);
+        let (cols, rows) = Self::grid_dims(self.rect, zoom);
         (col < cols && row < rows).then_some((col, row))
     }
 }
@@ -448,11 +461,11 @@ const ICON_RADIUS: u32 = 14;
 const ICON_GRID_TOP: u32 = 64;
 
 /// One icon on the desktop: a label, the app factory it should launch,
-/// and an optional "glyph" character (drawn 4x scaled inside the tile).
+/// and a real pictographic [`IconKind`] (drawn inside the tile).
 pub struct DesktopIcon {
     pub label: String,
-    pub glyph: char,
-    /// Background tint (paints behind the glyph). A soft, distinct
+    pub icon: IconKind,
+    /// Background tint (paints behind the icon). A soft, distinct
     /// colour per app helps the eye scan the grid.
     pub tint: Pixel,
     pub factory: Box<dyn Fn() -> Spawn>,
@@ -480,8 +493,9 @@ pub struct WindowManager {
     dirty: bool,
     /// Builds a fresh launcher window when the desktop empties.
     launcher: Option<Box<dyn Fn() -> Spawn>>,
-    /// Start-menu entries: a label and a factory that builds the window.
-    start_items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
+    /// Start-menu entries: a label, an icon and a factory that builds the
+    /// window.
+    start_items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     start_open: bool,
     /// While true, the keyboard-shortcut help overlay is drawn over the
     /// desktop (any key / click dismisses it).
@@ -598,11 +612,11 @@ impl WindowManager {
         self.launcher = Some(Box::new(f));
     }
 
-    /// Populate the Start menu. Each entry is a label and a factory that
-    /// builds its window when chosen.
+    /// Populate the Start menu. Each entry is a label, an icon and a
+    /// factory that builds its window when chosen.
     pub fn set_start_menu(
         &mut self,
-        items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
+        items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     ) {
         self.start_items = items;
     }
@@ -892,7 +906,7 @@ impl WindowManager {
             let menu = self.start_menu_rect();
             if hit(menu, x, y) {
                 let row = ((y - menu.y as i32) as u32) / (GLYPH_HEIGHT + 6);
-                if let Some((_, factory)) = self.start_items.get(row as usize) {
+                if let Some((_, _, factory)) = self.start_items.get(row as usize) {
                     let s = factory();
                     self.open(s.rect, s.app); // also clears start_open
                 }
@@ -942,7 +956,7 @@ impl WindowManager {
     fn start_menu_rect(&self) -> Rect {
         let rows = self.start_items.len().max(1) as u32;
         let h = rows * (GLYPH_HEIGHT + 6) + 12;
-        let w = GLYPH_WIDTH * 26;
+        let w = GLYPH_WIDTH * 28 + GLYPH_HEIGHT;
         Rect::new(
             0,
             self.screen_h.saturating_sub(TASKBAR_H + h),
@@ -1295,19 +1309,18 @@ impl WindowManager {
                 fb.fill_rect(tile_x + ICON_TILE - 2, tile_y, 2, ICON_TILE, ring);
             }
 
-            // 4× scaled glyph in the centre — readable from a metre
-            // away on a 1080p screen; reuses the bitmap font.
-            let scale: u32 = 4;
-            let gw = GLYPH_WIDTH * scale;
-            let gh = GLYPH_HEIGHT * scale;
-            let gx = tile_x + (ICON_TILE.saturating_sub(gw)) / 2;
-            let gy = tile_y + (ICON_TILE.saturating_sub(gh)) / 2;
+            // Real pictographic icon, centred — a folder, a calculator,
+            // a globe… not a scaled font letter. Inked light on a dark
+            // tile, dark on a light one, so it always reads.
+            let isize = (ICON_TILE * 64) / 92; // ~64px inside a 92px tile
+            let ix = tile_x + (ICON_TILE.saturating_sub(isize)) / 2;
+            let iy = tile_y + (ICON_TILE.saturating_sub(isize)) / 2;
             let glyph_fg = if luminance_for(body) > 140 {
                 Pixel::rgb(0x10, 0x10, 0x14)
             } else {
                 Pixel::WHITE
             };
-            draw_glyph_scaled(fb, gx, gy, icon.glyph, glyph_fg, scale);
+            draw_icon(fb, ix, iy, isize, icon.icon, glyph_fg, body);
 
             // Label under the tile, centred.
             let label_y = tile_y + ICON_TILE + 4;
@@ -1443,7 +1456,8 @@ impl WindowManager {
         fb.fill_rect(m.x + RADIUS / 2, m.y, m.w.saturating_sub(RADIUS), 1, theme.accent);
 
         let row_h = GLYPH_HEIGHT + 6;
-        for (i, (label, _)) in self.start_items.iter().enumerate() {
+        let isz = GLYPH_HEIGHT; // small icon fits the row height
+        for (i, (label, kind, _)) in self.start_items.iter().enumerate() {
             let ry = m.y + 6 + i as u32 * row_h;
             let hot = self.pointer_y >= ry as i32
                 && self.pointer_y < (ry + row_h) as i32
@@ -1463,7 +1477,9 @@ impl WindowManager {
                     bg,
                 );
             }
-            draw_text_aa(fb, m.x + 16, ry + 3, label, fg, bg);
+            // A small real icon to the left of every Start-menu label.
+            draw_icon(fb, m.x + 10, ry + (row_h - isz) / 2, isz, *kind, fg, bg);
+            draw_text_aa(fb, m.x + 16 + isz, ry + 3, label, fg, bg);
         }
     }
 }
@@ -1490,14 +1506,6 @@ fn luminance_for(p: Pixel) -> u32 {
     // ITU-R BT.601-ish weighting on linear 0..255 — good enough to
     // pick black vs white text over a coloured tile.
     (p.r as u32 * 299 + p.g as u32 * 587 + p.b as u32 * 114) / 1000
-}
-
-/// Draw a single bitmap glyph scaled `scale`× with **anti-aliased** edges
-/// (a smooth resample of the pixel art, not blocky replicated squares) —
-/// used by the desktop icons (large logos) and the wordmark. Composites
-/// over the back buffer so it sits cleanly on a tinted tile.
-fn draw_glyph_scaled(fb: &mut Framebuffer, x: u32, y: u32, ch: char, fg: Pixel, scale: u32) {
-    draw_glyph_scaled_aa(fb, x, y, ch, fg, scale);
 }
 
 /// 2×-scaled, anti-aliased text for the wallpaper wordmark.
@@ -1614,7 +1622,9 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
     // grid-bg fill by `radius` at the bottom so the rounded body's
     // alpha-blended corner pixels stay visible underneath.
     let content = win.content_rect();
-    let (cols, rows) = Window::grid_dims(r);
+    let zoom = win.app.zoom().clamp(1, 3);
+    let (cw, chh) = (GLYPH_WIDTH * zoom, GLYPH_HEIGHT * zoom);
+    let (cols, rows) = Window::grid_dims(r, zoom);
     win.grid.resize(cols, rows, theme.fg, theme.surface);
     win.grid.clear();
     win.app.render(&mut win.grid);
@@ -1629,13 +1639,19 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
             win.grid.bg(),
         );
     }
-    // Cell glyphs — same as before.
+    // Cell glyphs — at zoom 1 the crisp 1× AA path; at higher zoom each
+    // cell gets its background painted then a smooth supersampled glyph.
     for gy in 0..win.grid.rows {
         for gx in 0..win.grid.cols {
             let cell = win.grid.cell(gx, gy);
-            let pxg = content.x + gx * GLYPH_WIDTH;
-            let pyg = content.y + gy * GLYPH_HEIGHT;
-            draw_glyph_aa(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
+            let pxg = content.x + gx * cw;
+            let pyg = content.y + gy * chh;
+            if zoom == 1 {
+                draw_glyph_aa(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
+            } else {
+                fb.fill_rect(pxg, pyg, cw, chh, cell.bg);
+                draw_glyph_scaled_aa_over(fb, pxg, pyg, cell.ch, cell.fg, cell.bg, zoom);
+            }
         }
     }
 }
@@ -1874,6 +1890,7 @@ mod tests {
         let mut m = WindowManager::new(1000, 800);
         m.set_start_menu(vec![(
             "X".into(),
+            IconKind::Generic,
             Box::new(|| Spawn {
                 rect: Rect::new(0, 0, 100, 100),
                 app: Box::new(Dummy("x")),

@@ -38,12 +38,15 @@ BR2_TOOLCHAIN_BUILDROOT_MUSL=y
 # SCSI/NVMe/MMC block devices and the ext4/vfat/exfat/ntfs3 filesystems,
 # so DrDrStore can actually mount a USB stick / SD card / disk and make
 # files persist on real hardware — without it the base defconfig sees no
-# removable disk at all. Buildroot merges multiple space-separated
-# fragment files in order.
+# removable disk at all. linux-wifi.config adds the 802.11 (cfg80211 +
+# mac80211) stack and the Wi-Fi/Ethernet drivers the target laptops and
+# tablets use (Intel iwlwifi, Broadcom, Atheros, Realtek, USB dongles) so
+# the Network panel sees a real radio and DrDrNet has a wire to talk over.
+# Buildroot merges multiple space-separated fragment files in order.
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_USE_DEFCONFIG=y
 BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DRDROS_PATH)/linux-fb.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-input.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-storage.config"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DRDROS_PATH)/linux-fb.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-input.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-storage.config $(BR2_EXTERNAL_DRDROS_PATH)/linux-wifi.config"
 
 # ─── Root filesystem ────────────────────────────────────────────────────
 # Ship the rootfs as a gzipped cpio archive (initramfs). The Linux kernel
