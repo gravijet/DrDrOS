@@ -160,7 +160,7 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 | Rust source | **14832 lines** across **21 files** |
 | Workspace crates | **12** (every `drdr-*`) |
 | Tests | **86** (`cargo test`, all green) |
-| Git commits | **43** |
+| Git commits | **45** |
 | Tracked files (excl. `buildroot/`) | **49** |
 | Development window | 2026-05-14
 ? → 2026-05-31 |
