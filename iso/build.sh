@@ -65,6 +65,19 @@ if [[ ! -d /usr/lib/grub/i386-pc ]]; then
     echo "  → boot it with: scripts/qemu.sh --iso --uefi" >&2
     echo "  → for BIOS boot too: sudo apt-get install -y grub-pc-bin" >&2
 fi
+# The UEFI El Torito image needs the x86_64-efi GRUB modules
+# (grub-efi-amd64-bin). Without them grub-mkrescue produces a BIOS-only
+# ISO that a Surface Go 2 / ThinkPad T14 (both UEFI) will NOT boot at
+# all — the single most common "it doesn't start" cause after Secure
+# Boot. Fail loudly: a UEFI machine with a BIOS-only ISO is dead media.
+if [[ ! -d /usr/lib/grub/x86_64-efi ]]; then
+    echo "iso/build.sh: ERROR — grub-efi-amd64-bin not found" >&2
+    echo "  /usr/lib/grub/x86_64-efi is missing, so grub-mkrescue cannot" >&2
+    echo "  build a UEFI boot image. The resulting ISO would not boot on" >&2
+    echo "  a Surface Go 2 / ThinkPad T14 (both UEFI-only)." >&2
+    echo "  → sudo apt-get install -y grub-efi-amd64-bin" >&2
+    exit 1
+fi
 
 if [[ ! -f $BZIMAGE ]]; then
     echo "iso/build.sh: kernel image not found: $BZIMAGE" >&2
@@ -85,12 +98,57 @@ cp "$ROOTFS"  "$STAGE/boot/rootfs.cpio.gz"
 
 cat > "$STAGE/boot/grub/grub.cfg" <<'EOF'
 # DrDrOS GRUB boot configuration.
-# Edit timeout=0 if you want zero-pause autoboot — useful in CI / Ventoy.
-set timeout=3
+#
+# Robustness notes (why each line is here — learned booting real UEFI
+# hardware: Surface Go 2, ThinkPad T14, not just QEMU):
+#
+#  * `search --file` re-finds the partition that actually holds our
+#    kernel and sets $root to it. Without this, GRUB's idea of $root can
+#    be wrong when the ISO is launched indirectly (Ventoy, a USB stick
+#    whose layout the firmware mapped differently), and `linux
+#    /boot/bzImage` then fails with "file not found" — a silent non-boot.
+#  * `all_video` + `efi_gop`/`efi_uga` load every framebuffer backend GRUB
+#    has, and `gfxpayload=keep` hands the *live* GOP framebuffer straight
+#    to the kernel. On efifb/simpledrm machines this is the difference
+#    between a desktop and a black screen after the GRUB menu.
+#  * We keep `console=tty0` on every entry so the screen always shows the
+#    boot, and drop `quiet` from the safe/verbose entries for diagnosis.
+
+insmod part_gpt
+insmod part_msdos
+insmod fat
+insmod iso9660
+insmod all_video
+insmod efi_gop
+insmod efi_uga
+insmod gfxterm
+insmod video_bochs
+insmod video_cirrus
+
+# Find the volume that carries our kernel and make it $root, wherever the
+# firmware placed it. The `|| true` keeps going if search isn't needed.
+search --no-floppy --file --set=root /boot/bzImage
+
+set gfxpayload=keep
+terminal_output gfxterm
+
+# Edit timeout=0 for zero-pause autoboot (CI / Ventoy). 5s gives a user on
+# a slow-to-init panel time to see the menu and pick "safe graphics".
+set timeout=5
 set default=0
 
-menuentry "DrDrOS — boot to userland" {
-    linux  /boot/bzImage console=tty0 quiet
+menuentry "DrDrOS — boot to desktop" {
+    set gfxpayload=keep
+    linux  /boot/bzImage console=tty0 loglevel=4
+    initrd /boot/rootfs.cpio.gz
+}
+
+menuentry "DrDrOS — safe graphics (force EFI framebuffer)" {
+    # nomodeset disables the DRM KMS drivers and falls back to the plain
+    # firmware framebuffer (efifb). Use this if the desktop boots to a
+    # black/garbled screen with the default entry on real hardware.
+    set gfxpayload=keep
+    linux  /boot/bzImage console=tty0 nomodeset video=efifb loglevel=4
     initrd /boot/rootfs.cpio.gz
 }
 
@@ -111,5 +169,19 @@ grub-mkrescue \
 ls -la "$OUTPUT"
 echo
 echo "[iso/build.sh] success → $OUTPUT"
-echo "  Boot in QEMU: scripts/qemu.sh --iso"
-echo "  Write to USB: sudo dd if=$OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
+echo "  Boot in QEMU (UEFI): scripts/qemu.sh --iso --uefi"
+echo "  Write to USB:        sudo dd if=$OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
+echo
+echo "  ┌─ REAL HARDWARE (Surface Go 2 / ThinkPad T14) ─────────────────┐"
+echo "  │ If the machine shows 'No bootable device' or jumps straight   │"
+echo "  │ back to Windows, it is almost always SECURE BOOT, not the     │"
+echo "  │ ISO: this GRUB image is unsigned, so UEFI firmware refuses it │"
+echo "  │ until Secure Boot is OFF.                                     │"
+echo "  │   Surface Go 2: hold Volume-Up + tap Power → UEFI → Security  │"
+echo "  │     → Secure Boot → Disabled (or 'Microsoft & 3rd party').    │"
+echo "  │   ThinkPad T14: tap Enter/F1 at boot → Security → Secure Boot │"
+echo "  │     → Disabled. Set Boot Mode = UEFI (not Legacy).            │"
+echo "  │ Then F12 (T14) / Volume-Down (Surface) to pick the USB stick.│"
+echo "  │ Ventoy users: use 'GRUB2 Mode' (press Ctrl-r) if normal mode │"
+echo "  │ chainloads the ISO into a blank screen.                      │"
+echo "  └───────────────────────────────────────────────────────────────┘"

@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use drdr_net::status::{KIND_STAT_REQ, Stat, StatReq};
 use drdr_net::Conn;
-use drdr_ui::{AppControl, DesktopIcon, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp};
+use drdr_ui::{
+    AppControl, DesktopIcon, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp, WindowManager,
+};
 
 use nix::sys::reboot::{RebootMode, reboot};
 
@@ -380,6 +382,8 @@ pub struct EditApp {
     /// `Some(buf)` while the user is typing a new file name in the
     /// "Save As" prompt (F2). Enter commits, Esc cancels.
     save_as: Option<String>,
+    /// Ticks since the last edit while dirty — drives the autosave.
+    autosave: u16,
 }
 
 impl EditApp {
@@ -395,7 +399,7 @@ impl EditApp {
             }
             Err(_) => (vec![String::new()], "new file".into()),
         };
-        Self { path, lines, cx: 0, cy: 0, top: 0, modified: false, status, save_as: None }
+        Self { path, lines, cx: 0, cy: 0, top: 0, modified: false, status, save_as: None, autosave: 0 }
     }
 
     fn cur_len(&self) -> usize {
@@ -584,6 +588,21 @@ impl WindowApp for EditApp {
         AppControl::Continue
     }
 
+    fn on_tick(&mut self) -> AppControl {
+        // Autosave to the current file a few seconds after the last edit
+        // (not while the Save-As prompt is open — the name isn't final).
+        if self.modified && self.save_as.is_none() {
+            self.autosave = self.autosave.saturating_add(1);
+            if self.autosave >= 40 {
+                self.save();
+                self.autosave = 0;
+            }
+        } else if !self.modified {
+            self.autosave = 0;
+        }
+        AppControl::Continue
+    }
+
     fn render(&mut self, g: &mut TextGrid) {
         let rows = g.rows as usize;
         let text_rows = rows.saturating_sub(1);
@@ -663,13 +682,17 @@ pub fn app_catalog(
         entry("Files", || Box::new(FilesApp::new(drdr_store::documents_dir()))),
         entry("Text Editor", || Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))),
         entry("Notes (saved)", || Box::new(NotesApp::new())),
+        entry("Tasks (saved)", || Box::new(TasksApp::new())),
         entry("Terminal (Shell)", || Box::new(ConsoleApp::new())),
         entry("Calculator", || Box::new(CalcApp::new())),
         entry("Clock & Calendar", || Box::new(ClockApp::new())),
         entry("System Monitor", || Box::new(SysMonApp::new())),
+        entry("System Info", || Box::new(SysInfoApp::new())),
         entry("DrDrChat (LAN)", move || Box::new(ChatApp::new(net_for_chat.clone()))),
         entry("DrDrPaint", || Box::new(PaintApp::new())),
         entry("DrDrSnake", || Box::new(SnakeApp::new())),
+        entry("DrDr2048", || Box::new(Game2048::new())),
+        entry("DrDrMines", || Box::new(MinesApp::new())),
         entry("Disks", || Box::new(DisksApp::new())),
         entry("Settings", move || Box::new(SettingsApp::new(net_for_settings.clone()))),
         entry("DrDrNet panel", move || Box::new(NetApp::new(net_for_panel.clone()))),
@@ -706,16 +729,30 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
             Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))
         }),
         icon("Notes",      'N', Px::rgb(0xF2, 0xC0, 0x32), || Box::new(NotesApp::new())),
+        icon("Tasks",      'K', Px::rgb(0x2E, 0xA0, 0x6A), || Box::new(TasksApp::new())),
         icon("Terminal",   '>', Px::rgb(0x33, 0x33, 0x3A), || Box::new(ConsoleApp::new())),
         icon("Calculator", '=', Px::rgb(0x6B, 0x4F, 0xC9), || Box::new(CalcApp::new())),
         icon("Clock",      'C', Px::rgb(0xE8, 0x6B, 0x3D), || Box::new(ClockApp::new())),
         icon("Monitor",    'M', Px::rgb(0x36, 0xB9, 0xB0), || Box::new(SysMonApp::new())),
+        icon("Sys Info",   'i', Px::rgb(0x2D, 0x82, 0xF0), || Box::new(SysInfoApp::new())),
         icon("Chat",       '@', Px::rgb(0xE8, 0x4E, 0x95), move || Box::new(ChatApp::new(net_for_chat.clone()))),
         icon("Paint",      'P', Px::rgb(0xC8, 0x36, 0x52), || Box::new(PaintApp::new())),
         icon("Snake",      'S', Px::rgb(0x4F, 0xB8, 0x35), || Box::new(SnakeApp::new())),
+        icon("2048",       '2', Px::rgb(0xED, 0xC2, 0x2E), || Box::new(Game2048::new())),
+        icon("Mines",      '*', Px::rgb(0x4A, 0x6C, 0xD4), || Box::new(MinesApp::new())),
         icon("Disks",      'D', Px::rgb(0x6E, 0x6E, 0x82), || Box::new(DisksApp::new())),
         icon("Settings",   '*', Px::rgb(0x6B, 0x73, 0x80), move || Box::new(SettingsApp::new(net_for_settings.clone()))),
     ]
+}
+
+/// Open a representative set of windows — used only by the `--ppm
+/// DRDR_DEMO` snapshot path so generated screenshots show a working
+/// desktop (window chrome + real app text), never in a normal boot.
+pub fn open_demo_windows(wm: &mut WindowManager) {
+    wm.open(Rect::new(28, 60, 410, 330), Box::new(SysInfoApp::new()));
+    wm.open(Rect::new(470, 70, 300, 250), Box::new(Game2048::new()));
+    wm.open(Rect::new(250, 150, 360, 250), Box::new(CalcApp::new()));
+    wm.open(Rect::new(120, 280, 560, 360), Box::new(NotesApp::demo()));
 }
 
 impl LauncherApp {
@@ -1224,11 +1261,37 @@ pub struct NotesApp {
     top: usize,
     modified: bool,
     status: String,
+    /// Ticks elapsed since the last edit while still dirty — drives the
+    /// autosave so work is never lost just because Esc wasn't pressed.
+    autosave: u16,
 }
 
 impl NotesApp {
     pub fn new() -> Self {
         Self::open("notes.txt")
+    }
+
+    /// In-memory note with sample text — for the snapshot/demo path only
+    /// (no disk read), so screenshots show real prose, not an empty grid.
+    fn demo() -> Self {
+        let lines = vec![
+            "Welcome to DrDrOS Notes.".to_string(),
+            "".to_string(),
+            "Your text is saved with Esc and survives a reboot".to_string(),
+            "once a disk is mounted (open Disks, pick a volume).".to_string(),
+            "".to_string(),
+            "The font is now anti-aliased - smooth, not blocky.".to_string(),
+        ];
+        Self {
+            name: "notes.txt".to_string(),
+            lines,
+            cx: 0,
+            cy: 0,
+            top: 0,
+            modified: false,
+            status: "demo".to_string(),
+            autosave: 0,
+        }
     }
 
     fn open(name: &str) -> Self {
@@ -1251,6 +1314,7 @@ impl NotesApp {
             top: 0,
             modified: false,
             status,
+            autosave: 0,
         }
     }
 
@@ -1373,6 +1437,21 @@ impl WindowApp for NotesApp {
         AppControl::Continue
     }
 
+    fn on_tick(&mut self) -> AppControl {
+        // Autosave: a few seconds after the last edit, flush to storage so
+        // a note is never lost just because the user didn't press Esc.
+        if self.modified {
+            self.autosave = self.autosave.saturating_add(1);
+            if self.autosave >= 40 {
+                self.save();
+                self.autosave = 0;
+            }
+        } else {
+            self.autosave = 0;
+        }
+        AppControl::Continue
+    }
+
     fn render(&mut self, g: &mut TextGrid) {
         let rows = g.rows as usize;
         let text_rows = rows.saturating_sub(1);
@@ -1384,7 +1463,7 @@ impl WindowApp for NotesApp {
         g.text(
             0,
             0,
-            &format!("Esc=save  [{} lines]  {}", self.lines.len(), self.status),
+            &format!("Esc=save (autosaves)  [{} lines]  {}", self.lines.len(), self.status),
         );
         for vis in 0..text_rows {
             let li = self.top + vis;
@@ -2623,6 +2702,794 @@ impl WindowApp for SnakeApp {
     }
 }
 
+// ─── DrDrTasks — a persistent to-do list ─────────────────────────────
+
+/// A to-do list that **persists**. It loads and saves through
+/// [`drdr_store`], so your tasks survive a reboot once a disk is mounted
+/// — and it autosaves, so you never lose one. Type a task and press Enter
+/// to add it; click a task to tick it off, double-click to delete. This is
+/// the app that best shows DrDrOS storage doing its everyday job.
+pub struct TasksApp {
+    /// `(done, text)` per task.
+    tasks: Vec<(bool, String)>,
+    input: String,
+    status: String,
+    modified: bool,
+    autosave: u16,
+}
+
+const TASKS_FILE: &str = "tasks.txt";
+
+impl TasksApp {
+    pub fn new() -> Self {
+        let mut t = Self {
+            tasks: Vec::new(),
+            input: String::new(),
+            status: String::new(),
+            modified: false,
+            autosave: 0,
+        };
+        t.load();
+        t
+    }
+
+    fn load(&mut self) {
+        match drdr_store::load(TASKS_FILE) {
+            Ok(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                for line in s.lines() {
+                    let done = line.starts_with("[x]") || line.starts_with("[X]");
+                    let text = line
+                        .trim_start_matches(|c| matches!(c, '[' | ']' | 'x' | 'X' | ' '))
+                        .to_string();
+                    if !text.is_empty() {
+                        self.tasks.push((done, text));
+                    }
+                }
+                self.status = format!("loaded {} task(s)", self.tasks.len());
+            }
+            Err(_) => self.status = "new list".into(),
+        }
+    }
+
+    fn save(&mut self) {
+        let body: String = self
+            .tasks
+            .iter()
+            .map(|(d, t)| format!("[{}] {}\n", if *d { "x" } else { " " }, t))
+            .collect();
+        match drdr_store::save(TASKS_FILE, body.as_bytes()) {
+            Ok(_) => {
+                self.modified = false;
+                self.status = if drdr_store::data_is_persistent() {
+                    "saved (persistent)".into()
+                } else {
+                    "saved to RAM - mount a disk in Disks to keep it!".into()
+                };
+            }
+            Err(e) => self.status = format!("save failed: {e}"),
+        }
+    }
+
+    fn add(&mut self) {
+        let t = self.input.trim();
+        if !t.is_empty() {
+            self.tasks.push((false, t.to_string()));
+            self.input.clear();
+            self.modified = true;
+            self.save();
+        }
+    }
+}
+
+impl WindowApp for TasksApp {
+    fn title(&self) -> String {
+        let open = self.tasks.iter().filter(|(d, _)| !*d).count();
+        format!(
+            "Tasks - {} open / {} total{}",
+            open,
+            self.tasks.len(),
+            if self.modified { " *" } else { "" }
+        )
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match key {
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Space => self.input.push(' '),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.add(),
+            KeyCode::Escape => self.save(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, _col: u32, row: u32, double: bool) -> AppControl {
+        if row >= 3 {
+            let idx = (row - 3) as usize;
+            if idx < self.tasks.len() {
+                if double {
+                    self.tasks.remove(idx);
+                } else {
+                    self.tasks[idx].0 = !self.tasks[idx].0;
+                }
+                self.modified = true;
+                self.save();
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        if self.modified {
+            self.autosave = self.autosave.saturating_add(1);
+            if self.autosave >= 40 {
+                self.save();
+                self.autosave = 0;
+            }
+        } else {
+            self.autosave = 0;
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, "DrDrTasks - type + Enter to add   click=toggle done  double-click=delete");
+        g.text(0, 1, &format!("New task: {}_", self.input));
+        g.text(0, 2, &self.status);
+        let dim = Px::rgb(0x80, 0x86, 0x94);
+        let done_c = Px::rgb(0x3C, 0xA8, 0x4B);
+        for (i, (done, text)) in self.tasks.iter().enumerate() {
+            let row = i as u32 + 3;
+            if row >= g.rows {
+                break;
+            }
+            if *done {
+                let line = format!("[x] {text}");
+                g.write(0, row, "[x] ", done_c, g.bg());
+                g.write(4, row, text, dim, g.bg());
+                let _ = line;
+            } else {
+                g.text(0, row, &format!("[ ] {text}"));
+            }
+        }
+        if self.tasks.is_empty() {
+            g.text(0, 4, "(no tasks yet - type one above and press Enter)");
+        }
+    }
+}
+
+// ─── DrDr2048 — the sliding-tile game ────────────────────────────────
+
+#[derive(Copy, Clone)]
+enum Dir2048 {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// 2048 on a 4×4 board. Arrow keys slide and merge tiles; R starts a new
+/// game. Our own merge logic and a tiny xorshift PRNG — no crate.
+pub struct Game2048 {
+    board: [[u32; 4]; 4],
+    score: u32,
+    best: u32,
+    rng: u64,
+    over: bool,
+    won: bool,
+}
+
+impl Game2048 {
+    pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x2048_2048);
+        let mut g = Self {
+            board: [[0; 4]; 4],
+            score: 0,
+            best: 0,
+            rng: seed.max(1),
+            over: false,
+            won: false,
+        };
+        g.spawn();
+        g.spawn();
+        g
+    }
+
+    fn restart(&mut self) {
+        self.best = self.best.max(self.score);
+        self.board = [[0; 4]; 4];
+        self.score = 0;
+        self.over = false;
+        self.won = false;
+        self.spawn();
+        self.spawn();
+    }
+
+    fn xs(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn spawn(&mut self) {
+        let empties: Vec<(usize, usize)> = (0..4)
+            .flat_map(|y| (0..4).map(move |x| (x, y)))
+            .filter(|&(x, y)| self.board[y][x] == 0)
+            .collect();
+        if empties.is_empty() {
+            return;
+        }
+        let pick = (self.xs() as usize) % empties.len();
+        let (x, y) = empties[pick];
+        self.board[y][x] = if self.xs() % 10 == 0 { 4 } else { 2 };
+    }
+
+    /// The four cells of line `idx` in `dir`, ordered destination-first
+    /// (slide collapses everything toward element 0).
+    fn line_coords(idx: usize, dir: Dir2048) -> [(usize, usize); 4] {
+        match dir {
+            Dir2048::Left => [(0, idx), (1, idx), (2, idx), (3, idx)],
+            Dir2048::Right => [(3, idx), (2, idx), (1, idx), (0, idx)],
+            Dir2048::Up => [(idx, 0), (idx, 1), (idx, 2), (idx, 3)],
+            Dir2048::Down => [(idx, 3), (idx, 2), (idx, 1), (idx, 0)],
+        }
+    }
+
+    /// Collapse a line toward index 0, merging equal neighbours once.
+    /// Returns the new line, the score gained, and whether anything moved.
+    fn slide(row: [u32; 4]) -> ([u32; 4], u32, bool) {
+        let vals: Vec<u32> = row.iter().copied().filter(|&v| v != 0).collect();
+        let mut out: Vec<u32> = Vec::with_capacity(4);
+        let mut gained = 0;
+        let mut i = 0;
+        while i < vals.len() {
+            if i + 1 < vals.len() && vals[i] == vals[i + 1] {
+                let merged = vals[i] * 2;
+                out.push(merged);
+                gained += merged;
+                i += 2;
+            } else {
+                out.push(vals[i]);
+                i += 1;
+            }
+        }
+        let mut new = [0u32; 4];
+        for (j, v) in out.iter().enumerate() {
+            new[j] = *v;
+        }
+        (new, gained, new != row)
+    }
+
+    fn move_dir(&mut self, dir: Dir2048) -> bool {
+        let mut moved = false;
+        for idx in 0..4 {
+            let coords = Self::line_coords(idx, dir);
+            let row = [
+                self.board[coords[0].1][coords[0].0],
+                self.board[coords[1].1][coords[1].0],
+                self.board[coords[2].1][coords[2].0],
+                self.board[coords[3].1][coords[3].0],
+            ];
+            let (new, gained, m) = Self::slide(row);
+            moved |= m;
+            self.score += gained;
+            for (k, &(x, y)) in coords.iter().enumerate() {
+                self.board[y][x] = new[k];
+                if new[k] >= 2048 {
+                    self.won = true;
+                }
+            }
+        }
+        if moved {
+            self.spawn();
+            self.best = self.best.max(self.score);
+            if !self.any_moves() {
+                self.over = true;
+            }
+        }
+        moved
+    }
+
+    fn any_moves(&self) -> bool {
+        for y in 0..4 {
+            for x in 0..4 {
+                if self.board[y][x] == 0 {
+                    return true;
+                }
+                if x + 1 < 4 && self.board[y][x] == self.board[y][x + 1] {
+                    return true;
+                }
+                if y + 1 < 4 && self.board[y][x] == self.board[y + 1][x] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn tile_color(v: u32) -> Px {
+        match v {
+            2 => Px::rgb(0xEE, 0xE4, 0xDA),
+            4 => Px::rgb(0xED, 0xE0, 0xC8),
+            8 => Px::rgb(0xF2, 0xB1, 0x79),
+            16 => Px::rgb(0xF5, 0x95, 0x63),
+            32 => Px::rgb(0xF6, 0x7C, 0x5F),
+            64 => Px::rgb(0xF6, 0x5E, 0x3B),
+            128 => Px::rgb(0xED, 0xCF, 0x72),
+            256 => Px::rgb(0xED, 0xCC, 0x61),
+            512 => Px::rgb(0xED, 0xC8, 0x50),
+            1024 => Px::rgb(0xED, 0xC5, 0x3F),
+            _ => Px::rgb(0xED, 0xC2, 0x2E),
+        }
+    }
+}
+
+impl WindowApp for Game2048 {
+    fn title(&self) -> String {
+        format!("DrDr2048 - score {} (best {})", self.score, self.best.max(self.score))
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match key {
+            KeyCode::Left => {
+                self.move_dir(Dir2048::Left);
+            }
+            KeyCode::Right => {
+                self.move_dir(Dir2048::Right);
+            }
+            KeyCode::Up => {
+                self.move_dir(Dir2048::Up);
+            }
+            KeyCode::Down => {
+                self.move_dir(Dir2048::Down);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => self.restart(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let dark = Px::rgb(0x2B, 0x27, 0x22);
+        g.text(0, 0, &format!("Arrows = slide   R = new game    score {}", self.score));
+        if self.won {
+            g.write(0, 1, "You reached 2048!  keep going or press R", Px::rgb(0xF6, 0x5E, 0x3B), g.bg());
+        } else if self.over {
+            g.write(0, 1, "Game over - press R to try again", Px::rgb(0xF6, 0x5E, 0x3B), g.bg());
+        } else {
+            g.text(0, 1, "Merge equal tiles to reach 2048.");
+        }
+        // Each tile is a 6-wide × 3-tall block; the board starts at row 3.
+        let tw = 6u32;
+        let th = 3u32;
+        for by in 0..4u32 {
+            for bx in 0..4u32 {
+                let v = self.board[by as usize][bx as usize];
+                let ox = bx * tw;
+                let oy = 3 + by * th;
+                let (fill, fg) = if v == 0 {
+                    (Px::rgb(0x3A, 0x35, 0x2F), g.bg())
+                } else {
+                    let f = Self::tile_color(v);
+                    let text = if v <= 4 { dark } else { Px::rgb(0xFF, 0xFF, 0xFF) };
+                    (f, text)
+                };
+                // paint the tile block
+                for dy in 0..th {
+                    for dx in 0..tw {
+                        let cx = ox + dx;
+                        let cy = oy + dy;
+                        if cx < g.cols && cy < g.rows {
+                            g.put(cx, cy, ' ', fg, fill);
+                        }
+                    }
+                }
+                if v != 0 {
+                    let s = v.to_string();
+                    let tx = ox + (tw.saturating_sub(s.len() as u32)) / 2;
+                    let ty = oy + th / 2;
+                    if ty < g.rows {
+                        g.write(tx, ty, &s, fg, fill);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── DrDrMines — Minesweeper ─────────────────────────────────────────
+
+/// Classic Minesweeper, mouse-driven. Left-click reveals a cell;
+/// double-click toggles a flag. The first click is always safe (mines are
+/// placed afterwards, avoiding it), revealing flood-fills through empty
+/// regions. Press R for a new board.
+pub struct MinesApp {
+    w: usize,
+    h: usize,
+    mines: usize,
+    bomb: Vec<bool>,
+    revealed: Vec<bool>,
+    flagged: Vec<bool>,
+    adj: Vec<u8>,
+    placed: bool,
+    over: bool,
+    won: bool,
+    rng: u64,
+}
+
+impl MinesApp {
+    pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x4D_1235_7E15);
+        let (w, h, mines) = (16usize, 12usize, 30usize);
+        let mut m = Self {
+            w,
+            h,
+            mines,
+            bomb: vec![false; w * h],
+            revealed: vec![false; w * h],
+            flagged: vec![false; w * h],
+            adj: vec![0; w * h],
+            placed: false,
+            over: false,
+            won: false,
+            rng: seed.max(1),
+        };
+        m.reset();
+        m
+    }
+
+    fn reset(&mut self) {
+        let n = self.w * self.h;
+        self.bomb = vec![false; n];
+        self.revealed = vec![false; n];
+        self.flagged = vec![false; n];
+        self.adj = vec![0; n];
+        self.placed = false;
+        self.over = false;
+        self.won = false;
+    }
+
+    fn xs(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn idx(&self, x: usize, y: usize) -> usize {
+        y * self.w + x
+    }
+
+    fn place_mines(&mut self, safe: usize) {
+        let n = self.w * self.h;
+        let mut placed = 0;
+        while placed < self.mines && placed < n.saturating_sub(1) {
+            let p = (self.xs() as usize) % n;
+            if p == safe || self.bomb[p] {
+                continue;
+            }
+            self.bomb[p] = true;
+            placed += 1;
+        }
+        // Precompute adjacency counts.
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let mut c = 0u8;
+                for (nx, ny) in self.neighbors(x, y) {
+                    if self.bomb[self.idx(nx, ny)] {
+                        c += 1;
+                    }
+                }
+                let i = self.idx(x, y);
+                self.adj[i] = c;
+            }
+        }
+        self.placed = true;
+    }
+
+    fn neighbors(&self, x: usize, y: usize) -> Vec<(usize, usize)> {
+        let mut v = Vec::with_capacity(8);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && ny >= 0 && (nx as usize) < self.w && (ny as usize) < self.h {
+                    v.push((nx as usize, ny as usize));
+                }
+            }
+        }
+        v
+    }
+
+    fn reveal(&mut self, x: usize, y: usize) {
+        if !self.placed {
+            self.place_mines(self.idx(x, y));
+        }
+        let start = self.idx(x, y);
+        if self.revealed[start] || self.flagged[start] {
+            return;
+        }
+        if self.bomb[start] {
+            self.over = true;
+            // Reveal all bombs on loss.
+            for i in 0..self.bomb.len() {
+                if self.bomb[i] {
+                    self.revealed[i] = true;
+                }
+            }
+            return;
+        }
+        // Flood-fill through zero-adjacency cells.
+        let mut stack = vec![(x, y)];
+        while let Some((cx, cy)) = stack.pop() {
+            let i = self.idx(cx, cy);
+            if self.revealed[i] || self.flagged[i] {
+                continue;
+            }
+            self.revealed[i] = true;
+            if self.adj[i] == 0 && !self.bomb[i] {
+                for (nx, ny) in self.neighbors(cx, cy) {
+                    if !self.revealed[self.idx(nx, ny)] {
+                        stack.push((nx, ny));
+                    }
+                }
+            }
+        }
+        self.check_win();
+    }
+
+    fn check_win(&mut self) {
+        let revealed = self.revealed.iter().filter(|&&r| r).count();
+        if revealed == self.w * self.h - self.mines {
+            self.won = true;
+        }
+    }
+
+    fn flags_used(&self) -> usize {
+        self.flagged.iter().filter(|&&f| f).count()
+    }
+
+    fn number_color(n: u8) -> Px {
+        match n {
+            1 => Px::rgb(0x42, 0x8A, 0xF0),
+            2 => Px::rgb(0x3C, 0xA8, 0x4B),
+            3 => Px::rgb(0xE0, 0x4F, 0x4F),
+            4 => Px::rgb(0x6B, 0x4F, 0xC9),
+            5 => Px::rgb(0xC0, 0x6A, 0x2A),
+            6 => Px::rgb(0x36, 0xB9, 0xB0),
+            7 => Px::rgb(0xC8, 0x36, 0x52),
+            _ => Px::rgb(0x88, 0x88, 0x88),
+        }
+    }
+}
+
+impl WindowApp for MinesApp {
+    fn title(&self) -> String {
+        let state = if self.won {
+            "  WON!"
+        } else if self.over {
+            "  BOOM"
+        } else {
+            ""
+        };
+        format!(
+            "DrDrMines - {} mines, {} flagged{}",
+            self.mines,
+            self.flags_used(),
+            state
+        )
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if matches!(key, KeyCode::Char('r') | KeyCode::Char('R')) {
+            self.reset();
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, double: bool) -> AppControl {
+        if self.over || self.won {
+            return AppControl::Continue;
+        }
+        // Board starts at row 2; cells are 1 char wide.
+        if row < 2 {
+            return AppControl::Continue;
+        }
+        let x = col as usize;
+        let y = (row - 2) as usize;
+        if x >= self.w || y >= self.h {
+            return AppControl::Continue;
+        }
+        let i = self.idx(x, y);
+        if double {
+            // Toggle a flag (only on hidden cells).
+            if !self.revealed[i] {
+                self.flagged[i] = !self.flagged[i];
+            }
+        } else {
+            self.reveal(x, y);
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let hint = if self.over {
+            "BOOM - press R for a new board"
+        } else if self.won {
+            "Cleared! every safe cell found - press R"
+        } else {
+            "click = reveal   double-click = flag   R = new board"
+        };
+        g.text(0, 0, hint);
+        g.text(
+            0,
+            1,
+            &format!("mines {}   flags {}", self.mines, self.flags_used()),
+        );
+        let hidden = Px::rgb(0x6B, 0x73, 0x80);
+        let open_bg = g.bg();
+        for y in 0..self.h {
+            let row = y as u32 + 2;
+            if row >= g.rows {
+                break;
+            }
+            for x in 0..self.w {
+                let cx = x as u32;
+                if cx >= g.cols {
+                    break;
+                }
+                let i = self.idx(x, y);
+                if self.flagged[i] && !self.revealed[i] {
+                    g.put(cx, row, 'F', Px::rgb(0xE8, 0x4E, 0x4E), open_bg);
+                } else if !self.revealed[i] {
+                    g.put(cx, row, '#', open_bg, hidden);
+                } else if self.bomb[i] {
+                    g.put(cx, row, '*', Px::rgb(0xFF, 0xFF, 0xFF), Px::rgb(0xC8, 0x36, 0x52));
+                } else if self.adj[i] == 0 {
+                    g.put(cx, row, '.', Px::rgb(0x55, 0x55, 0x55), open_bg);
+                } else {
+                    let n = self.adj[i];
+                    g.put(
+                        cx,
+                        row,
+                        (b'0' + n) as char,
+                        Self::number_color(n),
+                        open_bg,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ─── DrDrFetch — a system-info card ──────────────────────────────────
+
+/// A "neofetch"-style card: a DrDrOS wordmark beside live system facts —
+/// hostname, kernel, uptime, memory, CPU, process count, and where your
+/// files are being saved. Refreshes on the heartbeat.
+pub struct SysInfoApp;
+
+impl SysInfoApp {
+    pub fn new() -> Self {
+        SysInfoApp
+    }
+}
+
+fn first_line_field(path: &str, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.split_once(':') {
+            if rest.0.trim() == key {
+                return Some(rest.1.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn fmt_uptime(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else {
+        format!("{m}m {s}s")
+    }
+}
+
+impl WindowApp for SysInfoApp {
+    fn title(&self) -> String {
+        "System Info".into()
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let accent = Px::rgb(0x2D, 0x82, 0xF0);
+        // A compact DrDrOS logo on the left.
+        let logo = [
+            "####  ####  ####  #### #### ####",
+            "#   # #   # #   # #    #  # #   ",
+            "#   # ####  #   # #### #  # ####",
+            "#   # #  #  #   # #    #  #    #",
+            "####  #   # ####  #### #### ####",
+        ];
+        for (i, l) in logo.iter().enumerate() {
+            g.write(1, i as u32 + 1, l, accent, g.bg());
+        }
+
+        let host = fs::read_to_string("/etc/hostname")
+            .or_else(|_| fs::read_to_string("/proc/sys/kernel/hostname"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "drdros".into());
+        let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into());
+        let cpu = first_line_field("/proc/cpuinfo", "model name")
+            .unwrap_or_else(|| "unknown CPU".into());
+        let mem_total = meminfo_kb("MemTotal");
+        let mem_avail = meminfo_kb("MemAvailable");
+        let mem_used = mem_total.saturating_sub(mem_avail);
+        let up = fmt_uptime(uptime_secs());
+        let procs = proc_count();
+        let data = drdr_store::data_dir();
+        let persist = if drdr_store::data_is_persistent() {
+            "persistent disk"
+        } else {
+            "RAM (not saved across reboots)"
+        };
+
+        let mut row = 8u32;
+        let mut line = |g: &mut TextGrid, k: &str, v: &str| {
+            g.write(1, row, k, accent, g.bg());
+            g.text(14, row, v);
+            row += 1;
+        };
+        line(g, "Host", &host);
+        line(g, "OS", "DrDrOS (custom Rust userland)");
+        line(g, "Kernel", &format!("Linux {kernel}"));
+        line(g, "Uptime", &up);
+        line(g, "CPU", &cpu);
+        line(
+            g,
+            "Memory",
+            &format!(
+                "{} / {} MiB used",
+                mem_used / 1024,
+                mem_total / 1024
+            ),
+        );
+        line(g, "Processes", &procs.to_string());
+        line(g, "Desktop", &format!("drdr-desk v{}", env!("CARGO_PKG_VERSION")));
+        line(g, "Storage", persist);
+        line(g, "Data dir", &data.display().to_string());
+    }
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -2734,5 +3601,73 @@ mod app_tests {
         // 10:42 UTC on any day past epoch — minutes of day = 10*60+42.
         let ts = (10 * 60 + 42) * 60;
         assert_eq!(fmt_hhmm(ts), "10:42");
+    }
+
+    #[test]
+    fn g2048_slide_merges_once_toward_zero() {
+        // [2,2,2,2] → [4,4,0,0], gained 8, moved.
+        let (new, gained, moved) = Game2048::slide([2, 2, 2, 2]);
+        assert_eq!(new, [4, 4, 0, 0]);
+        assert_eq!(gained, 8);
+        assert!(moved);
+        // Already-collapsed line doesn't move.
+        let (_, _, moved) = Game2048::slide([4, 2, 0, 0]);
+        assert!(!moved);
+        // A single gap closes up (moved) without merging.
+        let (new, gained, moved) = Game2048::slide([0, 2, 0, 4]);
+        assert_eq!(new, [2, 4, 0, 0]);
+        assert_eq!(gained, 0);
+        assert!(moved);
+    }
+
+    #[test]
+    fn g2048_right_move_collapses_to_the_right() {
+        let mut g = Game2048::new();
+        g.board = [[2, 2, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        let moved = g.move_dir(Dir2048::Right);
+        assert!(moved);
+        // The 2+2 merged into a 4 pinned to the right edge…
+        assert_eq!(g.board[0][3], 4);
+        // …and a new random tile (2 or 4) spawned somewhere.
+        let nonzero: u32 = g.board.iter().flatten().filter(|&&v| v != 0).count() as u32;
+        assert_eq!(nonzero, 2);
+    }
+
+    #[test]
+    fn mines_first_click_is_always_safe_and_counts_adjacency() {
+        let mut m = MinesApp::new();
+        m.reveal(5, 5);
+        // The first-clicked cell can never be a bomb.
+        assert!(!m.bomb[m.idx(5, 5)]);
+        assert!(m.revealed[m.idx(5, 5)]);
+        assert!(!m.over);
+        // Adjacency of every cell equals its real neighbour-bomb count.
+        for y in 0..m.h {
+            for x in 0..m.w {
+                let want = m
+                    .neighbors(x, y)
+                    .iter()
+                    .filter(|&&(nx, ny)| m.bomb[m.idx(nx, ny)])
+                    .count() as u8;
+                assert_eq!(m.adj[m.idx(x, y)], want);
+            }
+        }
+    }
+
+    #[test]
+    fn tasks_round_trip_done_marker_parsing() {
+        // The on-disk format is "[x] text" / "[ ] text"; loading must
+        // recover the done flag and the text.
+        let mut t = TasksApp { tasks: vec![], input: String::new(), status: String::new(), modified: false, autosave: 0 };
+        // Simulate what load() parses, line by line.
+        for line in ["[x] buy milk", "[ ] write code"] {
+            let done = line.starts_with("[x]");
+            let text = line
+                .trim_start_matches(|c| matches!(c, '[' | ']' | 'x' | 'X' | ' '))
+                .to_string();
+            t.tasks.push((done, text));
+        }
+        assert_eq!(t.tasks[0], (true, "buy milk".to_string()));
+        assert_eq!(t.tasks[1], (false, "write code".to_string()));
     }
 }

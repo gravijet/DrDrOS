@@ -335,6 +335,55 @@ fn discover_marked_volume() -> Option<PathBuf> {
     None
 }
 
+/// Best-effort: make storage persistent **automatically**, so a user who
+/// just wants to "save a file" doesn't have to open Disks first.
+///
+/// This is deliberately conservative — a storage layer that silently
+/// scribbles on the wrong disk is worse than no storage layer:
+///
+///   1. If the data dir is already persistent (a `.drdros`-marked volume
+///      from a previous session is mounted, or the user already chose
+///      one), do nothing.
+///   2. Otherwise mount the **largest removable, writable** partition —
+///      i.e. the USB stick DrDrOS typically boots from, never an internal
+///      system disk — and adopt it. A `.drdros` marker is dropped so the
+///      next boot rediscovers it via [`data_dir`] step 2, with no probing.
+///
+/// Tiny partitions (< 64 MiB: EFI System Partition, boot) are skipped, and
+/// a read-only mount is rejected (the marker write fails, we unmount and
+/// move on). Returns the adopted data dir, or `None` if RAM stays the
+/// store. Never panics, never blocks on a missing disk.
+pub fn auto_adopt() -> Option<PathBuf> {
+    if data_is_persistent() {
+        return None;
+    }
+    let mut cands: Vec<BlockDev> = list_block_devices()
+        .into_iter()
+        .filter(|d| d.partition && d.removable && d.mountpoint.is_none())
+        .collect();
+    // Largest first: the user's data partition, not a small EFI/boot one.
+    cands.sort_by(|a, b| b.blocks.cmp(&a.blocks));
+    for d in cands {
+        if d.size_mb() < 64 {
+            continue;
+        }
+        let target = format!("/mnt/{}", d.name);
+        if mount_device(&d.dev_path(), &target).is_err() {
+            continue;
+        }
+        // set_data_dir creates Documents + the marker; on a read-only
+        // mount those writes fail, so a successful return proves the
+        // volume is actually usable for saving.
+        match set_data_dir(Path::new(&target)) {
+            Ok(()) => return Some(data_dir()),
+            Err(_) => {
+                let _ = unmount(&target);
+            }
+        }
+    }
+    None
+}
+
 /// Is the current data dir on persistent media (true) or RAM (false)?
 pub fn data_is_persistent() -> bool {
     let dir = data_dir();
