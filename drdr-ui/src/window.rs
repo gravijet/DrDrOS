@@ -29,7 +29,9 @@
 use crate::input::{KeyCode, MouseButton, MouseEvent};
 use crate::{Rect, Theme};
 use drdr_fb::{Framebuffer, Pixel};
-use drdr_font::{GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph};
+use drdr_font::{
+    GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph_aa, draw_glyph_scaled_aa, draw_text_aa,
+};
 
 // ─── Layout constants ────────────────────────────────────────────────
 
@@ -1200,31 +1202,24 @@ impl WindowManager {
         fb.fill_round_rect_corners(x, y, w, header_h, RADIUS, RADIUS, 0, 0, theme.accent);
         let title = "DrDrOS shortcuts";
         let title_w = GLYPH_WIDTH * title.len() as u32 * 2;
-        // Big centred title
-        for (i, ch) in title.bytes().enumerate() {
-            let glyph = drdr_font::glyph_for(ch);
+        // Big, smooth (anti-aliased) centred title.
+        for (i, ch) in title.chars().enumerate() {
             let gx = x + (w.saturating_sub(title_w)) / 2 + i as u32 * GLYPH_WIDTH * 2;
             let gy = y + 8;
-            for (row, bits) in glyph.iter().enumerate() {
-                for col in 0..8u32 {
-                    if *bits & (0x80u8 >> col) != 0 {
-                        fb.fill_rect(gx + col * 2, gy + row as u32 * 2, 2, 2, theme.accent_fg);
-                    }
-                }
-            }
+            draw_glyph_scaled_aa(fb, gx, gy, ch, theme.accent_fg, 2);
         }
 
         let mut ry = y + header_h + pad;
         for (key, desc) in lines {
-            drdr_font::draw_text(fb, x + pad, ry, key, theme.accent, theme.surface);
-            drdr_font::draw_text(fb, x + pad + key_w + pad, ry, desc, theme.fg, theme.surface);
+            draw_text_aa(fb, x + pad, ry, key, theme.accent, theme.surface);
+            draw_text_aa(fb, x + pad + key_w + pad, ry, desc, theme.fg, theme.surface);
             ry += row_h;
         }
 
         // Footer hint
         let hint = "press any key to close";
         let hw = GLYPH_WIDTH * hint.len() as u32;
-        drdr_font::draw_text(
+        draw_text_aa(
             fb,
             x + (w.saturating_sub(hw)) / 2,
             y + h.saturating_sub(GLYPH_HEIGHT + 6),
@@ -1330,8 +1325,8 @@ impl WindowManager {
             let lx = tile_x + (ICON_TILE.saturating_sub(lw)) / 2;
             // Subtle dark shadow behind label so it stays legible over
             // both light and dark wallpapers without per-theme tuning.
-            drdr_font::draw_text(fb, lx + 1, label_y + 1, &shown, Pixel::rgba(0, 0, 0, 90).over(theme.bg), theme.bg);
-            drdr_font::draw_text(fb, lx, label_y, &shown, theme.fg, theme.bg);
+            draw_text_aa(fb, lx + 1, label_y + 1, &shown, Pixel::rgba(0, 0, 0, 90).over(theme.bg), theme.bg);
+            draw_text_aa(fb, lx, label_y, &shown, theme.fg, theme.bg);
         }
     }
 
@@ -1362,7 +1357,7 @@ impl WindowManager {
         );
         let ty = sb.y + (tb.h.saturating_sub(GLYPH_HEIGHT)) / 2;
         // Bitmap font is ASCII-only — a clean word beats a tofu glyph.
-        drdr_font::draw_text(fb, sb.x + 14, ty, "DrDrOS", sfg, sbg);
+        draw_text_aa(fb, sb.x + 14, ty, "DrDrOS", sfg, sbg);
 
         // One rounded chip per open window.
         let slot_w = self.taskbar_slot_w();
@@ -1397,7 +1392,7 @@ impl WindowManager {
             let label = win.app.title();
             let maxc = ((slot_w - 12) / GLYPH_WIDTH) as usize;
             let label: String = label.chars().take(maxc).collect();
-            drdr_font::draw_text(fb, x + 10, ty, &label, fg, bg);
+            draw_text_aa(fb, x + 10, ty, &label, fg, bg);
             x += slot_w;
         }
 
@@ -1423,8 +1418,8 @@ impl WindowManager {
                 theme.bg.lerp(theme.accent, 30),
             );
         }
-        drdr_font::draw_text(fb, cx, mid, &self.clock, theme.fg, theme.surface);
-        drdr_font::draw_text(
+        draw_text_aa(fb, cx, mid, &self.clock, theme.fg, theme.surface);
+        draw_text_aa(
             fb,
             cx,
             mid + GLYPH_HEIGHT,
@@ -1468,7 +1463,7 @@ impl WindowManager {
                     bg,
                 );
             }
-            drdr_font::draw_text(fb, m.x + 16, ry + 3, label, fg, bg);
+            draw_text_aa(fb, m.x + 16, ry + 3, label, fg, bg);
         }
     }
 }
@@ -1497,31 +1492,19 @@ fn luminance_for(p: Pixel) -> u32 {
     (p.r as u32 * 299 + p.g as u32 * 587 + p.b as u32 * 114) / 1000
 }
 
-/// Draw a single bitmap glyph scaled `scale`× by replicating pixels —
-/// used by the desktop icons (large logos) and the boot wordmark.
+/// Draw a single bitmap glyph scaled `scale`× with **anti-aliased** edges
+/// (a smooth resample of the pixel art, not blocky replicated squares) —
+/// used by the desktop icons (large logos) and the wordmark. Composites
+/// over the back buffer so it sits cleanly on a tinted tile.
 fn draw_glyph_scaled(fb: &mut Framebuffer, x: u32, y: u32, ch: char, fg: Pixel, scale: u32) {
-    let glyph = drdr_font::glyph_for(ch as u8);
-    for (row, bits) in glyph.iter().enumerate() {
-        for col in 0..8u32 {
-            if *bits & (0x80u8 >> col) != 0 {
-                fb.fill_rect(x + col * scale, y + row as u32 * scale, scale, scale, fg);
-            }
-        }
-    }
+    draw_glyph_scaled_aa(fb, x, y, ch, fg, scale);
 }
 
-/// 2×-scaled text for the wallpaper wordmark (no second font needed).
+/// 2×-scaled, anti-aliased text for the wallpaper wordmark.
 fn draw_text_2x(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: Pixel) {
     let mut cx = x;
-    for ch in text.bytes() {
-        let glyph = drdr_font::glyph_for(ch);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..8u32 {
-                if *bits & (0x80u8 >> col) != 0 {
-                    fb.fill_rect(cx + col * 2, y + row as u32 * 2, 2, 2, fg);
-                }
-            }
-        }
+    for ch in text.chars() {
+        draw_glyph_scaled_aa(fb, cx, y, ch, fg, 2);
         cx += GLYPH_WIDTH * 2;
     }
 }
@@ -1579,7 +1562,7 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
     let ty = r.y + (TITLE_H.saturating_sub(GLYPH_HEIGHT)) / 2;
     let maxc = ((r.w.saturating_sub(BTN_W * 3 + 16)) / GLYPH_WIDTH) as usize;
     let title: String = title.chars().take(maxc.max(1)).collect();
-    drdr_font::draw_text(fb, r.x + 14, ty, &title, bar_fg, bar_color);
+    draw_text_aa(fb, r.x + 14, ty, &title, bar_fg, bar_color);
 
     // ── Window controls: minimise / maximise / close ────────────────
     // Close reddens on hover (Windows convention); maximise toggles
@@ -1623,7 +1606,7 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
         };
         let gx = b.x + (b.w.saturating_sub(GLYPH_WIDTH)) / 2;
         let gy = b.y + (b.h.saturating_sub(GLYPH_HEIGHT)) / 2;
-        draw_glyph(fb, gx, gy, g, glyph_fg, cell_bg);
+        draw_glyph_aa(fb, gx, gy, g, glyph_fg, cell_bg);
     }
 
     // ── App content ─────────────────────────────────────────────────
@@ -1652,7 +1635,7 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
             let cell = win.grid.cell(gx, gy);
             let pxg = content.x + gx * GLYPH_WIDTH;
             let pyg = content.y + gy * GLYPH_HEIGHT;
-            draw_glyph(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
+            draw_glyph_aa(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
         }
     }
 }

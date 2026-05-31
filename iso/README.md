@@ -9,8 +9,45 @@ into a hybrid ISO that boots:
 - under any VM that takes `-cdrom` (QEMU, VirtualBox, VMware, ...).
 
 The bootloader is **GRUB**, packaged via `grub-mkrescue` — no isolinux
-dependency. EFI works out of the box; legacy BIOS works too as long as
-`grub-pc-bin` is installed alongside `grub-common`.
+dependency. EFI works out of the box (needs `grub-efi-amd64-bin`); legacy
+BIOS works too as long as `grub-pc-bin` is installed alongside
+`grub-common`.
+
+The generated `grub.cfg` is hardened for real UEFI hardware:
+`search --file` re-finds the volume holding the kernel (so Ventoy / a
+USB stick whose layout the firmware remapped still boots), `all_video` +
+`gfxpayload=keep` hand the live GOP framebuffer to the kernel (no black
+screen on efifb/simpledrm), and a **"safe graphics"** menu entry
+(`nomodeset video=efifb`) is there for panels where the KMS driver
+misbehaves.
+
+## ⚠ It boots in QEMU but not on my Surface / ThinkPad
+
+Ninety-nine times out of a hundred this is **Secure Boot**, not the ISO.
+`grub-mkrescue` produces an *unsigned* GRUB binary, and UEFI firmware
+refuses to launch unsigned bootloaders while Secure Boot is on — the
+machine shows "No bootable device" or jumps straight back to Windows,
+looking exactly like the media isn't bootable.
+
+Disable Secure Boot, then pick the USB stick from the firmware boot menu:
+
+- **Surface Go 2** — power off. Hold **Volume-Up**, tap **Power**, keep
+  holding Volume-Up → UEFI menu → **Security → Secure Boot → Disabled**
+  (or "Microsoft & 3rd party CA"). Then hold **Volume-Down** + tap
+  **Power** to boot from USB.
+- **ThinkPad T14** — tap **Enter** (then **F1**) at the logo → **Security
+  → Secure Boot → Disabled**; make sure **Boot Mode = UEFI** (not
+  Legacy/CSM). **F12** at boot to pick the USB stick.
+
+Other things that look like "won't boot":
+
+- **Ventoy:** if normal mode chainloads to a blank screen, press
+  **Ctrl-r** on the Ventoy menu to use **GRUB2 Mode**, or just `dd` the
+  ISO straight to a dedicated stick.
+- **BIOS-only ISO on a UEFI machine:** if you built without
+  `grub-efi-amd64-bin` the ISO has no EFI image and a UEFI-only laptop
+  won't see it. `iso/build.sh` now errors out up front if that package
+  is missing.
 
 ## One-shot
 
@@ -44,7 +81,7 @@ bash iso/build.sh \
 ├── bzImage              ← Linux kernel
 ├── rootfs.cpio.gz       ← DrDrOS initramfs (runs entirely in RAM)
 └── grub/
-    └── grub.cfg         ← two boot entries: quiet + verbose (serial)
+    └── grub.cfg         ← three entries: desktop · safe-graphics · verbose
 ```
 
 ## ISO requirements
@@ -62,8 +99,14 @@ For legacy BIOS booting also install:
 
 - `grub-pc-bin`
 
+For UEFI booting (Surface Go 2, ThinkPad T14, every modern PC):
+
+- `grub-efi-amd64-bin` — the x86_64-efi GRUB modules. Without it
+  `grub-mkrescue` builds a BIOS-only ISO that a UEFI-only machine cannot
+  boot at all; `iso/build.sh` errors out if it is missing.
+
 One-liner for Debian/Ubuntu:
 
 ```sh
-sudo apt-get install -y grub-common xorriso mtools grub-pc-bin
+sudo apt-get install -y grub-common grub-efi-amd64-bin xorriso mtools grub-pc-bin
 ```

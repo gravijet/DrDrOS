@@ -14,10 +14,10 @@ and scheduling; everything above it is ours.
 | **Language** | Rust (memory-safe, fast, modern) |
 | **Display** | Linux framebuffer (`/dev/fb0`) — no X11, no Wayland, no DE |
 | **Pixel formats** | 16 / 24 / 32 bpp, any RGB/BGR channel order (real efifb/simpledrm, not just QEMU) |
-| **Storage** | Runs from RAM; **opt-in persistence** — mount a disk and your files survive a reboot |
+| **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop: taskbar + Start menu, draggable windows, a dozen apps, optional disk storage |
+| **Status** | Boots to a modern desktop: taskbar + Start menu, draggable windows, **anti-aliased text**, ~20 apps incl. games, automatic disk persistence |
 
 ### What you actually get when it boots
 
@@ -34,17 +34,29 @@ graphical desktop — no login, no shell, no X11:
   cycle, a hand-drawn cursor, a Launcher that returns if you close
   everything, so the desktop is never a dead end.
 - **A dozen-plus windowed apps** — Files, Text Editor, **Notes**
-  (persistent), **Calculator** (our own expression parser), **Clock &
-  Calendar**, **System Monitor** (live CPU/RAM/load from `/proc`),
-  **DrDrConsole** (a no-PTY command interpreter), **DrDrChat** (LAN
-  chat between DrDrOS machines), **DrDrPaint** (mouse-driven block
-  drawing), **DrDrSnake** (the game, on a tick-driven canvas), **Disks**,
-  **Settings**, the DrDrNet panel, About, and the power menu.
-- **Real, opt-in persistence (DrDrStore)** — everything runs from RAM by
-  default. Open **Disks**, pick a partition, and DrDrOS mounts it
-  (probing ext4/vfat/exfat/ntfs/…) and makes it your data directory.
-  Notes and saved files now survive a reboot, and the disk is
-  auto-rediscovered next time via a `.drdros` marker.
+  (persistent + autosaving), **Tasks** (a persistent to-do list),
+  **Calculator** (our own expression parser), **Clock & Calendar**,
+  **System Monitor** (live CPU/RAM/load from `/proc`), **System Info**
+  (a neofetch-style card), **DrDrConsole** (a no-PTY command
+  interpreter), **DrDrChat** (LAN chat between DrDrOS machines),
+  **DrDrPaint** (mouse-driven block drawing), and the games
+  **DrDrSnake**, **DrDr2048** and **DrDrMines** (Minesweeper), plus
+  **Disks**, **Settings**, the DrDrNet panel, About, and the power menu.
+- **Smooth, anti-aliased text** — the hand-drawn 8×16 bitmap font is now
+  resampled in software: letters stay crisp and full-strength while their
+  diagonal staircases get a soft edge, and large logos/icons render as
+  smooth rounded shapes instead of fat square pixels. No second font, no
+  TTF parser — the same pixel art, de-pixelated at draw time.
+- **Real persistence (DrDrStore), now automatic** — everything runs from
+  RAM by default, but on boot DrDrOS quietly mounts the largest
+  **removable, writable** disk it finds (the USB stick you booted from)
+  and points your Documents folder at it — so Notes / Tasks / the editor
+  **save for real without any setup**, and **autosave** flushes work even
+  if you never press save. You can still pick a specific volume in
+  **Disks** (probing ext4/vfat/exfat/ntfs3/…); either way the disk is
+  auto-rediscovered next boot via a `.drdros` marker. The kernel now
+  carries the USB-storage / SCSI / NVMe / MMC stack and the
+  ext4/vfat/exfat/ntfs3 filesystems so a real disk actually appears.
 - **DrDrNet, over the wire** — the original length-prefixed binary
   protocol now runs on every interface, not just loopback. Two DrDrOS
   machines on the same LAN find each other automatically via a tiny
@@ -119,12 +131,12 @@ Every pixel and keystroke above is handled by code in this repository.
 | **drdr-edit** | binary | DrDrEdit — vi-style modal text editor |
 | **drdr-files** | binary | DrDrFiles — batch lister + interactive TUI file browser |
 | **drdr-fb** | library | DrDrFb — framebuffer access for **16/24/32bpp, any channel order** |
-| **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyph renderer |
+| **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyphs **+ a software anti-aliaser** (crisp strokes, soft edges, smooth scaled logos) |
 | **drdr-ui** | library | DrDrUI — widgets, Theme (light + dark), `TextGrid`/`WindowApp`, the WM **+ taskbar/Start-menu shell**, `InputHub` (kbd + mouse + **touchscreen**), VT takeover |
 | **drdr-store** | library | DrDrStore — block-device discovery, mounting, and a `save`/`load` API so files persist beyond RAM |
 | **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
 | **drdr-net** | library | DrDrNet — custom binary protocol + a hand-rolled epoll reactor (Tier 3 async) **+ UDP-broadcast peer discovery + a chat sub-protocol** so two DrDrOS machines on a LAN find each other and talk |
-| **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) |
+| **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) + `linux-storage.config` (USB-storage/SCSI/NVMe/MMC + ext4/vfat/exfat/ntfs3 so disks mount + persist) |
 | **iso/** | tooling | xorriso pipeline producing the bootable `drdros.iso` |
 | **scripts/** | tooling | `qemu.sh` runner · `stats.sh` (auto-updates the numbers below) |
 
@@ -145,10 +157,11 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **13616 lines** across **21 files** |
-| Workspace crates | **12** (every `drdr-*`) |
-| Tests | **80** (`cargo test`, all green) |
-| Git commits | **41** |
+| Rust source | **14832 lines** across **21 files** |
+| Workspace crates | **0
+0** (every `drdr-*`) |
+| Tests | **86** (`cargo test`, all green) |
+| Git commits | **42** |
 | Tracked files (excl. `buildroot/`) | **49** |
 | Development window | 2026-05-14
 ? → 2026-05-26 |
@@ -157,14 +170,14 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-ui    |  3775 | GUI framework + WM + shell |
-| drdr-desk  |  3356 | window manager + apps |
+| drdr-desk  |  4309 | window manager + apps |
+| drdr-ui    |  3758 | GUI framework + WM + shell |
 | drdr-net   |  1911 | binary proto + reactor |
 | drdr-fb    |   888 | framebuffer (all bpp) |
-| drdr-font  |   659 | 8x16 glyphs |
+| drdr-font  |   886 | 8x16 glyphs |
+| drdr-store |   562 | persistent storage |
 | drdr-shell |   562 | shell |
-| drdr-init  |   537 | PID 1 / supervisor |
-| drdr-store |   513 | persistent storage |
+| drdr-init  |   541 | PID 1 / supervisor |
 | drdr-files |   498 | file browser |
 | drdr-edit  |   463 | modal editor |
 | drdr-demo  |   268 | widget showcase |
@@ -221,6 +234,23 @@ Lines of Rust per crate (largest first):
       (peer list + log + composer; broadcasts to every known peer),
       **DrDrPaint** (palette + click/drag block painting), and
       **DrDrSnake** (tick-driven game).
+- [x] **Phase 9 — Smoother, more, and it actually keeps your files**
+      *(this release)*
+      **Anti-aliased text** everywhere (`drdr-font` resamples its own
+      pixel art at draw time — crisp strokes, soft edges, smooth scaled
+      logos/icons) · **storage that just works**: DrDrStore auto-adopts
+      a removable writable disk on boot and Notes/Tasks/editor
+      **autosave**, so files persist with no setup · a kernel
+      `linux-storage.config` fragment (USB-storage · SCSI · NVMe · MMC ·
+      ext4/vfat/exfat/ntfs3 + NLS) so a real USB stick / SD card / disk
+      enumerates and mounts at all · **four new apps**: **Tasks**
+      (persistent to-do), **DrDr2048**, **DrDrMines** (Minesweeper),
+      **System Info** (neofetch-style card) · a hardened bootable ISO —
+      `grub.cfg` uses `search --file` + `gfxpayload=keep` + a
+      "safe graphics" entry, and `iso/build.sh` fails fast on a missing
+      UEFI GRUB and prints exact **Secure-Boot-off** steps for the
+      Surface Go 2 / ThinkPad T14 (the real reason a custom ISO won't
+      boot on them).
 
 ---
 

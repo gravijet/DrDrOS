@@ -348,8 +348,9 @@ fn draw_splash_with(path: &str, status: &str) -> std::io::Result<String> {
     let title_y = fb.height / 2 - GLYPH_HEIGHT;
     let sub_y = fb.height / 2 + GLYPH_HEIGHT / 2;
 
-    // A 2x-scaled wordmark reads as a logo, not console text.
-    draw_text_scaled(&mut fb, title_x.saturating_sub(title_w / 2), title_y.saturating_sub(GLYPH_HEIGHT / 2), title, theme.accent, 2);
+    // A 3x-scaled, anti-aliased wordmark reads as a smooth logo, not
+    // blocky console text — same look the desktop hands off to.
+    draw_text_scaled(&mut fb, title_x.saturating_sub(title_w / 2), title_y.saturating_sub(GLYPH_HEIGHT / 2), title, theme.accent, theme.bg, 2);
     draw_text(&mut fb, sub_x, sub_y, sub, theme.muted, theme.bg);
 
     // An indeterminate progress bar so a slow real-hardware boot looks
@@ -369,19 +370,22 @@ fn draw_splash_with(path: &str, status: &str) -> std::io::Result<String> {
     Ok(desc)
 }
 
-/// Draw `text` with each glyph blown up `scale`x by replicating pixels —
-/// cheap "big text" for the boot wordmark without a second font.
-fn draw_text_scaled(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: drdr_fb::Pixel, scale: u32) {
+/// Draw `text` `scale`× larger with anti-aliased edges — a smooth boot
+/// wordmark from the same bitmap font. Uses the opaque-over-`bg` AA path
+/// because the splash paints straight onto the device framebuffer (where
+/// the alpha-compositing `blend_pixel` can't read pixels back).
+fn draw_text_scaled(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    text: &str,
+    fg: drdr_fb::Pixel,
+    bg: drdr_fb::Pixel,
+    scale: u32,
+) {
     let mut cx = x;
-    for ch in text.bytes() {
-        let glyph = drdr_font::glyph_for(ch);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..8u32 {
-                if *bits & (0x80u8 >> col) != 0 {
-                    fb.fill_rect(cx + col * scale, y + row as u32 * scale, scale, scale, fg);
-                }
-            }
-        }
+    for ch in text.chars() {
+        drdr_font::draw_glyph_scaled_aa_over(fb, cx, y, ch, fg, bg, scale);
         cx += GLYPH_WIDTH * scale;
     }
 }

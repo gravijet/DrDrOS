@@ -30,7 +30,7 @@ pub mod vt;
 pub mod window;
 
 use drdr_fb::{Framebuffer, Pixel};
-use drdr_font::{draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
+use drdr_font::{draw_text_aa as draw_text, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 pub use drdr_fb::{Framebuffer as Fb, Pixel as Px};
 pub use input::{
