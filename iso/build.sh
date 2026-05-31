@@ -152,6 +152,17 @@ menuentry "DrDrOS — safe graphics (force EFI framebuffer)" {
     initrd /boot/rootfs.cpio.gz
 }
 
+menuentry "DrDrOS — maximum compatibility (simpledrm, slow but sure)" {
+    # The most conservative path: let the kernel bind the GOP framebuffer
+    # GRUB handed over via SYSFB/simpledrm, force a single CPU, and disable
+    # power-management quirks that wedge some firmwares early. Try this if
+    # BOTH entries above hang before the desktop appears.
+    set gfxpayload=keep
+    linux  /boot/bzImage console=tty0 nomodeset video=simplefb:off \
+           intel_idle.max_cstate=1 nosmp loglevel=4
+    initrd /boot/rootfs.cpio.gz
+}
+
 menuentry "DrDrOS — verbose boot (serial + tty0)" {
     linux  /boot/bzImage console=tty0 console=ttyS0 loglevel=7
     initrd /boot/rootfs.cpio.gz
