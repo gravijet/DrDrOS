@@ -206,6 +206,202 @@ pub fn draw_text(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: Pixel, bg
     }
 }
 
+// ─── Anti-aliased rendering ──────────────────────────────────────────
+//
+// The 8×16 bitmap is crisp but visibly *pixelated* — its 1-bit edges
+// staircase, which is exactly the "looks retro / blocky" complaint. We
+// keep the same hand-drawn glyphs (no second font, no TTF parser) and
+// soften their edges in software instead: treat the 1-bit cell as a
+// coverage field and *resample* it. Where the bitmap transitions on→off
+// the resample lands a partial value, so the renderer can blend the
+// foreground a fraction of the way toward the background — a smooth,
+// modern edge from the very same pixel art.
+//
+// Two paths:
+//   - `draw_text_aa` / `draw_glyph_aa`: 1×, opaque, edges blended over a
+//     known `bg`. Drop-in for body text and window chrome; works on any
+//     framebuffer (it writes opaque colours, never reads back).
+//   - `draw_glyph_scaled_aa`: the big logo/icon path. Supersamples the
+//     glyph at the *target* (scaled) resolution so a 4× icon letter is a
+//     smooth rounded shape, not a staircase of fat square pixels.
+
+/// Coverage (0.0 = off, 1.0 = on) of the glyph at integer cell
+/// `(col, row)`. Out-of-range is empty so edges fade to nothing.
+#[inline]
+fn glyph_bit(glyph: &[u8; 16], col: i32, row: i32) -> f32 {
+    if row < 0 || row >= 16 || col < 0 || col >= 8 {
+        return 0.0;
+    }
+    if glyph[row as usize] & (0x80u8 >> col as u8) != 0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Bilinear sample of the 1-bit glyph at fractional glyph-pixel position
+/// `(fx, fy)` (pixel centres sit on integer coordinates). Between two
+/// cells this returns the linear blend, which is what produces the soft
+/// edge.
+#[inline]
+fn sample_bilinear(glyph: &[u8; 16], fx: f32, fy: f32) -> f32 {
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let c00 = glyph_bit(glyph, x0, y0);
+    let c10 = glyph_bit(glyph, x0 + 1, y0);
+    let c01 = glyph_bit(glyph, x0, y0 + 1);
+    let c11 = glyph_bit(glyph, x0 + 1, y0 + 1);
+    let top = c00 * (1.0 - tx) + c10 * tx;
+    let bot = c01 * (1.0 - tx) + c11 * tx;
+    top * (1.0 - ty) + bot * ty
+}
+
+/// Per-byte 1× anti-aliased coverage, computed once and cached. Each
+/// entry is the 8×16 cell as `u8` alpha (0..255). Independent of colour,
+/// so a single table serves every fg/bg pair.
+fn aa_table() -> &'static [[u8; 128]] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<[u8; 128]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0u16..256)
+            .map(|b| {
+                let glyph = glyph_for(b as u8);
+                let mut cov = [0u8; 128];
+                for row in 0..16u32 {
+                    for col in 0..8u32 {
+                        // The glyph strokes are only 1px wide, so naively
+                        // resampling would *dim* them (a 1px feature never
+                        // reaches full coverage). Instead we keep every
+                        // "on" pixel fully opaque — the letter stays crisp
+                        // at full strength — and add a soft halo only on
+                        // the surrounding "off" pixels. That fills the
+                        // diagonal staircase steps without washing the text
+                        // out: smoothing, not blurring.
+                        if glyph_bit(glyph, col as i32, row as i32) > 0.5 {
+                            cov[(row * 8 + col) as usize] = 255;
+                            continue;
+                        }
+                        // 2×2 supersample of the neighbourhood (wider
+                        // ±0.42 so a diagonal neighbour contributes), then
+                        // damp it a little so halos stay subtle.
+                        let mut c = 0.0f32;
+                        for oy in [-0.42f32, 0.42] {
+                            for ox in [-0.42f32, 0.42] {
+                                c += sample_bilinear(glyph, col as f32 + ox, row as f32 + oy);
+                            }
+                        }
+                        cov[(row * 8 + col) as usize] = (c * 0.25 * 0.85 * 255.0).round() as u8;
+                    }
+                }
+                cov
+            })
+            .collect()
+    })
+}
+
+/// Anti-aliased single glyph at `(x, y)`, edges blended over `bg`.
+/// Writes opaque colours (no read-back), so it is correct on the real
+/// device framebuffer as well as the canonical back buffer.
+pub fn draw_glyph_aa(fb: &mut Framebuffer, x: u32, y: u32, c: char, fg: Pixel, bg: Pixel) {
+    let byte = if c.is_ascii() { c as u8 } else { 0 };
+    let cov = &aa_table()[byte as usize];
+    for row in 0..16u32 {
+        for col in 0..8u32 {
+            let a = cov[(row * 8 + col) as usize];
+            let color = match a {
+                0 => bg,
+                255 => fg,
+                _ => bg.lerp(fg, a),
+            };
+            fb.put_pixel(x + col, y + row, color);
+        }
+    }
+}
+
+/// Anti-aliased string — the smooth counterpart to [`draw_text`].
+pub fn draw_text_aa(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: Pixel, bg: Pixel) {
+    let mut cursor_x = x;
+    for c in text.chars() {
+        draw_glyph_aa(fb, cursor_x, y, c, fg, bg);
+        cursor_x = cursor_x.saturating_add(GLYPH_WIDTH);
+    }
+}
+
+/// Anti-aliased *scaled* glyph: render one character `scale`× larger with
+/// smooth edges, alpha-composited (`blend_pixel`) over whatever is already
+/// in `fb`. This is the big-logo path — desktop icons, the wallpaper
+/// wordmark, the help-panel title — where the old pixel-replication looked
+/// blocky. Only correct on the canonical back buffer (it composites).
+pub fn draw_glyph_scaled_aa(fb: &mut Framebuffer, x: u32, y: u32, ch: char, fg: Pixel, scale: u32) {
+    let scale = scale.max(1);
+    let byte = if ch.is_ascii() { ch as u8 } else { 0 };
+    let glyph = glyph_for(byte);
+    let w = GLYPH_WIDTH * scale;
+    let h = GLYPH_HEIGHT * scale;
+    let inv = 1.0 / scale as f32;
+    for oy in 0..h {
+        for ox in 0..w {
+            // 2×2 supersample inside this output pixel, mapped back into
+            // glyph-pixel space (centres aligned).
+            let mut c = 0.0f32;
+            for sy in [0.25f32, 0.75] {
+                for sx in [0.25f32, 0.75] {
+                    let gx = (ox as f32 + sx) * inv - 0.5;
+                    let gy = (oy as f32 + sy) * inv - 0.5;
+                    c += sample_bilinear(glyph, gx, gy);
+                }
+            }
+            let a = (c * 0.25 * 255.0).round() as u8;
+            if a == 0 {
+                continue;
+            }
+            fb.blend_pixel(x + ox, y + oy, Pixel::rgba(fg.r, fg.g, fg.b, a));
+        }
+    }
+}
+
+/// Anti-aliased scaled glyph blended over a *known* solid `bg` (opaque
+/// writes, no read-back) — the variant for the boot splash, which paints
+/// straight onto the device framebuffer where `blend_pixel` can't read.
+pub fn draw_glyph_scaled_aa_over(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    ch: char,
+    fg: Pixel,
+    bg: Pixel,
+    scale: u32,
+) {
+    let scale = scale.max(1);
+    let byte = if ch.is_ascii() { ch as u8 } else { 0 };
+    let glyph = glyph_for(byte);
+    let w = GLYPH_WIDTH * scale;
+    let h = GLYPH_HEIGHT * scale;
+    let inv = 1.0 / scale as f32;
+    for oy in 0..h {
+        for ox in 0..w {
+            let mut c = 0.0f32;
+            for sy in [0.25f32, 0.75] {
+                for sx in [0.25f32, 0.75] {
+                    let gx = (ox as f32 + sx) * inv - 0.5;
+                    let gy = (oy as f32 + sy) * inv - 0.5;
+                    c += sample_bilinear(glyph, gx, gy);
+                }
+            }
+            let a = (c * 0.25 * 255.0).round() as u8;
+            let color = match a {
+                0 => continue,
+                255 => fg,
+                _ => bg.lerp(fg, a),
+            };
+            fb.put_pixel(x + ox, y + oy, color);
+        }
+    }
+}
+
 // ─── Glyph bitmaps ───────────────────────────────────────────────────
 // Drawn on a 6-wide grid inside the 8-wide cell (1px side bearing). Read
 // each block top-to-bottom: it *is* the letter. Caps fill art rows 0..6;
@@ -655,5 +851,36 @@ mod tests {
         let mut fb = Framebuffer::in_memory(64, 16);
         // Should not panic and should light *some* pixels for "Ag".
         draw_text(&mut fb, 0, 0, "Ag", Pixel::WHITE, Pixel::BLACK);
+    }
+
+    #[test]
+    fn aa_softens_edges() {
+        // The whole point of the AA path: a diagonal-edged glyph must
+        // produce at least one *partial* coverage value (a grey edge),
+        // not just hard 0/255 like the bitmap. 'A' has diagonals.
+        let cov = &aa_table()[b'A' as usize];
+        let partials = cov.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partials > 0, "AA produced no soft edge pixels");
+        // …and a solid full-coverage interior must still exist (we didn't
+        // blur the letter into mush).
+        assert!(cov.iter().any(|&a| a == 255));
+    }
+
+    #[test]
+    fn aa_blends_toward_background_on_an_edge() {
+        // draw_glyph_aa writes opaque colours that, on an edge cell, lie
+        // strictly between fg and bg — proof the blend is happening.
+        let mut fb = Framebuffer::in_memory(8, 16);
+        draw_glyph_aa(&mut fb, 0, 0, 'A', Pixel::WHITE, Pixel::BLACK);
+        let mut saw_grey = false;
+        for y in 0..16 {
+            for x in 0..8 {
+                let p = fb.get_pixel(x, y);
+                if p.r > 0 && p.r < 255 {
+                    saw_grey = true;
+                }
+            }
+        }
+        assert!(saw_grey, "no anti-aliased (grey) pixel found");
     }
 }
