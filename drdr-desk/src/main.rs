@@ -86,6 +86,12 @@ fn main() -> ExitCode {
         let mut fb = Framebuffer::in_memory(1024, 768);
         let mut wm = WindowManager::new(fb.width, fb.height);
         build_desktop(&mut wm, shared_net.clone());
+        // DRDR_DEMO opens a few representative windows so a snapshot shows
+        // a real working desktop (chrome + app text), not just the empty
+        // icon grid. Default (no env) keeps the clean-desktop snapshot.
+        if std::env::var_os("DRDR_DEMO").is_some() {
+            apps::open_demo_windows(&mut wm);
+        }
         wm.tick();
         wm.draw(&mut fb, &theme);
         return match fb.write_ppm(path) {
@@ -143,6 +149,18 @@ fn main() -> ExitCode {
     wm.draw(&mut back, &theme);
     fb.present(&back);
     eprintln!("[drdr-desk] first frame on screen");
+
+    // ── Step 3.5: make storage persistent automatically, in the
+    //    background. If a removable, writable disk is present (the USB
+    //    stick we usually boot from), DrDrStore mounts it and points the
+    //    Documents folder at it — so Notes / the editor save for real
+    //    without the user opening Disks first. Done off-thread because a
+    //    cold USB enumerate + filesystem probe can take a moment on real
+    //    hardware, and the desktop is already on screen.
+    thread::spawn(|| match drdr_store::auto_adopt() {
+        Some(dir) => eprintln!("[drdr-desk] storage: adopted persistent data dir {}", dir.display()),
+        None => eprintln!("[drdr-desk] storage: no removable disk adopted (saving to RAM until you pick one in Disks)"),
+    });
 
     // ── Step 4: start DrDrNet in the background. The desktop is now
     //    on screen, so a slow UDP-broadcast bind on real hardware can
