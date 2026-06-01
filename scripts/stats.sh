@@ -49,8 +49,11 @@ LOC=$( (printf '%s\n' "${RS_FILES[@]}" | xargs wc -l 2>/dev/null | tail -1 | awk
 TESTS=$( (grep -hoE '#\[(test|tokio::test)\]' "${RS_FILES[@]}" 2>/dev/null | wc -l) || echo 0)
 
 # Workspace crate count = members listed in the root Cargo.toml.
-CRATES=$(awk '/^\s*members\s*=\s*\[/{f=1;next} /\]/{f=0} f{print}' Cargo.toml \
-          | grep -c '"' || echo 0)
+# Use POSIX character classes (mawk has no \s) so the members block is
+# actually matched; grep -c already prints 0 on no match, so don't append
+# a second "0" with `|| echo 0` (that produced a broken two-line count).
+CRATES=$(awk '/^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/{f=1;next} /\]/{f=0} f' Cargo.toml \
+          | grep -c '"')
 
 # --- per-crate line counts, biggest first -----------------------------
 declare -A CRATE_LOC
