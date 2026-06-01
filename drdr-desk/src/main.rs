@@ -27,6 +27,7 @@
 
 mod apps;
 mod net;
+mod wifi;
 
 use std::env;
 use std::process::ExitCode;
