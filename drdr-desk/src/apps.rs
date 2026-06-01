@@ -4339,16 +4339,49 @@ struct Iface {
 /// interfaces from `/sys/class/net`, flags which are wireless, shows
 /// DrDrNet's LAN peers, and explains how to bring Wi-Fi up. Real data,
 /// honest about what the current build can and can't do.
+/// Which screen of the Network panel is showing.
+#[derive(PartialEq, Eq)]
+enum NetView {
+    Interfaces,
+    Wifi,
+    Password,
+}
+
 pub struct NetworkApp {
     net: SharedNet,
     ifaces: Vec<Iface>,
     sel: usize,
     status: String,
+    view: NetView,
+    wifi_iface: Option<String>,
+    networks: Vec<crate::wifi::Network>,
+    wifi_status: crate::wifi::WifiStatus,
+    msg: String,
+    pw: String,
+    pw_ssid: String,
+    /// Countdown after a scan request before results are read; also the
+    /// periodic status-refresh timer.
+    scan_ticks: u8,
+    tick: u8,
 }
 
 impl NetworkApp {
     pub fn new(net: SharedNet) -> Self {
-        let mut a = Self { net, ifaces: Vec::new(), sel: 0, status: String::new() };
+        let mut a = Self {
+            net,
+            ifaces: Vec::new(),
+            sel: 0,
+            status: String::new(),
+            view: NetView::Interfaces,
+            wifi_iface: None,
+            networks: Vec::new(),
+            wifi_status: Default::default(),
+            msg: String::new(),
+            pw: String::new(),
+            pw_ssid: String::new(),
+            scan_ticks: 0,
+            tick: 0,
+        };
         a.reload();
         a
     }
@@ -4356,7 +4389,32 @@ impl NetworkApp {
     fn reload(&mut self) {
         self.ifaces = list_ifaces();
         self.sel = self.sel.min(self.ifaces.len().saturating_sub(1));
+        self.wifi_iface = crate::wifi::wireless_ifaces().into_iter().next();
         self.status = format!("{} interface(s)", self.ifaces.len());
+    }
+
+    /// Enter the Wi-Fi view and kick off a scan.
+    fn start_wifi(&mut self) {
+        let Some(iface) = self.wifi_iface.clone() else {
+            self.msg = "no Wi-Fi radio found".into();
+            return;
+        };
+        self.view = NetView::Wifi;
+        self.sel = 0;
+        self.msg = match crate::wifi::trigger_scan(&iface) {
+            Ok(()) => "scanning...".into(),
+            Err(e) => e,
+        };
+        self.scan_ticks = 4; // ~1s before reading results
+    }
+
+    fn do_connect(&mut self, ssid: &str, psk: &str) {
+        let Some(iface) = self.wifi_iface.clone() else { return };
+        self.msg = match crate::wifi::connect(&iface, ssid, psk) {
+            Ok(()) => format!("connecting to {ssid}..."),
+            Err(e) => e,
+        };
+        self.view = NetView::Wifi;
     }
 }
 
@@ -4380,15 +4438,96 @@ fn list_ifaces() -> Vec<Iface> {
 
 impl WindowApp for NetworkApp {
     fn title(&self) -> String {
-        "Network & Wi-Fi".into()
+        match self.view {
+            NetView::Interfaces => "Network & Wi-Fi".into(),
+            _ => format!(
+                "Wi-Fi{}",
+                if self.wifi_status.connected() {
+                    format!(" - {}", self.wifi_status.ssid)
+                } else {
+                    String::new()
+                }
+            ),
+        }
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
-        match key {
-            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
-            KeyCode::Down => self.sel = (self.sel + 1).min(self.ifaces.len().saturating_sub(1)),
-            KeyCode::Char('r') => self.reload(),
-            _ => {}
+        match self.view {
+            NetView::Interfaces => match key {
+                KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+                KeyCode::Down => self.sel = (self.sel + 1).min(self.ifaces.len().saturating_sub(1)),
+                KeyCode::Char('r') => self.reload(),
+                KeyCode::Char('w') | KeyCode::Enter => self.start_wifi(),
+                _ => {}
+            },
+            NetView::Wifi => match key {
+                KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+                KeyCode::Down => self.sel = (self.sel + 1).min(self.networks.len().saturating_sub(1)),
+                KeyCode::Char('s') => self.start_wifi(),
+                KeyCode::Backspace | KeyCode::Left => self.view = NetView::Interfaces,
+                KeyCode::Enter => {
+                    if let Some(n) = self.networks.get(self.sel).cloned() {
+                        if n.is_open() {
+                            self.do_connect(&n.ssid, "");
+                        } else {
+                            self.pw.clear();
+                            self.pw_ssid = n.ssid.clone();
+                            self.view = NetView::Password;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            NetView::Password => match key {
+                KeyCode::Char(c) => self.pw.push(c),
+                KeyCode::Space => self.pw.push(' '),
+                KeyCode::Backspace => {
+                    self.pw.pop();
+                }
+                KeyCode::Enter => {
+                    let (ssid, pw) = (self.pw_ssid.clone(), std::mem::take(&mut self.pw));
+                    self.do_connect(&ssid, &pw);
+                }
+                KeyCode::Escape => self.view = NetView::Wifi,
+                _ => {}
+            },
+        }
+        AppControl::Continue
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        // Only touch wpa_supplicant from the Wi-Fi screens (keeps the
+        // Interfaces view — and the host snapshot — free of subprocesses).
+        if self.view == NetView::Interfaces {
+            return AppControl::Continue;
+        }
+        if self.scan_ticks > 0 {
+            self.scan_ticks -= 1;
+            if self.scan_ticks == 0 {
+                if let Some(iface) = &self.wifi_iface {
+                    self.networks = crate::wifi::scan_results(iface);
+                    self.msg = format!("{} network(s) found", self.networks.len());
+                }
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick % 8 == 0 {
+            if let Some(iface) = &self.wifi_iface {
+                self.wifi_status = crate::wifi::status(iface);
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, _c: u32, row: u32, double: bool) -> AppControl {
+        if self.view == NetView::Wifi && row >= 3 {
+            let idx = (row - 3) as usize;
+            if idx < self.networks.len() {
+                self.sel = idx;
+                if double {
+                    return self.on_key(KeyCode::Enter);
+                }
+            }
         }
         AppControl::Continue
     }
@@ -4397,52 +4536,84 @@ impl WindowApp for NetworkApp {
         let teal = Px::rgb(0x2B, 0x9B, 0x8A);
         let muted = Px::rgb(0x8C, 0x8C, 0x96);
         let red = Px::rgb(0xC8, 0x2B, 0x2B);
-        g.write(0, 0, "Network interfaces   (r = rescan)", teal, g.bg());
-        g.text(0, 1, "NAME        TYPE   STATE     LINK  MAC");
-        let mut row = 2u32;
-        for (i, f) in self.ifaces.iter().enumerate() {
-            let kind = if f.wireless { "wifi" } else if f.name == "lo" { "loop" } else { "lan" };
-            let link = if f.carrier { "up" } else { "down" };
-            let line = format!(
-                "{:<11} {:<6} {:<9} {:<5} {}",
-                f.name, kind, f.state, link, f.mac
-            );
-            if i == self.sel {
-                selected(g, row, &line);
-            } else {
-                g.text(0, row, &line);
+        let green = Px::rgb(0x2E, 0x9E, 0x4F);
+        match self.view {
+            NetView::Interfaces => {
+                g.write(0, 0, "Network interfaces   (w = scan Wi-Fi, r = rescan)", teal, g.bg());
+                g.text(0, 1, "NAME        TYPE   STATE     LINK  MAC");
+                let mut row = 2u32;
+                for (i, f) in self.ifaces.iter().enumerate() {
+                    let kind = if f.wireless { "wifi" } else if f.name == "lo" { "loop" } else { "lan" };
+                    let link = if f.carrier { "up" } else { "down" };
+                    let line = format!("{:<11} {:<6} {:<9} {:<5} {}", f.name, kind, f.state, link, f.mac);
+                    if i == self.sel {
+                        selected(g, row, &line);
+                    } else {
+                        g.text(0, row, &line);
+                    }
+                    row += 1;
+                }
+                if self.ifaces.is_empty() {
+                    g.write(0, row, "(no interfaces found)", red, g.bg());
+                    row += 1;
+                }
+                row += 1;
+                match net_snapshot(&self.net) {
+                    Some(net) => {
+                        let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();
+                        g.write(0, row, &format!("DrDrNet: online, {} LAN peer(s)", peers.len()), teal, g.bg());
+                    }
+                    None => {
+                        g.write(0, row, "DrDrNet: starting...", muted, g.bg());
+                    }
+                }
+                row += 2;
+                match &self.wifi_iface {
+                    Some(w) => {
+                        g.write(0, row, &format!("Wi-Fi radio: {w}  -  press 'w' to scan and connect"), green, g.bg());
+                    }
+                    None => {
+                        g.write(0, row, "No Wi-Fi radio. Wired Ethernet auto-connects via DHCP.", muted, g.bg());
+                    }
+                }
             }
-            row += 1;
-        }
-        if self.ifaces.is_empty() {
-            g.write(0, row, "(no interfaces found)", red, g.bg());
-            row += 1;
-        }
-        row += 1;
-        // DrDrNet LAN peers, if networking has come up.
-        match net_snapshot(&self.net) {
-            Some(net) => {
-                let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();
-                g.write(0, row, &format!("DrDrNet: online, {} LAN peer(s)", peers.len()), teal, g.bg());
+            NetView::Wifi => {
+                let iface = self.wifi_iface.clone().unwrap_or_default();
+                g.write(0, 0, &format!("Wi-Fi on {iface}   (Enter=connect  s=rescan  Backspace=back)"), teal, g.bg());
+                if self.wifi_status.connected() {
+                    g.write(0, 1, &format!("Connected: {}  IP {}", self.wifi_status.ssid, self.wifi_status.ip), green, g.bg());
+                } else if !self.msg.is_empty() {
+                    g.write(0, 1, &self.msg, muted, g.bg());
+                }
+                g.text(0, 2, "SIGNAL  SECURITY  SSID");
+                let visible = (g.rows as usize).saturating_sub(3);
+                for (i, n) in self.networks.iter().take(visible).enumerate() {
+                    let bars: String = (0..4).map(|b| if (b as u8) < n.bars() { '|' } else { '.' }).collect();
+                    let lock = if n.is_open() { "open" } else { "lock" };
+                    let line = format!("[{bars}]  {:<6} {}", lock, n.ssid);
+                    let row = i as u32 + 3;
+                    if i == self.sel {
+                        selected(g, row, &line);
+                    } else {
+                        g.text(0, row, &line);
+                    }
+                }
+                if self.networks.is_empty() {
+                    g.write(0, 3, "(no networks yet - press 's' to scan)", muted, g.bg());
+                }
             }
-            None => {
-                g.write(0, row, "DrDrNet: starting...", muted, g.bg());
+            NetView::Password => {
+                g.write(0, 0, &format!("Connect to: {}", self.pw_ssid), teal, g.bg());
+                let stars: String = std::iter::repeat_n('*', self.pw.chars().count()).collect();
+                g.text(0, 2, &format!("Password: {stars}_"));
+                g.write(0, 4, "Enter = connect    Esc = cancel", muted, g.bg());
+                g.text(0, 6, "WPA2/WPA3 is handled by wpa_supplicant; DrDrOS");
+                g.text(0, 7, "writes the config and brings the link up, then");
+                g.text(0, 8, "udhcpc pulls an address.");
             }
         }
-        row += 2;
-        let any_wifi = self.ifaces.iter().any(|f| f.wireless);
-        if any_wifi {
-            g.text(0, row, "A Wi-Fi radio was detected. To join a network you");
-            g.text(0, row + 1, "need credentials; a wpa_supplicant front-end is on");
-            g.text(0, row + 2, "the roadmap. Wired/LAN works automatically via DHCP.");
-        } else {
-            g.write(0, row, "No Wi-Fi radio enumerated.", muted, g.bg());
-            g.text(0, row + 1, "Wired Ethernet is brought up automatically. Wi-Fi");
-            g.text(0, row + 2, "needs the wireless kernel modules + firmware (see");
-            g.text(0, row + 3, "buildroot/external/linux-wifi.config).");
-        }
-        if !self.status.is_empty() {
-            g.write(0, g.rows.saturating_sub(1), &self.status, muted, g.bg());
+        if !self.msg.is_empty() && self.view != NetView::Password {
+            g.write(0, g.rows.saturating_sub(1), &self.msg, muted, g.bg());
         }
     }
 }

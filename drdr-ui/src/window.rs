@@ -49,11 +49,11 @@ const BTN_W: u32 = TITLE_H;
 const TASKBAR_H: u32 = GLYPH_HEIGHT + 22;
 /// Soft drop-shadow reach (px) — how far the shadow extends past the
 /// window edge. Larger = softer, Win11/macOS look.
-const SHADOW_REACH: i32 = 18;
-/// Corner radius for windows, taskbar and Start menu — modern UIs use
-/// 6-10px; 8 reads clearly without eating too many pixels on small
-/// framebuffers.
-const RADIUS: u32 = 8;
+const SHADOW_REACH: i32 = 24;
+/// Corner radius for windows, taskbar and Start menu. Windows 11 uses a
+/// generous ~10-12px radius on top-level windows; 12 reads clearly as
+/// "rounded" without eating too many pixels on small framebuffers.
+const RADIUS: u32 = 12;
 
 // ─── TextGrid — the surface apps draw into ───────────────────────────
 
@@ -455,8 +455,8 @@ const SNAP_EDGE: i32 = 20;
 const ICON_TILE: u32 = 92;
 /// Gap between icons (horizontal AND vertical), in px.
 const ICON_GAP: u32 = 24;
-/// Rounded-corner radius of the icon tile.
-const ICON_RADIUS: u32 = 14;
+/// Rounded-corner radius of the icon tile (Win11-style "squircle" feel).
+const ICON_RADIUS: u32 = 20;
 /// Vertical padding above the icon grid (under the screen top).
 const ICON_GRID_TOP: u32 = 64;
 
@@ -1118,11 +1118,18 @@ impl WindowManager {
         set_fb_pointer((self.pointer_x, self.pointer_y));
         let (w, h) = (fb.width, fb.height);
 
-        // Wallpaper: a soft vertical gradient + a faint centred wordmark
-        // so a bare desktop reads as DrDrOS, not a crash.
+        // Wallpaper: a soft vertical gradient + a Windows-11-style radial
+        // "bloom" glow in the accent hue (two big, very faint discs), then
+        // a faint centred wordmark so a bare desktop reads as DrDrOS.
         let top = theme.bg;
-        let bot = theme.bg.lerp(theme.accent, 22);
+        let bot = theme.bg.lerp(theme.accent, 24);
         fb.fill_rect_v(0, 0, w, h, top, bot);
+        // Cheap bloom: a couple of large, low-alpha accent discs. Painted
+        // once per frame over the gradient — soft, modern, not noisy.
+        let glow = Pixel::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 16);
+        let big = w.max(h) as i32;
+        fb.fill_circle((w as i32) * 30 / 100, (h as i32) * 24 / 100, big * 55 / 100, glow);
+        fb.fill_circle((w as i32) * 82 / 100, (h as i32) * 88 / 100, big * 45 / 100, glow);
         // Soft DrDrOS wordmark watermark only when nothing else fills
         // the wallpaper — once the user has icons the mark becomes
         // visual noise, so we skip it.
@@ -1345,9 +1352,14 @@ impl WindowManager {
 
     fn draw_taskbar(&self, fb: &mut Framebuffer, theme: &Theme) {
         let tb = self.taskbar_rect();
-        // Frosted bar: solid surface with a 1px accent-tinted hairline
-        // at the top so the bar reads as floating above the wallpaper.
-        fb.fill_rect(tb.x, tb.y, tb.w, tb.h, theme.surface);
+        // Acrylic bar: a near-opaque translucent surface so the wallpaper
+        // bloom faintly shows through (the Win11 "Mica/Acrylic" look),
+        // with a 1px accent-tinted hairline at the top so it reads as
+        // floating above the wallpaper.
+        fb.shade_rect(
+            tb.x, tb.y, tb.w, tb.h,
+            Pixel::rgba(theme.surface.r, theme.surface.g, theme.surface.b, 235),
+        );
         fb.fill_rect(tb.x, tb.y, tb.w, 1, theme.accent.lerp(theme.bg, 80));
 
         // Start button — accent chip with rounded corners + wordmark.
@@ -1524,14 +1536,15 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
     let r = win.rect;
     let radius = RADIUS.min(r.w / 2).min(r.h / 2);
 
-    // ── Title bar — flat color, only the TOP two corners rounded so it
-    //    meets the content area below with a clean straight seam.
+    // ── Title bar — Windows-11 "Mica" style: the bar shares the window's
+    //    surface colour so the title bar and body read as one continuous
+    //    rounded sheet, rather than a heavy coloured strip. The focused
+    //    bar gets a barely-there accent wash + an accent hairline below;
+    //    an unfocused bar greys back toward the wallpaper.
     let (bar_color, bar_fg) = if focused {
-        (theme.accent, theme.accent_fg)
+        (theme.surface.lerp(theme.accent, 12), theme.fg)
     } else {
-        // A slightly tinted surface so an unfocused bar still reads as
-        // chrome (distinct from the content area below).
-        (theme.surface.lerp(theme.muted, 26), theme.muted)
+        (theme.surface.lerp(theme.bg, 55), theme.muted)
     };
     fb.fill_round_rect_corners(
         r.x, r.y, r.w, TITLE_H,

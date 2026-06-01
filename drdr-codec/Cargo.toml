@@ -1,0 +1,15 @@
+# DrDrCodec — from-scratch decoders for the common binary file formats a
+# desktop has to open: DEFLATE/zlib, PNG, ZIP (+ DOCX, which is a ZIP) and
+# enough PDF to pull text out. No external crates — same rule as the rest
+# of DrDrOS: if the algorithm already exists in a library, we write our own.
+
+[package]
+name         = "drdr-codec"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+license      = { workspace = true }
+
+[dependencies]
