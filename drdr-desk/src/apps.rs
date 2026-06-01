@@ -206,6 +206,9 @@ impl FilesApp {
             let app: Box<dyn WindowApp> = match classify(&it.name) {
                 FileClass::Image => Box::new(ImageApp::open(path)),
                 FileClass::Web => Box::new(BrowserApp::open(path)),
+                FileClass::Pdf => Box::new(PdfApp::open(path)),
+                FileClass::Archive => Box::new(ArchiveApp::open(path)),
+                FileClass::Media => Box::new(MediaApp::open(path)),
                 FileClass::Binary => Box::new(BinaryInfoApp::open(path)),
                 _ => Box::new(EditApp::new(path)),
             };
@@ -1004,12 +1007,23 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
 pub fn open_demo_windows(wm: &mut WindowManager) {
     // Show the editor on a real source file so the snapshot captures the
     // menu bar + syntax highlighting, plus the browser homepage.
-    wm.open(Rect::new(20, 48, 520, 360), Box::new(EditApp::new("drdr-desk/src/main.rs")));
+    wm.open(Rect::new(16, 44, 470, 330), Box::new(EditApp::new("drdr-desk/src/main.rs")));
     // A file-manager window so the snapshot shows the new Places sidebar.
-    wm.open(Rect::new(60, 250, 470, 320), Box::new(FilesApp::new(PathBuf::from("/"))));
-    wm.open(Rect::new(560, 60, 430, 320), Box::new(BrowserApp::new()));
-    wm.open(Rect::new(600, 360, 320, 220), Box::new(Game2048::new()));
-    wm.open(Rect::new(330, 430, 300, 150), Box::new(CalcApp::new()));
+    wm.open(Rect::new(40, 230, 430, 300), Box::new(FilesApp::new(PathBuf::from("/"))));
+    // If demo media exist (the snapshot script writes them), show the real
+    // image decode + the media-info panel; otherwise these windows just
+    // show a friendly "not found" pane and do no harm.
+    let img = std::path::Path::new("/tmp/drdr-demo.jpg");
+    if img.exists() {
+        wm.open(Rect::new(560, 44, 440, 360), Box::new(ImageApp::open(img.into())));
+    } else {
+        wm.open(Rect::new(560, 44, 430, 300), Box::new(BrowserApp::new()));
+    }
+    let media = std::path::Path::new("/tmp/drdr-demo.mp4");
+    if media.exists() {
+        wm.open(Rect::new(610, 410, 380, 200), Box::new(MediaApp::open(media.into())));
+    }
+    wm.open(Rect::new(330, 430, 270, 150), Box::new(CalcApp::new()));
 }
 
 impl LauncherApp {
@@ -3797,6 +3811,9 @@ pub enum FileClass {
     Code,
     Web,
     Image,
+    Pdf,
+    Archive,
+    Media,
     Binary,
 }
 
@@ -3806,23 +3823,30 @@ pub fn classify(name: &str) -> FileClass {
         "png" | "jpg" | "jpeg" | "bmp" | "gif" | "ppm" | "webp" | "ico" | "tiff" => {
             FileClass::Image
         }
+        "pdf" => FileClass::Pdf,
+        "zip" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "jar" | "apk"
+        | "epub" => FileClass::Archive,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "flv" | "wmv" | "mpg" | "mpeg"
+        | "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "wma" => FileClass::Media,
         "html" | "htm" | "md" | "markdown" => FileClass::Web,
         "rs" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "java" | "c" | "h" | "cpp" | "hpp"
         | "cc" | "py" | "go" | "css" | "json" | "xml" | "sh" | "bash" | "toml" | "yaml"
         | "yml" | "rb" | "php" | "sql" => FileClass::Code,
-        "pdf" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "zip" | "gz" | "xz" | "tar"
-        | "bin" | "exe" | "o" | "so" | "wasm" | "mp3" | "wav" | "mp4" => FileClass::Binary,
+        "gz" | "xz" | "tar" | "bin" | "exe" | "o" | "so" | "wasm" => FileClass::Binary,
         _ => FileClass::Text,
     }
 }
 
-/// A short two-letter tag shown beside a file in the manager list.
+/// A short tag shown beside a file in the manager list.
 pub fn type_tag(name: &str, is_dir: bool) -> &'static str {
     if is_dir {
         return "DIR";
     }
     match classify(name) {
         FileClass::Image => "IMG",
+        FileClass::Pdf => "PDF",
+        FileClass::Archive => "ZIP",
+        FileClass::Media => "AV",
         FileClass::Web => "WEB",
         FileClass::Code => "<>",
         FileClass::Binary => "BIN",
@@ -4769,11 +4793,11 @@ struct DecodedImg {
     px: Vec<Px>,
 }
 
-/// A real image viewer. It decodes PPM (P6) and uncompressed 24/32-bit
-/// BMP ourselves and paints them as colour cells (each grid cell is one
-/// down-sampled pixel — the closest a character grid gets to a bitmap),
-/// aspect-corrected for the 8×16 cell. PNG/JPEG are recognised and their
-/// dimensions reported, with an honest "preview not supported" note.
+/// A real image viewer. It decodes **PNG, GIF and baseline JPEG** (via
+/// our own `drdr-codec`), plus PPM (P6) and uncompressed 24/32-bit BMP,
+/// and paints them as colour cells (each grid cell is one down-sampled
+/// pixel — the closest a character grid gets to a bitmap), aspect-corrected
+/// for the 8×16 cell.
 pub struct ImageApp {
     name: String,
     img: Option<DecodedImg>,
@@ -4842,7 +4866,21 @@ impl WindowApp for ImageApp {
     }
 }
 
-/// Sniff a file's magic bytes and decode (or describe) it.
+/// Convert a `drdr_codec` RGBA image into the viewer's `Px` buffer,
+/// compositing any alpha over white so transparent PNG/GIF read cleanly.
+fn img_from_codec(img: drdr_codec::Image) -> DecodedImg {
+    let mut px = Vec::with_capacity((img.w * img.h) as usize);
+    for p in img.rgba.chunks_exact(4) {
+        let (r, g, b, a) = (p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32);
+        let over = |c: u32| ((c * a + 255 * (255 - a)) / 255) as u8;
+        px.push(Px::rgb(over(r), over(g), over(b)));
+    }
+    DecodedImg { w: img.w, h: img.h, px }
+}
+
+/// Sniff a file's magic bytes and decode (or describe) it. PNG, GIF and
+/// baseline JPEG are decoded for real by our own `drdr-codec`; PPM and
+/// BMP have their own small decoders here.
 fn decode_image(name: &str, b: &[u8]) -> (Option<DecodedImg>, Vec<String>) {
     if b.len() >= 2 && &b[0..2] == b"P6" {
         if let Some(img) = decode_ppm(b) {
@@ -4854,35 +4892,36 @@ fn decode_image(name: &str, b: &[u8]) -> (Option<DecodedImg>, Vec<String>) {
             return (Some(img), vec![]);
         }
     }
-    if b.len() >= 24 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
-        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
-        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
-        return (
-            None,
-            vec![
-                format!("{name}: PNG image, {w}x{h}"),
-                String::new(),
-                "PNG decoding (zlib/DEFLATE) is on the roadmap.".into(),
-                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
-            ],
-        );
+    if b.len() >= 8 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return match drdr_codec::decode_png(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (None, vec![format!("{name}: {e}")]),
+        };
+    }
+    if b.len() >= 6 && (&b[0..6] == b"GIF87a" || &b[0..6] == b"GIF89a") {
+        return match drdr_codec::decode_gif(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (None, vec![format!("{name}: {e}")]),
+        };
     }
     if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xD8 {
-        return (
-            None,
-            vec![
-                format!("{name}: JPEG image"),
-                String::new(),
-                "JPEG decoding is on the roadmap.".into(),
-                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
-            ],
-        );
+        return match drdr_codec::decode_jpeg(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (
+                None,
+                vec![
+                    format!("{name}: {e}"),
+                    String::new(),
+                    "(baseline JPEG decodes; progressive is not supported yet)".into(),
+                ],
+            ),
+        };
     }
     (
         None,
         vec![
             format!("{name}: unrecognised image ({} bytes)", b.len()),
-            "Supported previews: PPM (P6), BMP (24/32-bit).".into(),
+            "Supported: PNG, GIF, baseline JPEG, BMP, PPM.".into(),
         ],
     )
 }
@@ -5019,6 +5058,231 @@ impl WindowApp for BinaryInfoApp {
             g.text(0, row, &format!("{hex:<48} {asc}"));
             row += 1;
         }
+    }
+}
+
+// ─── A scrollable read-only text pane (shared by the doc viewers) ────
+
+/// The common machinery behind the PDF / archive / media viewers: a list
+/// of lines you can scroll with the arrows / PageUp-Down, Esc to close.
+struct TextPane {
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+impl TextPane {
+    fn new(lines: Vec<String>) -> Self {
+        Self { lines, scroll: 0 }
+    }
+
+    fn on_key(&mut self, key: KeyCode, page: usize) -> AppControl {
+        match key {
+            KeyCode::Escape => return AppControl::Close,
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll += 1,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Space => self.scroll += page,
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = self.lines.len(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    /// Paint from `top` row, returning nothing. Clamps the scroll so the
+    /// last page always shows content.
+    fn render(&mut self, g: &mut TextGrid, top: u32) {
+        let body = g.rows.saturating_sub(top) as usize;
+        let max_scroll = self.lines.len().saturating_sub(body);
+        self.scroll = self.scroll.min(max_scroll);
+        for (i, line) in self.lines.iter().skip(self.scroll).take(body).enumerate() {
+            g.text(0, top + i as u32, line);
+        }
+    }
+}
+
+/// Strip XML tags to readable text, turning paragraph/break closers into
+/// newlines and decoding the handful of entities Office documents use.
+/// Good enough to surface the words in a `.docx` / `.xlsx` / `.pptx`.
+fn xml_to_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut chars = xml.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            // Read the tag name to decide whether it ends a paragraph.
+            let rest = &xml[i..];
+            let end = rest.find('>').map(|e| i + e + 1).unwrap_or(xml.len());
+            let tag = &xml[i..end];
+            if tag.starts_with("</w:p")
+                || tag.starts_with("</a:p")
+                || tag.starts_with("</text:p")
+                || tag.starts_with("<w:br")
+                || tag.starts_with("</tr")
+            {
+                out.push('\n');
+            }
+            // Skip to the end of the tag.
+            while let Some(&(j, _)) = chars.peek() {
+                if j >= end {
+                    break;
+                }
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+/// Pull readable text out of an Office Open XML container (docx/xlsx/pptx)
+/// already opened as a ZIP. Returns `None` if it isn't an office file.
+fn office_text(data: &[u8], entries: &[drdr_codec::ZipEntry]) -> Option<String> {
+    // The part that holds the body text differs per app.
+    let part = entries.iter().find(|e| {
+        e.name == "word/document.xml"
+            || e.name == "xl/sharedStrings.xml"
+            || e.name == "ppt/slides/slide1.xml"
+    })?;
+    let raw = drdr_codec::read_zip_entry(data, part).ok()?;
+    let xml = String::from_utf8_lossy(&raw);
+    Some(xml_to_text(&xml))
+}
+
+// ─── PDF viewer ──────────────────────────────────────────────────────
+
+/// Opens a PDF and shows its extracted text (via our own `drdr-codec`
+/// PDF text extractor — DEFLATE-decompressing content streams and pulling
+/// the strings out). Not a full renderer; an honest, readable text view.
+pub struct PdfApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl PdfApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let lines = match drdr_codec::pdf::extract_pdf_text(&bytes) {
+            Ok(ls) if !ls.is_empty() => ls,
+            Ok(_) => vec!["(no extractable text — likely a scanned/image PDF)".into()],
+            Err(e) => vec![format!("Could not read PDF: {e}")],
+        };
+        Self { name, pane: TextPane::new(lines) }
+    }
+}
+
+impl WindowApp for PdfApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
+    fn title(&self) -> String {
+        format!("PDF - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        let page = 10;
+        self.pane.on_key(key, page)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (arrows/PageUp-Down scroll, Esc close)", self.name));
+        self.pane.render(g, 2);
+    }
+}
+
+// ─── Archive / Office document viewer ────────────────────────────────
+
+/// Lists a ZIP's entries and, when it's an Office document, shows the
+/// extracted body text underneath — all via our own ZIP reader + DEFLATE.
+pub struct ArchiveApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl ArchiveApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let mut lines = Vec::new();
+        match drdr_codec::list_zip(&bytes) {
+            Ok(entries) => {
+                if let Some(text) = office_text(&bytes, &entries) {
+                    lines.push("── Document text ──".into());
+                    for l in text.lines() {
+                        let l = l.trim_end();
+                        if !l.is_empty() {
+                            lines.push(l.to_string());
+                        }
+                    }
+                    lines.push(String::new());
+                }
+                lines.push(format!("── {} entries ──", entries.len()));
+                for e in &entries {
+                    lines.push(format!(
+                        "{:>9} B  {}",
+                        e.uncomp_size,
+                        e.name
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("Could not read archive: {e}")),
+        }
+        Self { name, pane: TextPane::new(lines) }
+    }
+}
+
+impl WindowApp for ArchiveApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Folder
+    }
+    fn title(&self) -> String {
+        format!("Archive - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        self.pane.on_key(key, 10)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (arrows scroll, Esc close)", self.name));
+        self.pane.render(g, 2);
+    }
+}
+
+// ─── Media (audio/video) info ────────────────────────────────────────
+
+/// Shows what a video/audio file *is* — container, duration, resolution,
+/// codecs, tracks — parsed from MP4 / Matroska metadata by our own
+/// `drdr-codec`. It does not decode compressed frames (an honest line in
+/// the panel says so); it's the "properties" view a desktop should give.
+pub struct MediaApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl MediaApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let info = drdr_codec::probe_media(&bytes, &ext_of(&name));
+        Self { name, pane: TextPane::new(info.summary()) }
+    }
+}
+
+impl WindowApp for MediaApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Music
+    }
+    fn title(&self) -> String {
+        format!("Media - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        self.pane.on_key(key, 6)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (Esc close)", self.name));
+        self.pane.render(g, 2);
     }
 }
 
@@ -5211,7 +5475,7 @@ mod app_tests {
         assert_eq!(classify("a.png"), FileClass::Image);
         assert_eq!(classify("index.html"), FileClass::Web);
         assert_eq!(classify("main.rs"), FileClass::Code);
-        assert_eq!(classify("report.pdf"), FileClass::Binary);
+        assert_eq!(classify("report.pdf"), FileClass::Pdf);
         assert_eq!(classify("readme"), FileClass::Text);
         // Tags follow the class.
         assert_eq!(type_tag("a.rs", false), "<>");
@@ -5347,5 +5611,64 @@ mod app_tests {
         region_line(&mut g, 1, FILES_LIST_X, "file.txt", true);
         assert_eq!(g.cell(2, 1).ch, 'S', "sidebar glyph survived the fill");
         assert_eq!(g.cell(FILES_LIST_X, 1).ch, 'f');
+    }
+
+    // ─── phase 13: real PNG/GIF/JPEG + PDF/archive/media routing ────
+
+    #[test]
+    fn classify_routes_new_formats() {
+        assert_eq!(classify("a.png"), FileClass::Image);
+        assert_eq!(classify("a.gif"), FileClass::Image);
+        assert_eq!(classify("a.jpg"), FileClass::Image);
+        assert_eq!(classify("report.pdf"), FileClass::Pdf);
+        assert_eq!(classify("notes.docx"), FileClass::Archive);
+        assert_eq!(classify("photos.zip"), FileClass::Archive);
+        assert_eq!(classify("movie.mp4"), FileClass::Media);
+        assert_eq!(classify("clip.mkv"), FileClass::Media);
+        assert_eq!(classify("song.mp3"), FileClass::Media);
+    }
+
+    // A real 3×2 RGBA PNG written by Pillow.
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 2, 8,
+        6, 0, 0, 0, 157, 116, 102, 26, 0, 0, 0, 27, 73, 68, 65, 84, 120, 156, 37, 199, 177, 13, 0,
+        0, 12, 195, 32, 212, 255, 127, 118, 134, 178, 33, 146, 168, 19, 127, 6, 134, 173, 8, 250,
+        147, 205, 134, 116, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[test]
+    fn decode_image_decodes_a_real_png() {
+        let (img, _) = decode_image("t.png", PNG);
+        let img = img.expect("png should decode through drdr-codec");
+        assert_eq!((img.w, img.h), (3, 2));
+        assert_eq!(img.px[0], Px::rgb(255, 0, 0));
+        assert_eq!(img.px[1], Px::rgb(0, 255, 0));
+        assert_eq!(img.px[2], Px::rgb(0, 0, 255));
+        assert_eq!(img.px[3], Px::rgb(255, 255, 0));
+    }
+
+    #[test]
+    fn xml_to_text_surfaces_words_and_breaks() {
+        let docx = "<w:p><w:r><w:t>Hello</w:t></w:r></w:p>\
+                    <w:p><w:r><w:t>world &amp; co</w:t></w:r></w:p>";
+        let text = xml_to_text(docx);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world & co"));
+        assert!(!text.contains('<'));
+        // The two paragraphs should be on separate lines.
+        assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+    }
+
+    #[test]
+    fn alpha_composites_over_white() {
+        // A fully transparent pixel becomes white; opaque keeps its colour.
+        let img = drdr_codec::Image {
+            w: 2,
+            h: 1,
+            rgba: vec![10, 20, 30, 0, 10, 20, 30, 255],
+        };
+        let d = img_from_codec(img);
+        assert_eq!(d.px[0], Px::rgb(255, 255, 255));
+        assert_eq!(d.px[1], Px::rgb(10, 20, 30));
     }
 }
