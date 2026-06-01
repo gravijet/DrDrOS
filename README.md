@@ -176,8 +176,7 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 | Metric | Value |
 |---|---|
 | Rust source | **18116 lines** across **28 files** |
-| Workspace crates | **0
-0** (every `drdr-*`) |
+| Workspace crates | **13** (every `drdr-*`) |
 | Tests | **111** (`cargo test`, all green) |
 | Git commits | **49** |
 | Tracked files (excl. `buildroot/`) | **57** |
