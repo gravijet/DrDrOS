@@ -94,6 +94,23 @@ fn main() -> ExitCode {
         if std::env::var_os("DRDR_DEMO").is_some() {
             apps::open_demo_windows(&mut wm);
         }
+        if std::env::var_os("DRDR_DEMO2").is_some() {
+            apps::open_demo_messaging(&mut wm, shared_net.clone());
+        }
+        if std::env::var_os("DRDR_DEMO3").is_some() {
+            apps::open_demo_productivity(&mut wm);
+        }
+        if let Some(q) = std::env::var_os("DRDR_START") {
+            wm.handle_key(drdr_ui::KeyCode::Super); // pop the Start menu
+            for c in q.to_string_lossy().chars() {
+                // Type the env value as a live search query (e.g. DRDR_START=cal).
+                if c == ' ' {
+                    wm.handle_key(drdr_ui::KeyCode::Space);
+                } else {
+                    wm.handle_key(drdr_ui::KeyCode::Char(c));
+                }
+            }
+        }
         wm.tick();
         wm.draw(&mut fb, &theme);
         return match fb.write_ppm(path) {

@@ -77,6 +77,128 @@ fn spawn_rect() -> Rect {
     Rect::new(150, 90, 720, 540)
 }
 
+// ─── Shared chat + layout helpers (used by the messaging apps) ────────
+
+/// Broadcast a chat line to every known LAN peer and echo it into our own
+/// log so the sender sees it immediately. Shared by DrDrChat, DrDrMessages
+/// and DrDrDiscord so the three interoperate on one bus — best-effort and
+/// fire-and-forget (a silent peer simply never receives it).
+fn fanout_chat(net: &NetState, text: String) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let msg = drdr_net::chat::ChatMsg {
+        from: net.me.host.clone(),
+        text,
+        ts_unix_secs: crate::net::now_unix_secs(),
+    };
+    crate::net::push_chat(&net.chat_log, msg.clone());
+    let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();
+    for p in peers {
+        let addr = std::net::SocketAddr::new(p.addr, p.peer.tcp_port);
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let _ = deliver_chat(addr, &msg);
+        });
+    }
+}
+
+/// Dial one peer and push a single chat frame, fire-and-forget.
+fn deliver_chat(
+    addr: std::net::SocketAddr,
+    msg: &drdr_net::chat::ChatMsg,
+) -> std::io::Result<()> {
+    let to = Duration::from_millis(500);
+    let stream = TcpStream::connect_timeout(&addr, to)?;
+    stream.set_write_timeout(Some(to)).ok();
+    let _ = stream.set_nodelay(true);
+    let mut conn = Conn::new(stream);
+    conn.send_typed(drdr_net::chat::KIND_CHAT_SAY, msg)
+}
+
+/// Word-wrap `text` to at most `width` columns, breaking words that are
+/// longer than a whole line. Blank input lines are preserved. Char-safe
+/// (never slices a multi-byte boundary). Used by the bubble chat views.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        let mut line_len = 0usize;
+        for word in para.split(' ').filter(|w| !w.is_empty()) {
+            let wlen = word.chars().count();
+            if wlen > width {
+                if line_len > 0 {
+                    out.push(std::mem::take(&mut line));
+                    line_len = 0;
+                }
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    if chunk.chars().count() == width {
+                        out.push(std::mem::take(&mut chunk));
+                    }
+                }
+                if !chunk.is_empty() {
+                    line_len = chunk.chars().count();
+                    line = chunk;
+                }
+                continue;
+            }
+            let need = if line_len == 0 { wlen } else { wlen + 1 };
+            if line_len + need > width {
+                out.push(std::mem::take(&mut line));
+                line_len = 0;
+            }
+            if line_len > 0 {
+                line.push(' ');
+                line_len += 1;
+            }
+            line.push_str(word);
+            line_len += wlen;
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Fill a horizontal run of `w` cells from `(col, row)` in one colour —
+/// the building block for chat bubbles and coloured panes.
+fn fill_cells(g: &mut TextGrid, col: u32, row: u32, w: u32, fg: Px, bg: Px) {
+    for c in col..col.saturating_add(w).min(g.cols) {
+        g.put(c, row, ' ', fg, bg);
+    }
+}
+
+/// One painted chat-bubble row: `(x0, width, bubble_bg, runs)` where each
+/// run is `(offset_from_x0, text, fg)`. Kept as a named type so the
+/// bubble builder reads cleanly (and clippy stays quiet about the nesting).
+type BubbleRow = (u32, u32, Px, Vec<(u32, String, Px)>);
+
+/// A stable, legible colour for a username, so a glance distinguishes
+/// authors in the Discord-style stream and the peer lists.
+fn user_color(name: &str) -> Px {
+    let mut h: u32 = 2166136261;
+    for b in name.bytes() {
+        h = (h ^ b as u32).wrapping_mul(16777619);
+    }
+    const PALETTE: [Px; 8] = [
+        Px::rgb(0x4F, 0xA3, 0xFF),
+        Px::rgb(0x57, 0xD9, 0x8E),
+        Px::rgb(0xF2, 0x7E, 0x63),
+        Px::rgb(0xC9, 0x8B, 0xFF),
+        Px::rgb(0xF5, 0xC0, 0x42),
+        Px::rgb(0x4D, 0xD0, 0xC4),
+        Px::rgb(0xFF, 0x8A, 0xC0),
+        Px::rgb(0x9B, 0xD1, 0x5B),
+    ];
+    PALETTE[(h % PALETTE.len() as u32) as usize]
+}
+
 // ─── About ───────────────────────────────────────────────────────────
 
 /// A static welcome card.
@@ -140,6 +262,7 @@ pub struct FilesApp {
     err: Option<String>,
     mode: FMode,
     spawns: Vec<Spawn>,
+    menu: MenuBar,
 }
 
 impl FilesApp {
@@ -152,9 +275,31 @@ impl FilesApp {
             err: None,
             mode: FMode::Browse,
             spawns: Vec::new(),
+            menu: files_menu(),
         };
         a.reload();
         a
+    }
+
+    /// Apply a clickable-menu action.
+    fn do_action(&mut self, action: &str) -> AppControl {
+        match action {
+            "new" => self.mode = FMode::NewName(String::new()),
+            "reload" => self.reload(),
+            "up" => self.go_up(),
+            "delete" => {
+                if self.items.get(self.sel).is_some_and(|i| i.name != "..") {
+                    self.mode = FMode::ConfirmDel;
+                }
+            }
+            "documents" => self.nav_to(drdr_store::documents_dir()),
+            "filesystem" => self.nav_to(PathBuf::from("/")),
+            "scratch" => self.nav_to(PathBuf::from("/tmp")),
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
     }
 
     fn reload(&mut self) {
@@ -316,6 +461,10 @@ impl WindowApp for FilesApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
         match &mut self.mode {
             FMode::NewName(buf) => match key {
                 KeyCode::Char(c) => buf.push(c),
@@ -360,24 +509,30 @@ impl WindowApp for FilesApp {
     }
 
     fn on_click(&mut self, col: u32, row: u32, double: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
         if !matches!(self.mode, FMode::Browse) {
             return AppControl::Continue;
         }
-        // A click in the left sidebar jumps to that Place.
+        // Row 0 = menu bar; the sidebar/list both start a row lower now.
+        // A click in the left sidebar jumps to that Place (row 1 = header).
         if col < FILES_SIDEBAR_W {
-            if row >= 1 {
+            if row >= 2 {
                 let places = self.places();
-                if let Some((_, p)) = places.get(row as usize - 1) {
+                if let Some((_, p)) = places.get(row as usize - 2) {
                     self.nav_to(p.clone());
                 }
             }
             return AppControl::Continue;
         }
-        // The file list: row 0 is the header; entries start at row 1.
-        if row == 0 {
+        // The file list: row 1 is the header; entries start at row 2.
+        if row < 2 {
             return AppControl::Continue;
         }
-        let idx = self.scroll + (row as usize - 1);
+        let idx = self.scroll + (row as usize - 2);
         if idx < self.items.len() {
             self.sel = idx;
             if double {
@@ -388,36 +543,37 @@ impl WindowApp for FilesApp {
     }
 
     fn render(&mut self, g: &mut TextGrid) {
-        // ── Left navigation sidebar ("Places") ──────────────────────────
-        let muted = g.fg();
-        g.write(1, 0, "PLACES", muted, g.bg());
+        let fg = g.fg();
+        let bg = g.bg();
+        // ── Left navigation sidebar ("Places") — row 0 is the menu bar ──
+        let muted = fg;
+        g.write(1, 1, "PLACES", muted, bg);
         let active_place = self.places().iter().position(|(_, p)| *p == self.cwd);
         for (i, (label, _)) in self.places().iter().enumerate() {
-            let row = i as u32 + 1;
+            let row = i as u32 + 2;
             let sel = active_place == Some(i);
             if sel {
-                let (fg, bg) = (g.bg(), g.fg());
                 for c in 0..FILES_SIDEBAR_W {
-                    g.put(c, row, ' ', fg, bg);
+                    g.put(c, row, ' ', bg, fg);
                 }
-                g.write(1, row, label, fg, bg);
+                g.write(1, row, label, bg, fg);
             } else {
-                g.write(1, row, label, g.fg(), g.bg());
+                g.write(1, row, label, fg, bg);
             }
         }
         // Vertical divider between the sidebar and the file list.
-        for r in 0..g.rows {
-            g.put(FILES_SIDEBAR_W, r, '|', muted, g.bg());
+        for r in 1..g.rows {
+            g.put(FILES_SIDEBAR_W, r, '|', muted, bg);
         }
 
         let x0 = FILES_LIST_X;
         if let Some(e) = &self.err {
             let e = e.clone();
-            g.text(x0, 1, &e);
-            g.text(x0, 3, "(any key / r to reload)");
+            g.text(x0, 2, &e);
+            g.text(x0, 4, "(any key / r to reload)");
         }
         let rows = g.rows as usize;
-        let visible = rows.saturating_sub(2);
+        let visible = rows.saturating_sub(3);
         if self.sel < self.scroll {
             self.scroll = self.sel;
         } else if visible > 0 && self.sel >= self.scroll + visible {
@@ -435,21 +591,56 @@ impl WindowApp for FilesApp {
                 format!("delete '{n}' ?  y = yes, any other key = no")
             }
         };
-        g.text(x0, 0, &header);
+        g.text(x0, 1, &header);
 
-        if self.err.is_some() {
-            return;
-        }
-        for vis in 0..visible {
-            let idx = self.scroll + vis;
-            if idx >= self.items.len() {
-                break;
+        if self.err.is_none() {
+            for vis in 0..visible {
+                let idx = self.scroll + vis;
+                if idx >= self.items.len() {
+                    break;
+                }
+                let it = &self.items[idx];
+                let line = format!("{:<4} {}", type_tag(&it.name, it.is_dir), it.name);
+                let row = vis as u32 + 2;
+                region_line(g, row, x0, &line, idx == self.sel);
             }
-            let it = &self.items[idx];
-            let line = format!("{:<4} {}", type_tag(&it.name, it.is_dir), it.name);
-            let row = vis as u32 + 1;
-            region_line(g, row, x0, &line, idx == self.sel);
         }
+        // Menu bar last so its drop-down overlays the list.
+        self.menu.render(g, fg, bg);
+    }
+}
+
+/// The file manager's menu bar — file operations, quick navigation and
+/// view toggles, all clickable so nothing needs a keyboard shortcut.
+fn files_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "File".into(),
+                items: vec![
+                    MenuBar::item("New file", "new"),
+                    MenuBar::item("Delete", "delete"),
+                    MenuBar::item("Reload", "reload"),
+                ],
+            },
+            Menu {
+                title: "Go".into(),
+                items: vec![
+                    MenuBar::item("Up one level", "up"),
+                    MenuBar::item("Documents", "documents"),
+                    MenuBar::item("Filesystem /", "filesystem"),
+                    MenuBar::item("Scratch /tmp", "scratch"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
     }
 }
 
@@ -926,6 +1117,8 @@ pub fn app_catalog(
     let net_for_settings = net.clone();
     let net_for_panel = net.clone();
     let net_for_network = net.clone();
+    let net_for_messages = net.clone();
+    let net_for_discord = net.clone();
     vec![
         // Default to the user's writable Documents folder — that's where
         // Notes / drdr-store::save live, and it shows the user where
@@ -935,9 +1128,14 @@ pub fn app_catalog(
         entry("Notes (saved)", IconKind::Note, || Box::new(NotesApp::new())),
         entry("Tasks (saved)", IconKind::Tasks, || Box::new(TasksApp::new())),
         entry("Browser", IconKind::Browser, || Box::new(BrowserApp::new())),
+        entry("Mail", IconKind::Mail, || Box::new(MailApp::new())),
+        entry("Messages", IconKind::Messages, move || Box::new(MessagesApp::new(net_for_messages.clone()))),
+        entry("DrDrCord", IconKind::Discord, move || Box::new(DiscordApp::new(net_for_discord.clone()))),
+        entry("Contacts", IconKind::Contacts, || Box::new(ContactsApp::new())),
+        entry("Calendar", IconKind::Calendar, || Box::new(CalendarApp::new())),
         entry("Terminal (Shell)", IconKind::Terminal, || Box::new(ConsoleApp::new())),
         entry("Calculator", IconKind::Calculator, || Box::new(CalcApp::new())),
-        entry("Clock & Calendar", IconKind::Clock, || Box::new(ClockApp::new())),
+        entry("Clock", IconKind::Clock, || Box::new(ClockApp::new())),
         entry("System Monitor", IconKind::Monitor, || Box::new(SysMonApp::new())),
         entry("System Info", IconKind::Info, || Box::new(SysInfoApp::new())),
         entry("Network & Wi-Fi", IconKind::Network, move || Box::new(NetworkApp::new(net_for_network.clone()))),
@@ -975,6 +1173,8 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
     let net_for_chat = net.clone();
     let net_for_settings = net.clone();
     let net_for_network = net.clone();
+    let net_for_messages = net.clone();
+    let net_for_discord = net.clone();
     vec![
         icon("Files",      IconKind::Folder,     Px::rgb(0x2D, 0x82, 0xF0), || {
             Box::new(FilesApp::new(drdr_store::documents_dir()))
@@ -985,6 +1185,11 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
         icon("Notes",      IconKind::Note,       Px::rgb(0xF2, 0xC0, 0x32), || Box::new(NotesApp::new())),
         icon("Tasks",      IconKind::Tasks,      Px::rgb(0x2E, 0xA0, 0x6A), || Box::new(TasksApp::new())),
         icon("Browser",    IconKind::Browser,    Px::rgb(0x1E, 0x9E, 0xD6), || Box::new(BrowserApp::new())),
+        icon("Mail",       IconKind::Mail,       Px::rgb(0x2D, 0x6C, 0xD8), || Box::new(MailApp::new())),
+        icon("Messages",   IconKind::Messages,   Px::rgb(0x25, 0xB3, 0x5E), move || Box::new(MessagesApp::new(net_for_messages.clone()))),
+        icon("DrDrCord",   IconKind::Discord,    Px::rgb(0x58, 0x65, 0xF2), move || Box::new(DiscordApp::new(net_for_discord.clone()))),
+        icon("Contacts",   IconKind::Contacts,   Px::rgb(0x2B, 0x9B, 0x8A), || Box::new(ContactsApp::new())),
+        icon("Calendar",   IconKind::Calendar,   Px::rgb(0xD0, 0x52, 0x4A), || Box::new(CalendarApp::new())),
         icon("Terminal",   IconKind::Terminal,   Px::rgb(0x33, 0x33, 0x3A), || Box::new(ConsoleApp::new())),
         icon("Calculator", IconKind::Calculator, Px::rgb(0x6B, 0x4F, 0xC9), || Box::new(CalcApp::new())),
         icon("Clock",      IconKind::Clock,      Px::rgb(0xE8, 0x6B, 0x3D), || Box::new(ClockApp::new())),
@@ -1022,6 +1227,48 @@ pub fn open_demo_windows(wm: &mut WindowManager) {
     if img.exists() {
         wm.open(Rect::new(700, 410, 300, 200), Box::new(ImageApp::open(img.into())));
     }
+}
+
+/// Open the productivity apps that gained menu bars — Files, Calculator
+/// and the Image viewer — so a snapshot shows their new Windows-style
+/// menus. Used by the `DRDR_DEMO3` snapshot path only.
+pub fn open_demo_productivity(wm: &mut WindowManager) {
+    wm.open(Rect::new(20, 30, 460, 420), Box::new(FilesApp::new(drdr_store::documents_dir())));
+    wm.open(Rect::new(500, 30, 360, 300), Box::new(CalcApp::new()));
+    let pic = std::path::Path::new("/tmp/pic.ppm");
+    if pic.exists() {
+        wm.open(Rect::new(420, 280, 500, 420), Box::new(ImageApp::open(pic.into())));
+    }
+}
+
+/// Open the new communication apps for a snapshot — Messages, DrDrCord,
+/// Mail, Calendar and Contacts — so a screenshot shows the messaging
+/// suite. Seeds a short conversation into the shared chat log first so the
+/// bubble views have content. Used by the `DRDR_DEMO2` snapshot path only.
+pub fn open_demo_messaging(wm: &mut WindowManager, net: SharedNet) {
+    if let Some(s) = net_snapshot(&net) {
+        for (from, text) in [
+            ("alice", "Hey everyone, welcome to DrDrOS!"),
+            ("drdros", "Thanks! Loving the new look."),
+            ("bob", "#help how do I open the calculator?"),
+            ("alice", "Click the Calculator tile on the desktop."),
+            ("drdros", "Got it, works great."),
+        ] {
+            crate::net::push_chat(
+                &s.chat_log,
+                drdr_net::chat::ChatMsg {
+                    from: from.into(),
+                    text: text.into(),
+                    ts_unix_secs: crate::net::now_unix_secs(),
+                },
+            );
+        }
+    }
+    wm.open(Rect::new(20, 30, 520, 360), Box::new(MailApp::new()));
+    wm.open(Rect::new(560, 30, 450, 330), Box::new(ContactsApp::new()));
+    wm.open(Rect::new(40, 360, 470, 360), Box::new(CalendarApp::new()));
+    wm.open(Rect::new(150, 120, 540, 380), Box::new(MessagesApp::new(net.clone())));
+    wm.open(Rect::new(360, 200, 620, 420), Box::new(DiscordApp::new(net)));
 }
 
 impl LauncherApp {
@@ -1816,11 +2063,38 @@ pub struct CalcApp {
     expr: String,
     result: Option<f64>,
     error: Option<String>,
+    menu: MenuBar,
 }
 
 impl CalcApp {
     pub fn new() -> Self {
-        Self { expr: String::new(), result: None, error: None }
+        Self { expr: String::new(), result: None, error: None, menu: calc_menu() }
+    }
+
+    fn clear(&mut self) {
+        self.expr.clear();
+        self.result = None;
+        self.error = None;
+    }
+
+    /// Apply a menu action.
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "clear" => self.clear(),
+            "back" => {
+                self.expr.pop();
+                self.result = None;
+                self.error = None;
+            }
+            "equals" => self.equals(),
+            "lparen" => self.push('('),
+            "rparen" => self.push(')'),
+            "percent" => self.push('%'),
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
     }
 
     fn equals(&mut self) {
@@ -1860,6 +2134,10 @@ impl WindowApp for CalcApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
         match key {
             KeyCode::Char(c)
                 if c.is_ascii_digit()
@@ -1873,20 +2151,21 @@ impl WindowApp for CalcApp {
                 self.result = None;
                 self.error = None;
             }
-            KeyCode::Escape | KeyCode::Char('c') | KeyCode::Char('C') => {
-                self.expr.clear();
-                self.result = None;
-                self.error = None;
-            }
+            KeyCode::Escape | KeyCode::Char('c') | KeyCode::Char('C') => self.clear(),
             _ => {}
         }
         AppControl::Continue
     }
 
     fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
-        // The keypad starts at grid row 4; each key is 5 cols wide.
-        if row >= 4 {
-            let kr = (row as usize - 4) / 2;
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Row 0 = menu bar; the keypad starts at grid row 5 (5 cols/key).
+        if row >= 5 {
+            let kr = (row as usize - 5) / 2;
             let kc = (col as usize) / 5;
             if kr < 4 && kc < 4 {
                 let ch = KEYPAD[kr][kc];
@@ -1901,24 +2180,61 @@ impl WindowApp for CalcApp {
     }
 
     fn render(&mut self, g: &mut TextGrid) {
-        g.text(0, 0, "Calculator  (type, Enter==, c=clear, Bksp)");
+        let fg = g.fg();
+        let bg = g.bg();
+        g.text(0, 1, "Type, or click the keys.  Enter = result.");
         let shown = if self.expr.is_empty() { "0" } else { &self.expr };
-        g.text(0, 2, &format!("> {shown}"));
+        g.text(0, 2, &format!("> {shown}_"));
         if let Some(v) = self.result {
             let teal = Px::rgb(0x1F, 0x9E, 0x55);
-            g.write(0, 3, &format!("= {}", trim_float(v)), teal, g.bg());
+            g.write(0, 3, &format!("= {}", trim_float(v)), teal, bg);
         } else if let Some(e) = &self.error {
             let red = Px::rgb(0xC8, 0x2B, 0x2B);
-            g.write(0, 3, &format!("! {e}"), red, g.bg());
+            g.write(0, 3, &format!("! {e}"), red, bg);
         }
         for (r, krow) in KEYPAD.iter().enumerate() {
-            let row = 4 + r as u32 * 2;
+            let row = 5 + r as u32 * 2;
             let mut line = String::new();
             for k in krow {
                 line.push_str(&format!("[ {k} ]"));
             }
             g.text(0, row, &line);
         }
+        // Menu bar last so its drop-down overlays the keypad.
+        self.menu.render(g, fg, bg);
+    }
+}
+
+/// The Calculator menu bar — edit actions, quick inserts and view toggles
+/// so everything works with the mouse as well as the keyboard.
+fn calc_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Edit".into(),
+                items: vec![
+                    MenuBar::item("Evaluate (=)", "equals"),
+                    MenuBar::item("Backspace", "back"),
+                    MenuBar::item("Clear", "clear"),
+                ],
+            },
+            Menu {
+                title: "Insert".into(),
+                items: vec![
+                    MenuBar::item("( open paren", "lparen"),
+                    MenuBar::item(") close paren", "rparen"),
+                    MenuBar::item("% percent", "percent"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
     }
 }
 
@@ -2555,49 +2871,14 @@ impl ChatApp {
     }
 
     /// Self-log the line, then dial every peer in parallel and deliver
-    /// the chat frame fire-and-forget. We don't wait for replies — chat
-    /// is best-effort, peer goes silent → message just doesn't arrive.
+    /// the chat frame fire-and-forget (see [`fanout_chat`]).
     fn send(&mut self) {
         let Some(net) = net_snapshot(&self.net) else {
             self.input.clear();
             return;
         };
         let text = std::mem::take(&mut self.input);
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let msg = drdr_net::chat::ChatMsg {
-            from: net.me.host.clone(),
-            text,
-            ts_unix_secs: crate::net::now_unix_secs(),
-        };
-        crate::net::push_chat(&net.chat_log, msg.clone());
-
-        let peers = net
-            .directory
-            .lock()
-            .map(|d| d.snapshot())
-            .unwrap_or_default();
-        for p in peers {
-            let addr = std::net::SocketAddr::new(p.addr, p.peer.tcp_port);
-            let msg = msg.clone();
-            std::thread::spawn(move || {
-                let _ = Self::deliver(addr, &msg);
-            });
-        }
-    }
-
-    fn deliver(
-        addr: std::net::SocketAddr,
-        msg: &drdr_net::chat::ChatMsg,
-    ) -> std::io::Result<()> {
-        let to = Duration::from_millis(500);
-        let stream = TcpStream::connect_timeout(&addr, to)?;
-        stream.set_write_timeout(Some(to)).ok();
-        let _ = stream.set_nodelay(true);
-        let mut conn = Conn::new(stream);
-        conn.send_typed(drdr_net::chat::KIND_CHAT_SAY, msg)
+        fanout_chat(&net, text);
     }
 }
 
@@ -5185,6 +5466,9 @@ pub struct ImageApp {
     name: String,
     img: Option<DecodedImg>,
     info: Vec<String>,
+    /// Show the metadata/details list instead of the picture.
+    show_info: bool,
+    menu: MenuBar,
 }
 
 impl ImageApp {
@@ -5192,7 +5476,18 @@ impl ImageApp {
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let bytes = fs::read(&path).unwrap_or_default();
         let (img, info) = decode_image(&name, &bytes);
-        Self { name, img, info }
+        Self { name, img, info, show_info: false, menu: image_menu() }
+    }
+
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "picture" => self.show_info = false,
+            "details" => self.show_info = true,
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
     }
 }
 
@@ -5205,47 +5500,101 @@ impl WindowApp for ImageApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
-        if key == KeyCode::Escape {
-            return AppControl::Close;
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        match key {
+            KeyCode::Escape => return AppControl::Close,
+            KeyCode::Char('i') => self.show_info = !self.show_info,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
         }
         AppControl::Continue
     }
 
     fn render(&mut self, g: &mut TextGrid) {
-        match &self.img {
-            None => {
-                for (i, l) in self.info.iter().enumerate() {
-                    g.text(1, i as u32 + 1, l);
+        let fg = g.fg();
+        let bg = g.bg();
+        // Row 0 = menu bar; row 1 = caption; picture/details fill the rest.
+        let no_pic = self.img.is_none();
+        if self.show_info || no_pic {
+            let dim = self
+                .img
+                .as_ref()
+                .map(|im| format!("{}   {}x{}   (press 'i' for the picture)", self.name, im.w, im.h))
+                .unwrap_or_else(|| format!("{}   (no preview available)", self.name));
+            g.text(0, 1, &dim);
+            for (i, l) in self.info.iter().enumerate() {
+                let row = i as u32 + 3;
+                if row >= g.rows {
+                    break;
                 }
+                g.text(1, row, l);
             }
-            Some(img) => {
-                let dim = format!("{}  {}x{}", self.name, img.w, img.h);
-                g.text(0, 0, &dim);
-                let avail_cols = g.cols.max(1);
-                let avail_rows = g.rows.saturating_sub(1).max(1);
-                // Fit aspect: cells are 8 wide, 16 tall, so a column is
-                // half the physical span of a row — halve the row count.
-                let ar = img.w as f32 / img.h as f32;
-                let mut uc = avail_cols;
-                let mut ur = (((uc * 8) as f32 / ar) / 16.0).round() as u32;
-                if ur > avail_rows {
-                    ur = avail_rows;
-                    uc = (((ur * 16) as f32 * ar) / 8.0).round() as u32;
-                }
-                uc = uc.clamp(1, avail_cols);
-                ur = ur.clamp(1, avail_rows);
-                let ox = (avail_cols - uc) / 2;
-                let oy = 1 + (avail_rows - ur) / 2;
-                for ry in 0..ur {
-                    for cx in 0..uc {
-                        let ix = (cx * img.w / uc).min(img.w - 1);
-                        let iy = (ry * img.h / ur).min(img.h - 1);
-                        let c = img.px[(iy * img.w + ix) as usize];
-                        g.put(ox + cx, oy + ry, ' ', c, c);
-                    }
+            if self.info.is_empty() && !no_pic {
+                g.write(1, 3, "A decoded picture - choose Image > Picture to view it.", fg, bg);
+            }
+        } else if let Some(img) = &self.img {
+            g.text(0, 1, &format!("{}   {}x{}   (press 'i' for details)", self.name, img.w, img.h));
+            let avail_cols = g.cols.max(1);
+            let avail_rows = g.rows.saturating_sub(2).max(1);
+            // Fit aspect: cells are 8 wide, 16 tall, so a column is half
+            // the physical span of a row — halve the row count.
+            let ar = img.w as f32 / img.h as f32;
+            let mut uc = avail_cols;
+            let mut ur = (((uc * 8) as f32 / ar) / 16.0).round() as u32;
+            if ur > avail_rows {
+                ur = avail_rows;
+                uc = (((ur * 16) as f32 * ar) / 8.0).round() as u32;
+            }
+            uc = uc.clamp(1, avail_cols);
+            ur = ur.clamp(1, avail_rows);
+            let ox = (avail_cols - uc) / 2;
+            let oy = 2 + (avail_rows - ur) / 2;
+            for ry in 0..ur {
+                for cx in 0..uc {
+                    let ix = (cx * img.w / uc).min(img.w - 1);
+                    let iy = (ry * img.h / ur).min(img.h - 1);
+                    let c = img.px[(iy * img.w + ix) as usize];
+                    g.put(ox + cx, oy + ry, ' ', c, c);
                 }
             }
         }
+        // Menu bar last so its drop-down overlays the picture.
+        self.menu.render(g, fg, bg);
+    }
+}
+
+/// The image viewer's menu bar: switch between the picture and its
+/// decoded details, and the usual view toggles.
+fn image_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Image".into(),
+                items: vec![
+                    MenuBar::item("Picture", "picture"),
+                    MenuBar::item("Details", "details"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
     }
 }
 
@@ -5669,6 +6018,1395 @@ impl WindowApp for MediaApp {
     }
 }
 
+// ─── DrDrMessages — a WhatsApp-style LAN messenger ───────────────────
+
+/// Conversation rail width, in character cells.
+const MSG_SIDEBAR_W: u32 = 20;
+/// WhatsApp-ish brand greens.
+const MSG_GREEN: Px = Px::rgb(0x25, 0xD3, 0x66);
+const MSG_GREEN_DK: Px = Px::rgb(0x07, 0x5E, 0x54);
+
+/// A modern two-pane messenger riding the DrDrNet chat bus. The left rail
+/// lists conversations — the LAN broadcast "Everyone", then every peer the
+/// discovery directory knows — and the right pane is the thread, drawn as
+/// chat bubbles (your own lines right-aligned in green, others left in
+/// grey) with a composer at the bottom. Same wire protocol as DrDrChat,
+/// dressed up like a phone messenger.
+pub struct MessagesApp {
+    net: SharedNet,
+    input: String,
+    /// 0 = "Everyone"; otherwise the 1-based index into the peer list.
+    sel: usize,
+    menu: MenuBar,
+}
+
+impl MessagesApp {
+    pub fn new(net: SharedNet) -> Self {
+        Self { net, input: String::new(), sel: 0, menu: messenger_menu() }
+    }
+
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "everyone" => self.sel = 0,
+            "clear" => self.input.clear(),
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn send(&mut self) {
+        let Some(net) = net_snapshot(&self.net) else {
+            self.input.clear();
+            return;
+        };
+        let text = std::mem::take(&mut self.input);
+        fanout_chat(&net, text);
+    }
+}
+
+impl WindowApp for MessagesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Messages
+    }
+    fn title(&self) -> String {
+        match net_snapshot(&self.net) {
+            None => "Messages - connecting...".into(),
+            Some(net) => {
+                let n = net.directory.lock().map(|d| d.len()).unwrap_or(0);
+                format!("Messages - {} ({} online)", net.me.host, n)
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        match key {
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Space => self.input.push(' '),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.send(),
+            KeyCode::Escape => self.input.clear(),
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = self.sel.saturating_add(1), // clamped at render
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Sidebar click selects a conversation (row 1 is the "Chats" head).
+        if col < MSG_SIDEBAR_W && row >= 2 {
+            self.sel = (row - 2) as usize;
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let cols = g.cols;
+        let rows = g.rows;
+        if cols < MSG_SIDEBAR_W + 10 || rows < 5 {
+            g.text(0, 1, "window too small");
+            return;
+        }
+        let dark = theme_is_dark();
+        // WhatsApp-ish palette: beige thread, green outgoing, white incoming.
+        let (thread_bg, in_bg, in_fg, out_bg, out_fg, sub) = if dark {
+            (Px::rgb(0x07, 0x0C, 0x0B), Px::rgb(0x20, 0x2C, 0x33), Px::rgb(0xE8, 0xEC, 0xF4),
+             Px::rgb(0x12, 0x5C, 0x4A), Px::WHITE, Px::rgb(0x9A, 0xB0, 0xA6))
+        } else {
+            (Px::rgb(0xEC, 0xE5, 0xDD), Px::WHITE, Px::rgb(0x11, 0x11, 0x11),
+             Px::rgb(0xD9, 0xFD, 0xD3), Px::rgb(0x07, 0x2A, 0x14), Px::rgb(0x6B, 0x6B, 0x6B))
+        };
+        let surface = g.bg();
+        let fg = g.fg();
+
+        let me = net_snapshot(&self.net);
+        let me_host = me.as_ref().map(|n| n.me.host.clone()).unwrap_or_else(|| "me".into());
+        let peers: Vec<String> = me
+            .as_ref()
+            .and_then(|n| n.directory.lock().ok().map(|d| d.snapshot()))
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.peer.host.clone())
+            .collect();
+
+        let mut convos: Vec<String> = vec!["Everyone".to_string()];
+        convos.extend(peers.iter().cloned());
+        if self.sel >= convos.len() {
+            self.sel = convos.len() - 1;
+        }
+
+        // ── Left rail ────────────────────────────────────────────────
+        for r in 0..rows {
+            fill_cells(g, 0, r, MSG_SIDEBAR_W, fg, surface);
+        }
+        fill_cells(g, 0, 1, MSG_SIDEBAR_W, Px::WHITE, MSG_GREEN_DK);
+        g.write(1, 1, "Chats", Px::WHITE, MSG_GREEN_DK);
+        for (i, name) in convos.iter().enumerate() {
+            let row = 2 + i as u32;
+            if row >= rows {
+                break;
+            }
+            let on = i == self.sel;
+            let (cfg, cbg) = if on { (surface, MSG_GREEN) } else { (fg, surface) };
+            if on {
+                fill_cells(g, 0, row, MSG_SIDEBAR_W, cfg, cbg);
+            }
+            let dot = if i == 0 { '*' } else { 'o' };
+            g.put(1, row, dot, if on { surface } else { MSG_GREEN }, cbg);
+            let shown: String = name.chars().take((MSG_SIDEBAR_W - 4) as usize).collect();
+            g.write(3, row, &shown, cfg, cbg);
+        }
+        for r in 0..rows {
+            g.put(MSG_SIDEBAR_W, r, ' ', sub, surface);
+        }
+
+        // ── Thread pane ──────────────────────────────────────────────
+        let tx0 = MSG_SIDEBAR_W + 1;
+        let tw = cols - tx0;
+        for r in 0..rows {
+            fill_cells(g, tx0, r, tw, in_fg, thread_bg);
+        }
+        fill_cells(g, tx0, 1, tw, Px::WHITE, MSG_GREEN_DK);
+        let htitle: String = convos[self.sel].chars().take((tw - 14) as usize).collect();
+        g.write(tx0 + 1, 1, &htitle, Px::WHITE, MSG_GREEN_DK);
+        let status = if me.is_none() {
+            "connecting"
+        } else if self.sel == 0 {
+            "LAN broadcast"
+        } else {
+            "online"
+        };
+        let sw = status.chars().count() as u32;
+        if tw > sw + 2 {
+            g.write(tx0 + tw - sw - 1, 1, status, Px::rgb(0xCF, 0xF5, 0xE0), MSG_GREEN_DK);
+        }
+
+        // Filter the shared log for the selected conversation, stripping
+        // any "#channel " tag so DrDrCord traffic still reads cleanly.
+        let log = me
+            .as_ref()
+            .and_then(|n| n.chat_log.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default();
+        let msgs: Vec<(String, String, u64)> = log
+            .iter()
+            .filter_map(|m| {
+                let (_, body) = parse_channel(&m.text);
+                let keep = self.sel == 0 || m.from == convos[self.sel] || m.from == me_host;
+                keep.then(|| (m.from.clone(), body.to_string(), m.ts_unix_secs))
+            })
+            .collect();
+
+        let area_top = 2u32;
+        let area_bot = rows.saturating_sub(1); // composer on the last row
+        let area_h = area_bot.saturating_sub(area_top);
+        let inner_w = (tw as usize).saturating_sub(6).max(6);
+        let mut brows: Vec<BubbleRow> = Vec::new();
+        for (from, body, ts) in &msgs {
+            let mine = *from == me_host;
+            let show_name = !mine && self.sel == 0;
+            let lines = wrap_text(body, inner_w);
+            let mut content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+            if show_name {
+                content_w = content_w.max(from.chars().count());
+            }
+            let time = fmt_hhmm(*ts);
+            content_w = content_w.max(time.chars().count());
+            let bw = (content_w as u32 + 2).min(tw.saturating_sub(2));
+            let bbg = if mine { out_bg } else { in_bg };
+            let tfg = if mine { out_fg } else { in_fg };
+            let x0 = if mine { tx0 + (tw - bw).saturating_sub(1) } else { tx0 + 1 };
+            if show_name {
+                brows.push((x0, bw, bbg, vec![(1, from.clone(), user_color(from))]));
+            }
+            for l in &lines {
+                brows.push((x0, bw, bbg, vec![(1, l.clone(), tfg)]));
+            }
+            let toff = bw.saturating_sub(time.chars().count() as u32 + 1);
+            brows.push((x0, bw, bbg, vec![(toff, time, sub)]));
+            brows.push((0, 0, thread_bg, Vec::new())); // gap between bubbles
+        }
+
+        if msgs.is_empty() {
+            let hint = "No messages yet - say hi below";
+            let hw = hint.chars().count() as u32;
+            if tw > hw {
+                g.write(tx0 + (tw - hw) / 2, area_top + area_h / 2, hint, sub, thread_bg);
+            }
+        } else {
+            let start = brows.len().saturating_sub(area_h as usize);
+            let vis = &brows[start..];
+            let first = area_bot.saturating_sub(vis.len() as u32);
+            for (i, (x0, bw, bbg, runs)) in vis.iter().enumerate() {
+                let row = first + i as u32;
+                if row < area_top || row >= area_bot {
+                    continue;
+                }
+                if *bw > 0 {
+                    fill_cells(g, *x0, row, *bw, *bbg, *bbg);
+                }
+                for (off, text, rfg) in runs {
+                    g.write(x0 + off, row, text, *rfg, *bbg);
+                }
+            }
+        }
+
+        // ── Composer (last row) ──────────────────────────────────────
+        let crow = rows - 1;
+        fill_cells(g, tx0, crow, tw, in_fg, in_bg);
+        let ph = self.input.is_empty();
+        let text = if ph { "Type a message".to_string() } else { format!("{}_", self.input) };
+        let tfg = if ph { sub } else { in_fg };
+        let shown: String = text.chars().take((tw - 2) as usize).collect();
+        g.write(tx0 + 1, crow, &shown, tfg, in_bg);
+
+        // Menu bar owns row 0 (drawn last so its drop-down overlays).
+        self.menu.render(g, fg, surface);
+    }
+}
+
+fn messenger_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Chat".into(),
+                items: vec![
+                    MenuBar::item("Everyone", "everyone"),
+                    MenuBar::item("Clear box", "clear"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![MenuBar::item("Toggle theme", "theme")],
+            },
+        ],
+    }
+}
+
+// ─── DrDrCord — a Discord-style channels + members chat ──────────────
+
+const DISCORD_CHANNELS: [&str; 4] = ["general", "random", "help", "dev"];
+const DCORD_RAIL_W: u32 = 14;
+const DCORD_MEMBERS_W: u32 = 16;
+const DCORD_BLURPLE: Px = Px::rgb(0x58, 0x65, 0xF2);
+
+/// Split a LAN chat line into (channel index, body). A line another
+/// DrDrCord client tagged `#chan ` routes to that channel; everything else
+/// (DrDrChat / Messages traffic) lands in #general.
+fn parse_channel(text: &str) -> (usize, &str) {
+    if let Some(rest) = text.strip_prefix('#') {
+        if let Some(sp) = rest.find(' ') {
+            let chan = &rest[..sp];
+            if let Some(i) = DISCORD_CHANNELS.iter().position(|c| *c == chan) {
+                return (i, rest[sp + 1..].trim_start());
+            }
+        }
+    }
+    (0, text)
+}
+
+/// A Discord-style three-pane chat: a channel rail, the message stream for
+/// the active channel, and an online-members list — over the same DrDrNet
+/// bus as DrDrChat, with channels carried as a `#chan ` text tag so other
+/// DrDrOS machines drop into the same rooms. Always dark, like the real thing.
+pub struct DiscordApp {
+    net: SharedNet,
+    input: String,
+    chan: usize,
+    menu: MenuBar,
+}
+
+impl DiscordApp {
+    pub fn new(net: SharedNet) -> Self {
+        Self { net, input: String::new(), chan: 0, menu: discord_menu() }
+    }
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "theme" => toggle_theme(),
+            "clear" => self.input.clear(),
+            "close" => return AppControl::Close,
+            _ => {
+                if let Some(i) = a.strip_prefix("chan").and_then(|s| s.parse::<usize>().ok()) {
+                    if i < DISCORD_CHANNELS.len() {
+                        self.chan = i;
+                    }
+                }
+            }
+        }
+        AppControl::Continue
+    }
+    fn send(&mut self) {
+        let Some(net) = net_snapshot(&self.net) else {
+            self.input.clear();
+            return;
+        };
+        let text = std::mem::take(&mut self.input);
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        fanout_chat(&net, format!("#{} {}", DISCORD_CHANNELS[self.chan], text));
+    }
+}
+
+impl WindowApp for DiscordApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Discord
+    }
+    fn title(&self) -> String {
+        format!("DrDrCord - #{}", DISCORD_CHANNELS[self.chan])
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        match key {
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Space => self.input.push(' '),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.send(),
+            KeyCode::Escape => self.input.clear(),
+            KeyCode::Up => self.chan = self.chan.saturating_sub(1),
+            KeyCode::Down => self.chan = (self.chan + 1).min(DISCORD_CHANNELS.len() - 1),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        if col < DCORD_RAIL_W && row >= 2 {
+            let i = (row - 2) as usize;
+            if i < DISCORD_CHANNELS.len() {
+                self.chan = i;
+            }
+        }
+        AppControl::Continue
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        let cols = g.cols;
+        let rows = g.rows;
+        if cols < DCORD_RAIL_W + DCORD_MEMBERS_W + 12 || rows < 5 {
+            g.text(0, 1, "window too small");
+            return;
+        }
+        // Discord is always dark — its own palette, independent of theme.
+        let rail_bg = Px::rgb(0x1E, 0x1F, 0x22);
+        let chat_bg = Px::rgb(0x31, 0x33, 0x38);
+        let mem_bg = Px::rgb(0x2B, 0x2D, 0x31);
+        let head_bg = Px::rgb(0x2B, 0x2D, 0x31);
+        let comp_bg = Px::rgb(0x40, 0x44, 0x4B);
+        let white = Px::rgb(0xF2, 0xF3, 0xF5);
+        let muted = Px::rgb(0x96, 0x9B, 0xA3);
+
+        let me = net_snapshot(&self.net);
+        let me_host = me.as_ref().map(|n| n.me.host.clone()).unwrap_or_else(|| "me".into());
+        let peers: Vec<String> = me
+            .as_ref()
+            .and_then(|n| n.directory.lock().ok().map(|d| d.snapshot()))
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.peer.host.clone())
+            .collect();
+
+        // ── Channel rail ─────────────────────────────────────────────
+        for r in 0..rows {
+            fill_cells(g, 0, r, DCORD_RAIL_W, white, rail_bg);
+        }
+        fill_cells(g, 0, 1, DCORD_RAIL_W, white, DCORD_BLURPLE);
+        g.write(1, 1, "DrDrOS", white, DCORD_BLURPLE);
+        for (i, ch) in DISCORD_CHANNELS.iter().enumerate() {
+            let row = 2 + i as u32;
+            if row >= rows {
+                break;
+            }
+            let on = i == self.chan;
+            let (cfg, cbg) = if on { (white, Px::rgb(0x40, 0x44, 0x4B)) } else { (muted, rail_bg) };
+            if on {
+                fill_cells(g, 0, row, DCORD_RAIL_W, cfg, cbg);
+            }
+            g.write(1, row, &format!("# {ch}"), cfg, cbg);
+        }
+
+        // ── Members pane (right) ─────────────────────────────────────
+        let mx0 = cols - DCORD_MEMBERS_W;
+        for r in 0..rows {
+            fill_cells(g, mx0, r, DCORD_MEMBERS_W, white, mem_bg);
+        }
+        g.write(mx0 + 1, 1, &format!("Online - {}", peers.len() + 1), muted, mem_bg);
+        let mut mrow = 2u32;
+        g.put(mx0 + 1, mrow, '*', MSG_GREEN, mem_bg);
+        g.write(mx0 + 3, mrow, &me_host, user_color(&me_host), mem_bg);
+        mrow += 1;
+        for p in &peers {
+            if mrow >= rows {
+                break;
+            }
+            g.put(mx0 + 1, mrow, '*', MSG_GREEN, mem_bg);
+            let shown: String = p.chars().take((DCORD_MEMBERS_W - 4) as usize).collect();
+            g.write(mx0 + 3, mrow, &shown, user_color(p), mem_bg);
+            mrow += 1;
+        }
+
+        // ── Chat column (middle) ─────────────────────────────────────
+        let cx0 = DCORD_RAIL_W;
+        let cw = mx0 - cx0;
+        for r in 0..rows {
+            fill_cells(g, cx0, r, cw, white, chat_bg);
+        }
+        fill_cells(g, cx0, 1, cw, white, head_bg);
+        g.write(cx0 + 1, 1, &format!("# {}", DISCORD_CHANNELS[self.chan]), white, head_bg);
+
+        let log = me
+            .as_ref()
+            .and_then(|n| n.chat_log.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default();
+        let area_top = 2u32;
+        let area_bot = rows - 1;
+        let inner_w = (cw as usize).saturating_sub(2).max(6);
+        let mut painted: Vec<(u32, String, Px)> = Vec::new(); // (offset, text, fg)
+        for m in &log {
+            let (ci, body) = parse_channel(&m.text);
+            if ci != self.chan {
+                continue;
+            }
+            painted.push((
+                1,
+                format!("{}  {}", m.from, fmt_hhmm(m.ts_unix_secs)),
+                user_color(&m.from),
+            ));
+            for l in wrap_text(body, inner_w) {
+                painted.push((1, l, white));
+            }
+        }
+        let area_h = area_bot.saturating_sub(area_top);
+        if painted.is_empty() {
+            g.write(cx0 + 2, area_top + 1, &format!("Welcome to #{}!", DISCORD_CHANNELS[self.chan]), muted, chat_bg);
+            g.write(cx0 + 2, area_top + 2, "This is the start of the channel.", muted, chat_bg);
+        } else {
+            let start = painted.len().saturating_sub(area_h as usize);
+            for (i, (off, text, tfg)) in painted[start..].iter().enumerate() {
+                let row = area_top + i as u32;
+                if row >= area_bot {
+                    break;
+                }
+                let shown: String = text.chars().take((cw - off - 1) as usize).collect();
+                g.write(cx0 + off, row, &shown, *tfg, chat_bg);
+            }
+        }
+
+        // Composer
+        let crow = rows - 1;
+        fill_cells(g, cx0, crow, cw, white, comp_bg);
+        let ph = self.input.is_empty();
+        let text = if ph { format!("Message #{}", DISCORD_CHANNELS[self.chan]) } else { format!("{}_", self.input) };
+        let tfg = if ph { muted } else { white };
+        let shown: String = text.chars().take((cw - 2) as usize).collect();
+        g.write(cx0 + 1, crow, &shown, tfg, comp_bg);
+
+        // Menu bar (its own dark colours so it blends with the app).
+        self.menu.render(g, rail_bg, white);
+    }
+}
+
+fn discord_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Channels".into(),
+                items: vec![
+                    MenuBar::item("# general", "chan0"),
+                    MenuBar::item("# random", "chan1"),
+                    MenuBar::item("# help", "chan2"),
+                    MenuBar::item("# dev", "chan3"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Clear box", "clear"),
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
+    }
+}
+
+// ─── DrDrMail — a local mailbox (compose, read, folders) ─────────────
+
+#[derive(Clone)]
+struct MailMsg {
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    ts: u64,
+}
+
+const MAIL_FOLDERS: [&str; 3] = ["Inbox", "Sent", "Drafts"];
+const MAIL_SIDEBAR_W: u32 = 11;
+
+#[derive(PartialEq, Clone, Copy)]
+enum MailField {
+    To,
+    Subject,
+    Body,
+}
+
+/// A self-contained mail client. There is no SMTP — mail lives on this
+/// machine — but it behaves like the real thing: three folders, a message
+/// list, a reading pane and a compose form. Sent mail is also written to
+/// your Documents as a `.eml` text file, so it shows up in Files too.
+pub struct MailApp {
+    folders: [Vec<MailMsg>; 3],
+    folder: usize,
+    sel: usize,
+    composing: Option<(MailMsg, MailField)>,
+    status: String,
+    menu: MenuBar,
+}
+
+impl MailApp {
+    pub fn new() -> Self {
+        let inbox = vec![
+            MailMsg {
+                from: "DrDrOS Team".into(),
+                to: "you".into(),
+                subject: "Welcome to DrDrMail".into(),
+                body: "Hi there!\n\nThis is your local mailbox. Use Mail > Compose to write a \
+                       message; sent mail is saved into your Documents as an .eml file so \
+                       you can find it in Files too.\n\nThere is no SMTP server - everything \
+                       here stays on this machine.\n\n- The DrDrOS Team"
+                    .into(),
+                ts: 1_700_000_000,
+            },
+            MailMsg {
+                from: "DrDrOS Tips".into(),
+                to: "you".into(),
+                subject: "Getting around".into(),
+                body: "Click a folder on the left to switch between Inbox, Sent and Drafts.\n\
+                       Click a message to read it. Press Tab to cycle folders, or use the \
+                       Mail menu at the top.\n\nEnjoy your new desktop!"
+                    .into(),
+                ts: 1_700_100_000,
+            },
+        ];
+        Self {
+            folders: [inbox, Vec::new(), Vec::new()],
+            folder: 0,
+            sel: 0,
+            composing: None,
+            status: "ready".into(),
+            menu: mail_menu(),
+        }
+    }
+
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "compose" => {
+                self.composing = Some((
+                    MailMsg { from: "me".into(), to: String::new(), subject: String::new(), body: String::new(), ts: 0 },
+                    MailField::To,
+                ));
+                self.status = "composing - Tab switches fields, menu Mail>Send".into();
+            }
+            "send" => self.finish_compose(true),
+            "draft" => self.finish_compose(false),
+            "discard" => {
+                self.composing = None;
+                self.status = "discarded".into();
+            }
+            "delete" => {
+                let f = self.folder;
+                if self.sel < self.folders[f].len() {
+                    self.folders[f].remove(self.sel);
+                    self.sel = self.sel.min(self.folders[f].len().saturating_sub(1));
+                    self.status = "deleted".into();
+                }
+            }
+            "inbox" => { self.folder = 0; self.sel = 0; }
+            "sent" => { self.folder = 1; self.sel = 0; }
+            "drafts" => { self.folder = 2; self.sel = 0; }
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    /// Move the compose buffer to Sent (and write a .eml to Documents) or
+    /// to Drafts, then leave compose mode.
+    fn finish_compose(&mut self, send: bool) {
+        let Some((mut m, _)) = self.composing.take() else {
+            self.status = "nothing to send".into();
+            return;
+        };
+        m.ts = crate::net::now_unix_secs();
+        if m.to.trim().is_empty() {
+            m.to = "(no recipient)".into();
+        }
+        if m.subject.trim().is_empty() {
+            m.subject = "(no subject)".into();
+        }
+        if send {
+            let fname = format!("mail-{}.eml", m.ts);
+            let eml = format!(
+                "From: {}\nTo: {}\nSubject: {}\nDate: {}\n\n{}\n",
+                m.from, m.to, m.subject, m.ts, m.body
+            );
+            let saved = drdr_store::save(&fname, eml.as_bytes()).is_ok();
+            self.folders[1].push(m);
+            self.folder = 1;
+            self.sel = self.folders[1].len() - 1;
+            self.status = if saved {
+                format!("sent (saved {fname} to Documents)")
+            } else {
+                "sent (could not write a copy to Documents)".into()
+            };
+        } else {
+            self.folders[2].push(m);
+            self.folder = 2;
+            self.sel = self.folders[2].len() - 1;
+            self.status = "saved to Drafts".into();
+        }
+    }
+
+    fn compose_key(&mut self, key: KeyCode) {
+        let Some((m, field)) = self.composing.as_mut() else { return };
+        let buf = match field {
+            MailField::To => &mut m.to,
+            MailField::Subject => &mut m.subject,
+            MailField::Body => &mut m.body,
+        };
+        match key {
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Space => buf.push(' '),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Tab => {
+                *field = match field {
+                    MailField::To => MailField::Subject,
+                    MailField::Subject => MailField::Body,
+                    MailField::Body => MailField::To,
+                };
+            }
+            KeyCode::Enter => {
+                if *field == MailField::Body {
+                    m.body.push('\n');
+                } else {
+                    *field = if *field == MailField::To { MailField::Subject } else { MailField::Body };
+                }
+            }
+            KeyCode::Escape => {
+                self.composing = None;
+                self.status = "compose cancelled".into();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl WindowApp for MailApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Mail
+    }
+    fn title(&self) -> String {
+        if self.composing.is_some() {
+            "DrDrMail - composing".into()
+        } else {
+            format!("DrDrMail - {} ({})", MAIL_FOLDERS[self.folder], self.folders[self.folder].len())
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        if self.composing.is_some() {
+            self.compose_key(key);
+            return AppControl::Continue;
+        }
+        let n = self.folders[self.folder].len();
+        match key {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Tab => {
+                self.folder = (self.folder + 1) % MAIL_FOLDERS.len();
+                self.sel = 0;
+            }
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        if self.composing.is_some() {
+            return AppControl::Continue;
+        }
+        if col < MAIL_SIDEBAR_W {
+            if row >= 2 && (row as usize - 2) < MAIL_FOLDERS.len() {
+                self.folder = row as usize - 2;
+                self.sel = 0;
+            }
+        } else if row >= 2 {
+            let idx = row as usize - 2;
+            if idx < self.folders[self.folder].len() {
+                self.sel = idx;
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let cols = g.cols;
+        let rows = g.rows;
+        let fg = g.fg();
+        let bg = g.bg();
+        let accent = Px::rgb(0x2D, 0x6C, 0xD8);
+        let muted = Px::rgb(0x80, 0x80, 0x88);
+
+        if let Some((m, field)) = &self.composing {
+            g.write(0, 1, "New message", accent, bg);
+            let mark = |f: MailField| if *field == f { '>' } else { ' ' };
+            g.write(0, 3, &format!("{} To:      {}", mark(MailField::To), m.to), fg, bg);
+            g.write(0, 4, &format!("{} Subject: {}", mark(MailField::Subject), m.subject), fg, bg);
+            g.write(0, 6, &format!("{} Body:", mark(MailField::Body)), fg, bg);
+            for (i, line) in m.body.split('\n').enumerate() {
+                let row = 7 + i as u32;
+                if row >= rows {
+                    break;
+                }
+                g.write(2, row, line, fg, bg);
+            }
+            if *field == MailField::Body {
+                // a caret at the end of the body
+                let last = m.body.split('\n').count() as u32 - 1;
+                let lastlen = m.body.split('\n').next_back().unwrap_or("").chars().count() as u32;
+                if 7 + last < rows {
+                    g.put(2 + lastlen, 7 + last, '_', bg, fg);
+                }
+            }
+            g.write(0, rows.saturating_sub(1), &format!("Tab=field  Mail>Send / Save draft  Esc=cancel   {}", self.status), muted, bg);
+            self.menu.render(g, fg, bg);
+            return;
+        }
+
+        // ── Folder sidebar ───────────────────────────────────────────
+        for r in 0..rows {
+            fill_cells(g, 0, r, MAIL_SIDEBAR_W, fg, bg);
+        }
+        g.write(1, 1, "Folders", muted, bg);
+        for (i, name) in MAIL_FOLDERS.iter().enumerate() {
+            let row = 2 + i as u32;
+            let on = i == self.folder;
+            let label = format!("{} {}", name, self.folders[i].len());
+            if on {
+                fill_cells(g, 0, row, MAIL_SIDEBAR_W, bg, fg);
+                g.write(1, row, &label, bg, fg);
+            } else {
+                g.write(1, row, &label, fg, bg);
+            }
+        }
+        for r in 0..rows {
+            g.put(MAIL_SIDEBAR_W, r, '|', muted, bg);
+        }
+
+        // ── Message list (top) + reading pane (bottom) ───────────────
+        let lx0 = MAIL_SIDEBAR_W + 2;
+        let list = &self.folders[self.folder];
+        if self.sel >= list.len() {
+            self.sel = list.len().saturating_sub(1);
+        }
+        let split = (rows / 2).max(3);
+        g.write(lx0, 1, &format!("{} - {} message(s)", MAIL_FOLDERS[self.folder], list.len()), muted, bg);
+        if list.is_empty() {
+            g.write(lx0, 3, "(no mail here)", muted, bg);
+        }
+        for (i, m) in list.iter().enumerate() {
+            let row = 2 + i as u32;
+            if row >= split {
+                break;
+            }
+            let line = format!("{:<14} {}", trunc(&m.from, 14), m.subject);
+            region_line(g, row, lx0, &line, i == self.sel);
+        }
+        // divider between list and reader
+        for c in lx0..cols {
+            g.put(c, split, '-', muted, bg);
+        }
+        // reading pane
+        if let Some(m) = list.get(self.sel) {
+            g.write(lx0, split + 1, &format!("From: {}", m.from), accent, bg);
+            g.write(lx0, split + 2, &format!("Subj: {}", m.subject), fg, bg);
+            let wrapw = (cols - lx0).max(8) as usize;
+            let mut row = split + 4;
+            for para in m.body.split('\n') {
+                for line in wrap_text(para, wrapw) {
+                    if row >= rows {
+                        break;
+                    }
+                    g.write(lx0, row, &line, fg, bg);
+                    row += 1;
+                }
+            }
+        }
+        self.menu.render(g, fg, bg);
+    }
+}
+
+fn mail_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Mail".into(),
+                items: vec![
+                    MenuBar::item("Compose", "compose"),
+                    MenuBar::item("Send", "send"),
+                    MenuBar::item("Save draft", "draft"),
+                    MenuBar::item("Discard", "discard"),
+                    MenuBar::item("Delete", "delete"),
+                ],
+            },
+            Menu {
+                title: "Folder".into(),
+                items: vec![
+                    MenuBar::item("Inbox", "inbox"),
+                    MenuBar::item("Sent", "sent"),
+                    MenuBar::item("Drafts", "drafts"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
+    }
+}
+
+// ─── DrDrCalendar — a month view with saved events ───────────────────
+
+/// A persistent month calendar. The grid shows a month with today ringed;
+/// click a day (or arrow to it) to see and add events. Each event is one
+/// line saved through drdr_store as `calendar.txt` ("YYYY-MM-DD|text"), so
+/// it survives a reboot whenever a disk is mounted.
+pub struct CalendarApp {
+    year: i64,
+    month: i64,
+    sel_day: i64,
+    events: Vec<(String, String)>,
+    input: String,
+    status: String,
+    menu: MenuBar,
+}
+
+impl CalendarApp {
+    pub fn new() -> Self {
+        let (y, m, d) = civil(now_unix().div_euclid(86_400));
+        let events = Self::load_events();
+        Self { year: y, month: m, sel_day: d, events, input: String::new(), status: "today".into(), menu: calendar_menu() }
+    }
+
+    fn load_events() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        if let Ok(bytes) = drdr_store::load("calendar.txt") {
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                if let Some((date, text)) = line.split_once('|') {
+                    v.push((date.to_string(), text.to_string()));
+                }
+            }
+        }
+        v
+    }
+
+    fn save_events(&mut self) {
+        let body: String = self.events.iter().map(|(d, t)| format!("{d}|{t}\n")).collect();
+        let _ = drdr_store::save("calendar.txt", body.as_bytes());
+    }
+
+    fn sel_date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.sel_day)
+    }
+
+    fn days_in_month(y: i64, m: i64) -> i64 {
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)
+    }
+
+    fn shift_month(&mut self, delta: i64) {
+        let mut m = self.month + delta;
+        while m > 12 {
+            m -= 12;
+            self.year += 1;
+        }
+        while m < 1 {
+            m += 12;
+            self.year -= 1;
+        }
+        self.month = m;
+        self.sel_day = self.sel_day.min(Self::days_in_month(self.year, self.month));
+    }
+
+    fn shift_day(&mut self, delta: i64) {
+        let dim = Self::days_in_month(self.year, self.month);
+        let nd = self.sel_day + delta;
+        if nd < 1 {
+            self.shift_month(-1);
+            self.sel_day = Self::days_in_month(self.year, self.month);
+        } else if nd > dim {
+            self.shift_month(1);
+            self.sel_day = 1;
+        } else {
+            self.sel_day = nd;
+        }
+    }
+
+    fn add_event(&mut self) {
+        let text = std::mem::take(&mut self.input);
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.events.push((self.sel_date(), text));
+        self.save_events();
+        self.status = "event added".into();
+    }
+
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "prev" => self.shift_month(-1),
+            "next" => self.shift_month(1),
+            "today" => {
+                let (y, m, d) = civil(now_unix().div_euclid(86_400));
+                self.year = y;
+                self.month = m;
+                self.sel_day = d;
+            }
+            "del" => {
+                let date = self.sel_date();
+                if let Some(pos) = self.events.iter().rposition(|(d, _)| *d == date) {
+                    self.events.remove(pos);
+                    self.save_events();
+                    self.status = "removed last event of the day".into();
+                }
+            }
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December",
+];
+
+impl WindowApp for CalendarApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Calendar
+    }
+    fn title(&self) -> String {
+        format!("Calendar - {} {}", MONTH_NAMES[(self.month - 1).clamp(0, 11) as usize], self.year)
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        match key {
+            KeyCode::Left => self.shift_day(-1),
+            KeyCode::Right => self.shift_day(1),
+            KeyCode::Up => self.shift_day(-7),
+            KeyCode::Down => self.shift_day(7),
+            KeyCode::PageUp => self.shift_month(-1),
+            KeyCode::PageDown => self.shift_month(1),
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Space => self.input.push(' '),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.add_event(),
+            KeyCode::Escape => self.input.clear(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Grid starts at row 4 (after menu, title, weekday header); each
+        // week is one row, each day 4 cells wide from column 1.
+        if row >= 4 && col >= 1 && col < 1 + 7 * 4 {
+            let wd = ((col - 1) / 4) as i64;
+            let week = (row - 4) as i64;
+            let first_wd = ((days_from_civil(self.year, self.month, 1) % 7) + 4).rem_euclid(7);
+            let day = week * 7 + wd - first_wd + 1;
+            if day >= 1 && day <= Self::days_in_month(self.year, self.month) {
+                self.sel_day = day;
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let rows = g.rows;
+        let fg = g.fg();
+        let bg = g.bg();
+        let accent = Px::rgb(0x2D, 0x6C, 0xD8);
+        let muted = Px::rgb(0x80, 0x80, 0x88);
+        let red = Px::rgb(0xD0, 0x3A, 0x3A);
+
+        let title = format!("{}  {}   < PgUp   PgDn >", MONTH_NAMES[(self.month - 1).clamp(0, 11) as usize], self.year);
+        g.write(1, 1, &title, accent, bg);
+        g.write(1, 2, "Su  Mo  Tu  We  Th  Fr  Sa", muted, bg);
+
+        let (ty, tm, td) = civil(now_unix().div_euclid(86_400));
+        let first_wd = ((days_from_civil(self.year, self.month, 1) % 7) + 4).rem_euclid(7);
+        let dim = Self::days_in_month(self.year, self.month);
+        for day in 1..=dim {
+            let cell = first_wd + (day - 1);
+            let week = (cell / 7) as u32;
+            let wd = (cell % 7) as u32;
+            let row = 4 + week;
+            let col = 1 + wd * 4;
+            if row >= rows {
+                break;
+            }
+            let is_today = self.year == ty && self.month == tm && day == td;
+            let is_sel = day == self.sel_day;
+            let has_ev = self.events.iter().any(|(d, _)| *d == format!("{:04}-{:02}-{:02}", self.year, self.month, day));
+            let label = format!("{day:>2}");
+            let (cfg, cbg) = if is_sel {
+                (bg, accent)
+            } else if is_today {
+                (red, bg)
+            } else {
+                (fg, bg)
+            };
+            if is_sel {
+                fill_cells(g, col, row, 3, cfg, cbg);
+            }
+            g.write(col, row, &label, cfg, cbg);
+            if has_ev {
+                g.put(col + 2, row, '.', if is_sel { bg } else { accent }, cbg);
+            }
+        }
+
+        // ── Events for the selected day + composer ───────────────────
+        let panel_row = 4 + 7;
+        if panel_row < rows {
+            let date = self.sel_date();
+            g.write(1, panel_row, &format!("Events on {date}:"), accent, bg);
+            let todays: Vec<&String> = self.events.iter().filter(|(d, _)| *d == date).map(|(_, t)| t).collect();
+            if todays.is_empty() {
+                g.write(2, panel_row + 1, "(none - type below and press Enter)", muted, bg);
+            }
+            for (i, t) in todays.iter().enumerate() {
+                let row = panel_row + 1 + i as u32;
+                if row >= rows - 1 {
+                    break;
+                }
+                g.write(2, row, &format!("- {t}"), fg, bg);
+            }
+        }
+        let crow = rows - 1;
+        g.write(1, crow, &format!("Add: {}_   ({})", self.input, self.status), accent, bg);
+
+        self.menu.render(g, fg, bg);
+    }
+}
+
+fn calendar_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Month".into(),
+                items: vec![
+                    MenuBar::item("Previous", "prev"),
+                    MenuBar::item("Next", "next"),
+                    MenuBar::item("Jump to today", "today"),
+                ],
+            },
+            Menu {
+                title: "Event".into(),
+                items: vec![MenuBar::item("Delete day's last", "del")],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
+    }
+}
+
+// ─── DrDrContacts — a saved address book ─────────────────────────────
+
+/// A persistent address book. Contacts are saved through drdr_store as
+/// `contacts.txt` ("name|detail" per line). Type "Name = detail" in the
+/// composer and press Enter to add one; the list survives a reboot when a
+/// disk is mounted.
+pub struct ContactsApp {
+    contacts: Vec<(String, String)>,
+    sel: usize,
+    input: String,
+    adding: bool,
+    status: String,
+    menu: MenuBar,
+}
+
+impl ContactsApp {
+    pub fn new() -> Self {
+        let mut contacts = Self::load();
+        if contacts.is_empty() {
+            contacts.push(("DrDrOS Team".into(), "hello@drdros.local".into()));
+            contacts.push(("Support".into(), "press F1 for shortcuts".into()));
+        }
+        Self { contacts, sel: 0, input: String::new(), adding: false, status: "ready".into(), menu: contacts_menu() }
+    }
+
+    fn load() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        if let Ok(bytes) = drdr_store::load("contacts.txt") {
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                let (name, detail) = line.split_once('|').unwrap_or((line, ""));
+                if !name.trim().is_empty() {
+                    v.push((name.to_string(), detail.to_string()));
+                }
+            }
+        }
+        v
+    }
+
+    fn save(&mut self) {
+        let body: String = self.contacts.iter().map(|(n, d)| format!("{n}|{d}\n")).collect();
+        let _ = drdr_store::save("contacts.txt", body.as_bytes());
+    }
+
+    fn commit_add(&mut self) {
+        let raw = std::mem::take(&mut self.input);
+        let raw = raw.trim();
+        if raw.is_empty() {
+            self.adding = false;
+            return;
+        }
+        let (name, detail) = raw.split_once('=').map(|(n, d)| (n.trim(), d.trim())).unwrap_or((raw, ""));
+        self.contacts.push((name.to_string(), detail.to_string()));
+        self.sel = self.contacts.len() - 1;
+        self.save();
+        self.adding = false;
+        self.status = "contact added".into();
+    }
+
+    fn do_action(&mut self, a: &str) -> AppControl {
+        match a {
+            "new" => {
+                self.adding = true;
+                self.input.clear();
+                self.status = "type  Name = detail  then Enter".into();
+            }
+            "delete" => {
+                if self.sel < self.contacts.len() {
+                    self.contacts.remove(self.sel);
+                    self.sel = self.sel.min(self.contacts.len().saturating_sub(1));
+                    self.save();
+                    self.status = "deleted".into();
+                }
+            }
+            "message" => {
+                self.status = "open DrDrMessages to chat on the LAN".into();
+            }
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+}
+
+impl WindowApp for ContactsApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Contacts
+    }
+    fn title(&self) -> String {
+        format!("Contacts ({})", self.contacts.len())
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        if self.adding {
+            match key {
+                KeyCode::Char(c) => self.input.push(c),
+                KeyCode::Space => self.input.push(' '),
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Enter => self.commit_add(),
+                KeyCode::Escape => {
+                    self.adding = false;
+                    self.input.clear();
+                }
+                _ => {}
+            }
+            return AppControl::Continue;
+        }
+        match key {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(self.contacts.len().saturating_sub(1)),
+            KeyCode::Char('n') => return self.do_action("new"),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        let listw = 22u32;
+        if col < listw && row >= 2 {
+            let idx = row as usize - 2;
+            if idx < self.contacts.len() {
+                self.sel = idx;
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let cols = g.cols;
+        let rows = g.rows;
+        let fg = g.fg();
+        let bg = g.bg();
+        let accent = Px::rgb(0x2B, 0x9B, 0x8A);
+        let muted = Px::rgb(0x80, 0x80, 0x88);
+        let listw = 22u32.min(cols / 2);
+
+        if self.sel >= self.contacts.len() {
+            self.sel = self.contacts.len().saturating_sub(1);
+        }
+
+        // List
+        g.write(1, 1, "People", muted, bg);
+        for (i, (name, _)) in self.contacts.iter().enumerate() {
+            let row = 2 + i as u32;
+            if row >= rows - 1 {
+                break;
+            }
+            let on = i == self.sel;
+            let shown: String = name.chars().take((listw - 4) as usize).collect();
+            if on {
+                fill_cells(g, 0, row, listw, bg, fg);
+                g.put(1, row, '*', bg, fg);
+                g.write(3, row, &shown, bg, fg);
+            } else {
+                g.put(1, row, 'o', accent, bg);
+                g.write(3, row, &shown, fg, bg);
+            }
+        }
+        for r in 0..rows {
+            g.put(listw, r, '|', muted, bg);
+        }
+
+        // Detail card
+        let dx = listw + 2;
+        if let Some((name, detail)) = self.contacts.get(self.sel) {
+            g.write(dx, 1, name, accent, bg);
+            g.write(dx, 3, "Detail:", muted, bg);
+            for (i, line) in wrap_text(detail, (cols - dx).max(6) as usize).iter().enumerate() {
+                let row = 4 + i as u32;
+                if row >= rows - 2 {
+                    break;
+                }
+                g.write(dx, row, line, fg, bg);
+            }
+        }
+
+        let crow = rows - 1;
+        if self.adding {
+            g.write(0, crow, &format!("New (Name = detail): {}_", self.input), accent, bg);
+        } else {
+            g.write(0, crow, &format!("n=new  Contacts menu to delete   {}", self.status), muted, bg);
+        }
+        self.menu.render(g, fg, bg);
+    }
+}
+
+fn contacts_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Contacts".into(),
+                items: vec![
+                    MenuBar::item("New", "new"),
+                    MenuBar::item("Delete", "delete"),
+                    MenuBar::item("Message on LAN", "message"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
+    }
+}
+
+/// Truncate `s` to `n` chars (no ellipsis) — small helper for table cells.
+fn trunc(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -5976,12 +7714,12 @@ mod app_tests {
 
     #[test]
     fn clicking_a_place_navigates_there() {
-        // "Scratch" → /tmp is the 4th place (sidebar row 4, i.e. row index
-        // 4 = place index 3). A click in the sidebar column jumps the cwd.
+        // Row 0 is now the menu bar and row 1 the "PLACES" header, so the
+        // place list starts at row 2: place index i sits at row i + 2.
+        // "Scratch" → /tmp is place index 3 → sidebar row 5.
         let mut f = FilesApp::new(drdr_store::documents_dir());
         let scratch = std::path::PathBuf::from("/tmp");
-        // Sidebar rows are 1-based; "Scratch" is the 4th place → row 4.
-        f.on_click(1, 4, false);
+        f.on_click(1, 5, false);
         if scratch.is_dir() {
             assert_eq!(f.cwd, scratch, "sidebar click should navigate to /tmp");
         }
@@ -6129,5 +7867,84 @@ mod app_tests {
         let before = p.cells[10][10];
         p.touch(1, 1);
         assert_eq!(p.cells[10][10], before);
+    }
+
+    // ─── messaging suite (Messages / DrDrCord / Mail / Calendar) ─────
+
+    #[test]
+    fn wrap_text_wraps_words_and_hard_breaks_long_ones() {
+        // Plain wrap at a word boundary.
+        assert_eq!(wrap_text("the quick brown fox", 9), vec!["the quick", "brown fox"]);
+        // A word longer than the line is hard-split, never panicking.
+        let v = wrap_text("supercalifragilistic", 6);
+        assert!(v.iter().all(|l| l.chars().count() <= 6));
+        assert_eq!(v.concat(), "supercalifragilistic");
+        // Blank input still yields one (empty) line so a blank stays blank.
+        assert_eq!(wrap_text("", 8), vec![String::new()]);
+    }
+
+    #[test]
+    fn parse_channel_routes_tagged_lines_and_defaults_to_general() {
+        assert_eq!(parse_channel("#help anyone there?"), (2, "anyone there?"));
+        assert_eq!(parse_channel("#dev shipping it"), (3, "shipping it"));
+        // Unknown tag or untagged line → #general (index 0), body unchanged.
+        assert_eq!(parse_channel("#nope hi"), (0, "#nope hi"));
+        assert_eq!(parse_channel("just chatting"), (0, "just chatting"));
+    }
+
+    #[test]
+    fn user_color_is_stable_per_name() {
+        assert_eq!(user_color("alice"), user_color("alice"));
+        // Different names generally differ (these two are picked to).
+        assert_ne!(user_color("alice"), user_color("bob"));
+    }
+
+    #[test]
+    fn calendar_month_length_and_navigation() {
+        // Known month lengths incl. a leap February.
+        assert_eq!(CalendarApp::days_in_month(2026, 2), 28);
+        assert_eq!(CalendarApp::days_in_month(2024, 2), 29);
+        assert_eq!(CalendarApp::days_in_month(2026, 4), 30);
+        assert_eq!(CalendarApp::days_in_month(2026, 12), 31);
+        // Stepping a day off the end of December rolls into next January.
+        let mut c = CalendarApp::new();
+        c.year = 2026;
+        c.month = 12;
+        c.sel_day = 31;
+        c.shift_day(1);
+        assert_eq!((c.year, c.month, c.sel_day), (2027, 1, 1));
+        // And back the other way.
+        c.shift_day(-1);
+        assert_eq!((c.year, c.month, c.sel_day), (2026, 12, 31));
+    }
+
+    #[test]
+    fn mail_compose_send_moves_to_sent() {
+        let mut m = MailApp::new();
+        assert_eq!(m.folders[1].len(), 0); // Sent empty
+        m.do_action("compose");
+        // Fill the compose buffer directly.
+        if let Some((msg, _)) = m.composing.as_mut() {
+            msg.to = "bob".into();
+            msg.subject = "hi".into();
+            msg.body = "hello there".into();
+        }
+        m.finish_compose(true);
+        assert_eq!(m.folders[1].len(), 1);
+        assert_eq!(m.folder, 1);
+        assert_eq!(m.folders[1][0].subject, "hi");
+    }
+
+    #[test]
+    fn contacts_add_parses_name_and_detail() {
+        let mut c = ContactsApp::new();
+        let n0 = c.contacts.len();
+        c.adding = true;
+        c.input = "Ada Lovelace = ada@analytical.engine".into();
+        c.commit_add();
+        assert_eq!(c.contacts.len(), n0 + 1);
+        let (name, detail) = c.contacts.last().unwrap();
+        assert_eq!(name, "Ada Lovelace");
+        assert_eq!(detail, "ada@analytical.engine");
     }
 }
