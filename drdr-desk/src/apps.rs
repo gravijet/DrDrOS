@@ -21,7 +21,8 @@ use std::time::Duration;
 use drdr_net::status::{KIND_STAT_REQ, Stat, StatReq};
 use drdr_net::Conn;
 use drdr_ui::{
-    AppControl, DesktopIcon, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp, WindowManager,
+    AppControl, DesktopIcon, IconKind, KeyCode, Px, Rect, Spawn, TextGrid, Theme, WindowApp,
+    WindowManager,
 };
 
 use nix::sys::reboot::{RebootMode, reboot};
@@ -82,6 +83,9 @@ fn spawn_rect() -> Rect {
 pub struct AboutApp;
 
 impl WindowApp for AboutApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Info
+    }
     fn title(&self) -> String {
         "About DrDrOS".into()
     }
@@ -196,10 +200,16 @@ impl FilesApp {
         } else {
             let mut path = self.cwd.clone();
             path.push(&it.name);
-            self.spawns.push(Spawn {
-                rect: spawn_rect(),
-                app: Box::new(EditApp::new(path)),
-            });
+            // Route by file type: images to the viewer, web/markdown to
+            // the browser, binaries to a safe info pane, everything else
+            // (text + code) to the editor.
+            let app: Box<dyn WindowApp> = match classify(&it.name) {
+                FileClass::Image => Box::new(ImageApp::open(path)),
+                FileClass::Web => Box::new(BrowserApp::open(path)),
+                FileClass::Binary => Box::new(BinaryInfoApp::open(path)),
+                _ => Box::new(EditApp::new(path)),
+            };
+            self.spawns.push(Spawn { rect: spawn_rect(), app });
         }
     }
 
@@ -247,9 +257,53 @@ impl FilesApp {
         }
         self.sel = (self.sel as i32 + delta).clamp(0, n - 1) as usize;
     }
+
+    /// The "Places" shortcuts shown in the left sidebar: the writable
+    /// Documents / Data folders, the filesystem root, and the scratch
+    /// area. A click jumps straight there — the navigation rail every
+    /// modern file manager has.
+    fn places(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("Documents", drdr_store::documents_dir()),
+            ("My Data", drdr_store::data_dir()),
+            ("Filesystem", PathBuf::from("/")),
+            ("Scratch", PathBuf::from("/tmp")),
+        ]
+    }
+
+    /// Jump to a Places shortcut (only if it's a readable directory).
+    fn nav_to(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.cwd = p;
+            self.reload();
+        }
+    }
+}
+
+/// Width of the file-manager navigation sidebar, in character cells.
+const FILES_SIDEBAR_W: u32 = 14;
+/// First content column to the right of the sidebar + its divider.
+const FILES_LIST_X: u32 = FILES_SIDEBAR_W + 2;
+
+/// Write one list line in the content region `[x0, cols)`, painting a
+/// reverse-video background across just that region when selected — so a
+/// left sidebar drawn earlier is never overwritten.
+fn region_line(g: &mut TextGrid, row: u32, x0: u32, text: &str, sel: bool) {
+    if sel {
+        let (fg, bg) = (g.bg(), g.fg());
+        for c in x0..g.cols {
+            g.put(c, row, ' ', fg, bg);
+        }
+        g.write(x0, row, text, fg, bg);
+    } else {
+        g.text(x0, row, text);
+    }
 }
 
 impl WindowApp for FilesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Folder
+    }
     fn title(&self) -> String {
         format!("DrDrFiles - {}", self.cwd.display())
     }
@@ -302,9 +356,22 @@ impl WindowApp for FilesApp {
         AppControl::Continue
     }
 
-    fn on_click(&mut self, _col: u32, row: u32, double: bool) -> AppControl {
-        // Row 0 is the header; entries start at row 1.
-        if !matches!(self.mode, FMode::Browse) || row == 0 {
+    fn on_click(&mut self, col: u32, row: u32, double: bool) -> AppControl {
+        if !matches!(self.mode, FMode::Browse) {
+            return AppControl::Continue;
+        }
+        // A click in the left sidebar jumps to that Place.
+        if col < FILES_SIDEBAR_W {
+            if row >= 1 {
+                let places = self.places();
+                if let Some((_, p)) = places.get(row as usize - 1) {
+                    self.nav_to(p.clone());
+                }
+            }
+            return AppControl::Continue;
+        }
+        // The file list: row 0 is the header; entries start at row 1.
+        if row == 0 {
             return AppControl::Continue;
         }
         let idx = self.scroll + (row as usize - 1);
@@ -318,9 +385,33 @@ impl WindowApp for FilesApp {
     }
 
     fn render(&mut self, g: &mut TextGrid) {
+        // ── Left navigation sidebar ("Places") ──────────────────────────
+        let muted = g.fg();
+        g.write(1, 0, "PLACES", muted, g.bg());
+        let active_place = self.places().iter().position(|(_, p)| *p == self.cwd);
+        for (i, (label, _)) in self.places().iter().enumerate() {
+            let row = i as u32 + 1;
+            let sel = active_place == Some(i);
+            if sel {
+                let (fg, bg) = (g.bg(), g.fg());
+                for c in 0..FILES_SIDEBAR_W {
+                    g.put(c, row, ' ', fg, bg);
+                }
+                g.write(1, row, label, fg, bg);
+            } else {
+                g.write(1, row, label, g.fg(), g.bg());
+            }
+        }
+        // Vertical divider between the sidebar and the file list.
+        for r in 0..g.rows {
+            g.put(FILES_SIDEBAR_W, r, '|', muted, g.bg());
+        }
+
+        let x0 = FILES_LIST_X;
         if let Some(e) = &self.err {
-            g.text(1, 1, e);
-            g.text(1, 3, "(any key / r to reload)");
+            let e = e.clone();
+            g.text(x0, 1, &e);
+            g.text(x0, 3, "(any key / r to reload)");
         }
         let rows = g.rows as usize;
         let visible = rows.saturating_sub(2);
@@ -341,7 +432,7 @@ impl WindowApp for FilesApp {
                 format!("delete '{n}' ?  y = yes, any other key = no")
             }
         };
-        g.text(0, 0, &header);
+        g.text(x0, 0, &header);
 
         if self.err.is_some() {
             return;
@@ -352,14 +443,9 @@ impl WindowApp for FilesApp {
                 break;
             }
             let it = &self.items[idx];
-            let tag = if it.is_dir { "[D] " } else { "    " };
-            let line = format!("{tag}{}", it.name);
+            let line = format!("{:<4} {}", type_tag(&it.name, it.is_dir), it.name);
             let row = vis as u32 + 1;
-            if idx == self.sel {
-                selected(g, row, &line);
-            } else {
-                g.text(0, row, &line);
-            }
+            region_line(g, row, x0, &line, idx == self.sel);
         }
     }
 }
@@ -374,6 +460,10 @@ impl WindowApp for FilesApp {
 pub struct EditApp {
     path: PathBuf,
     lines: Vec<String>,
+    /// Per-character manual colour, parallel to `lines` (one entry per
+    /// char). `None` = use the syntax/default colour. Set by the Colour
+    /// menu, applied to typed text.
+    colors: Vec<Vec<Option<Px>>>,
     cx: usize,
     cy: usize,
     top: usize,
@@ -384,6 +474,16 @@ pub struct EditApp {
     save_as: Option<String>,
     /// Ticks since the last edit while dirty — drives the autosave.
     autosave: u16,
+    /// The clickable File / Format / Colour / View menu bar.
+    menu: MenuBar,
+    /// Current ink for newly typed characters (None = default colour).
+    ink: Option<Px>,
+    /// Text magnification (1..=3), driven by Format → Bigger/Smaller.
+    text_zoom: u32,
+    /// Language for syntax highlighting (from the file extension).
+    lang: Lang,
+    /// Whether syntax highlighting is on (View → Toggle syntax).
+    syntax: bool,
 }
 
 impl EditApp {
@@ -399,11 +499,103 @@ impl EditApp {
             }
             Err(_) => (vec![String::new()], "new file".into()),
         };
-        Self { path, lines, cx: 0, cy: 0, top: 0, modified: false, status, save_as: None, autosave: 0 }
+        let colors = lines.iter().map(|l| vec![None; l.chars().count()]).collect();
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let lang = lang_for(&name);
+        Self {
+            path,
+            lines,
+            colors,
+            cx: 0,
+            cy: 0,
+            top: 0,
+            modified: false,
+            status,
+            save_as: None,
+            autosave: 0,
+            menu: editor_menu(),
+            ink: None,
+            text_zoom: 1,
+            lang,
+            syntax: lang != Lang::Plain,
+        }
+    }
+
+    /// Resolve the colour of every character on line `li`: a manual ink
+    /// wins, then syntax highlighting (if on), then the default `fg`.
+    fn line_colors(&self, li: usize, fg: Px) -> Vec<Px> {
+        let line = &self.lines[li];
+        let mut base = if self.syntax {
+            highlight(line, self.lang, fg)
+        } else {
+            vec![fg; line.chars().count()]
+        };
+        if let Some(man) = self.colors.get(li) {
+            for (i, c) in base.iter_mut().enumerate() {
+                if let Some(Some(px)) = man.get(i) {
+                    *c = *px;
+                }
+            }
+        }
+        base
+    }
+
+    /// Apply an action id fired by the menu bar.
+    fn do_action(&mut self, action: &str) -> AppControl {
+        match action {
+            "new" => {
+                self.lines = vec![String::new()];
+                self.colors = vec![vec![]];
+                self.cx = 0;
+                self.cy = 0;
+                self.top = 0;
+                self.modified = true;
+                self.lang = Lang::Plain;
+                self.syntax = false;
+                self.status = "new document (Save As to name it)".into();
+            }
+            "save" => {
+                self.save();
+            }
+            "saveas" => {
+                self.save_as = Some(String::new());
+                self.status = "Save As: type a name then Enter (Esc to cancel)".into();
+            }
+            "close" => {
+                self.save();
+                return AppControl::Close;
+            }
+            "size_up" => self.text_zoom = (self.text_zoom + 1).min(3),
+            "size_down" => self.text_zoom = self.text_zoom.saturating_sub(1).max(1),
+            "colorline" => {
+                if let Some(row) = self.colors.get_mut(self.cy) {
+                    for c in row.iter_mut() {
+                        *c = self.ink;
+                    }
+                    self.modified = true;
+                }
+            }
+            "color_reset" => {
+                for row in &mut self.colors {
+                    for c in row.iter_mut() {
+                        *c = None;
+                    }
+                }
+            }
+            "ink_default" => self.ink = None,
+            "syntax" => self.syntax = !self.syntax,
+            "theme" => toggle_theme(),
+            other => {
+                if other.starts_with("ink_") {
+                    self.ink = ink_for_action(other);
+                }
+            }
+        }
+        AppControl::Continue
     }
 
     fn cur_len(&self) -> usize {
-        self.lines[self.cy].len()
+        self.lines[self.cy].chars().count()
     }
 
     fn clamp_cx(&mut self) {
@@ -458,6 +650,10 @@ impl EditApp {
             .map(|(i, _)| i)
             .unwrap_or(line.len());
         line.insert(byte, c);
+        // Keep the parallel colour buffer in lock-step with the text.
+        let row = &mut self.colors[self.cy];
+        let at = self.cx.min(row.len());
+        row.insert(at, self.ink);
         self.cx += 1;
         self.modified = true;
     }
@@ -467,21 +663,35 @@ impl EditApp {
             let line = &mut self.lines[self.cy];
             let (byte, _) = line.char_indices().nth(self.cx - 1).unwrap();
             line.remove(byte);
+            let row = &mut self.colors[self.cy];
+            if self.cx - 1 < row.len() {
+                row.remove(self.cx - 1);
+            }
             self.cx -= 1;
             self.modified = true;
         } else if self.cy > 0 {
             let cur = self.lines.remove(self.cy);
+            let cur_c = self.colors.remove(self.cy);
             self.cy -= 1;
             self.cx = self.cur_len();
             self.lines[self.cy].push_str(&cur);
+            self.colors[self.cy].extend(cur_c);
             self.modified = true;
         }
     }
 
     fn newline(&mut self) {
         let at = self.cx.min(self.cur_len());
-        let rest = self.lines[self.cy].split_off(at);
+        let byte = self.lines[self.cy]
+            .char_indices()
+            .nth(at)
+            .map(|(i, _)| i)
+            .unwrap_or(self.lines[self.cy].len());
+        let rest = self.lines[self.cy].split_off(byte);
         self.lines.insert(self.cy + 1, rest);
+        let row = &mut self.colors[self.cy];
+        let rest_c = if at <= row.len() { row.split_off(at) } else { Vec::new() };
+        self.colors.insert(self.cy + 1, rest_c);
         self.cy += 1;
         self.cx = 0;
         self.modified = true;
@@ -489,9 +699,16 @@ impl EditApp {
 }
 
 impl WindowApp for EditApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
     fn title(&self) -> String {
         let star = if self.modified { "*" } else { "" };
         format!("DrDrEdit{star} - {}", self.path.display())
+    }
+
+    fn zoom(&self) -> u32 {
+        self.text_zoom
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
@@ -520,6 +737,12 @@ impl WindowApp for EditApp {
                 }
                 _ => {}
             }
+            return AppControl::Continue;
+        }
+
+        // A keystroke dismisses an open menu (so you don't type into it).
+        if self.menu.is_open() {
+            self.menu.close();
             return AppControl::Continue;
         }
 
@@ -577,9 +800,17 @@ impl WindowApp for EditApp {
     }
 
     fn on_click(&mut self, col: u32, row: u32, _double: bool) -> AppControl {
-        // Row 0 is the status line; text starts at row 1.
-        if row >= 1 {
-            let target = self.top + (row as usize - 1);
+        if self.save_as.is_some() {
+            return AppControl::Continue;
+        }
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Row 0 = menu bar, row 1 = status; document text from row 2.
+        if row >= 2 {
+            let target = self.top + (row as usize - 2);
             if target < self.lines.len() {
                 self.cy = target;
                 self.cx = (col as usize).min(self.cur_len());
@@ -605,42 +836,56 @@ impl WindowApp for EditApp {
 
     fn render(&mut self, g: &mut TextGrid) {
         let rows = g.rows as usize;
-        let text_rows = rows.saturating_sub(1);
-        // Keep the caret line on screen.
+        // Row 0 = menu bar, row 1 = status; document text uses the rest.
+        let text_rows = rows.saturating_sub(2);
         if self.cy < self.top {
             self.top = self.cy;
         } else if text_rows > 0 && self.cy >= self.top + text_rows {
             self.top = self.cy + 1 - text_rows;
         }
 
-        let star = if self.modified { " *modified" } else { "" };
+        let star = if self.modified { " *" } else { "" };
+        let inkname = if self.ink.is_some() { "custom" } else { "default" };
         let header = if let Some(buf) = &self.save_as {
             format!("Save As: {buf}_  (Enter=ok Esc=cancel)")
         } else {
             format!(
-                "Esc save&close  Shift+Tab save-as  [{}]{star}  {}",
+                "[{}]{star} ink:{} size:{}x  {}",
                 self.lines.len(),
+                inkname,
+                self.text_zoom,
                 self.status
             )
         };
-        g.text(0, 0, &header);
+        g.text(0, 1, &header);
 
+        let fg = g.fg();
+        let bg = g.bg();
         for vis in 0..text_rows {
             let li = self.top + vis;
             if li >= self.lines.len() {
                 break;
             }
-            let row = vis as u32 + 1;
-            g.text(0, row, &self.lines[li]);
-            // Draw the caret as a reverse-video cell on its line.
+            let row = vis as u32 + 2;
+            let colors = self.line_colors(li, fg);
+            for (i, ch) in self.lines[li].chars().enumerate() {
+                if i as u32 >= g.cols {
+                    break;
+                }
+                let c = colors.get(i).copied().unwrap_or(fg);
+                g.put(i as u32, row, ch, c, bg);
+            }
+            // Caret as a reverse-video cell on its line.
             if li == self.cy {
-                let line = &self.lines[li];
-                let ch = line.chars().nth(self.cx).unwrap_or(' ');
+                let ch = self.lines[li].chars().nth(self.cx).unwrap_or(' ');
                 if (self.cx as u32) < g.cols {
-                    g.put(self.cx as u32, row, ch, g.bg(), g.fg());
+                    g.put(self.cx as u32, row, ch, bg, fg);
                 }
             }
         }
+
+        // Menu bar painted LAST so its drop-down overlays the document.
+        self.menu.render(g, fg, bg);
     }
 }
 
@@ -651,7 +896,7 @@ impl WindowApp for EditApp {
 /// this automatically whenever the desktop becomes empty, so closed
 /// windows can always be reopened.
 pub struct LauncherApp {
-    items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
+    items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     sel: usize,
     spawns: Vec<Spawn>,
 }
@@ -662,42 +907,47 @@ pub struct LauncherApp {
 /// that builds the window on demand.
 pub fn app_catalog(
     net: SharedNet,
-) -> Vec<(String, Box<dyn Fn() -> Spawn>)> {
+) -> Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)> {
     fn entry(
         label: &str,
+        icon: IconKind,
         f: impl Fn() -> Box<dyn WindowApp> + 'static,
-    ) -> (String, Box<dyn Fn() -> Spawn>) {
+    ) -> (String, IconKind, Box<dyn Fn() -> Spawn>) {
         (
             label.to_string(),
+            icon,
             Box::new(move || Spawn { rect: spawn_rect(), app: f() }),
         )
     }
     let net_for_chat = net.clone();
     let net_for_settings = net.clone();
     let net_for_panel = net.clone();
+    let net_for_network = net.clone();
     vec![
         // Default to the user's writable Documents folder — that's where
         // Notes / drdr-store::save live, and it shows the user where
         // their files actually go (RAM or a mounted disk).
-        entry("Files", || Box::new(FilesApp::new(drdr_store::documents_dir()))),
-        entry("Text Editor", || Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))),
-        entry("Notes (saved)", || Box::new(NotesApp::new())),
-        entry("Tasks (saved)", || Box::new(TasksApp::new())),
-        entry("Terminal (Shell)", || Box::new(ConsoleApp::new())),
-        entry("Calculator", || Box::new(CalcApp::new())),
-        entry("Clock & Calendar", || Box::new(ClockApp::new())),
-        entry("System Monitor", || Box::new(SysMonApp::new())),
-        entry("System Info", || Box::new(SysInfoApp::new())),
-        entry("DrDrChat (LAN)", move || Box::new(ChatApp::new(net_for_chat.clone()))),
-        entry("DrDrPaint", || Box::new(PaintApp::new())),
-        entry("DrDrSnake", || Box::new(SnakeApp::new())),
-        entry("DrDr2048", || Box::new(Game2048::new())),
-        entry("DrDrMines", || Box::new(MinesApp::new())),
-        entry("Disks", || Box::new(DisksApp::new())),
-        entry("Settings", move || Box::new(SettingsApp::new(net_for_settings.clone()))),
-        entry("DrDrNet panel", move || Box::new(NetApp::new(net_for_panel.clone()))),
-        entry("About DrDrOS", || Box::new(AboutApp)),
-        entry("Power", || Box::new(SystemApp::new())),
+        entry("Files", IconKind::Folder, || Box::new(FilesApp::new(drdr_store::documents_dir()))),
+        entry("Text Editor", IconKind::Document, || Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))),
+        entry("Notes (saved)", IconKind::Note, || Box::new(NotesApp::new())),
+        entry("Tasks (saved)", IconKind::Tasks, || Box::new(TasksApp::new())),
+        entry("Browser", IconKind::Browser, || Box::new(BrowserApp::new())),
+        entry("Terminal (Shell)", IconKind::Terminal, || Box::new(ConsoleApp::new())),
+        entry("Calculator", IconKind::Calculator, || Box::new(CalcApp::new())),
+        entry("Clock & Calendar", IconKind::Clock, || Box::new(ClockApp::new())),
+        entry("System Monitor", IconKind::Monitor, || Box::new(SysMonApp::new())),
+        entry("System Info", IconKind::Info, || Box::new(SysInfoApp::new())),
+        entry("Network & Wi-Fi", IconKind::Network, move || Box::new(NetworkApp::new(net_for_network.clone()))),
+        entry("DrDrChat (LAN)", IconKind::Chat, move || Box::new(ChatApp::new(net_for_chat.clone()))),
+        entry("DrDrPaint", IconKind::Paint, || Box::new(PaintApp::new())),
+        entry("DrDrSnake", IconKind::Snake, || Box::new(SnakeApp::new())),
+        entry("DrDr2048", IconKind::Dice2048, || Box::new(Game2048::new())),
+        entry("DrDrMines", IconKind::Mine, || Box::new(MinesApp::new())),
+        entry("Disks", IconKind::Disk, || Box::new(DisksApp::new())),
+        entry("Settings", IconKind::Settings, move || Box::new(SettingsApp::new(net_for_settings.clone()))),
+        entry("DrDrNet panel", IconKind::Network, move || Box::new(NetApp::new(net_for_panel.clone()))),
+        entry("About DrDrOS", IconKind::Info, || Box::new(AboutApp)),
+        entry("Power", IconKind::Power, || Box::new(SystemApp::new())),
     ]
 }
 
@@ -708,40 +958,43 @@ pub fn app_catalog(
 pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
     fn icon(
         label: &str,
-        glyph: char,
+        kind: IconKind,
         tint: Px,
         f: impl Fn() -> Box<dyn WindowApp> + 'static,
     ) -> DesktopIcon {
         DesktopIcon {
             label: label.to_string(),
-            glyph,
+            icon: kind,
             tint,
             factory: Box::new(move || Spawn { rect: spawn_rect(), app: f() }),
         }
     }
     let net_for_chat = net.clone();
     let net_for_settings = net.clone();
+    let net_for_network = net.clone();
     vec![
-        icon("Files",      'F', Px::rgb(0x2D, 0x82, 0xF0), || {
+        icon("Files",      IconKind::Folder,     Px::rgb(0x2D, 0x82, 0xF0), || {
             Box::new(FilesApp::new(drdr_store::documents_dir()))
         }),
-        icon("Editor",     'T', Px::rgb(0x5E, 0xB2, 0x4F), || {
+        icon("Editor",     IconKind::Document,   Px::rgb(0x5E, 0xB2, 0x4F), || {
             Box::new(EditApp::new(drdr_store::documents_dir().join("untitled.txt")))
         }),
-        icon("Notes",      'N', Px::rgb(0xF2, 0xC0, 0x32), || Box::new(NotesApp::new())),
-        icon("Tasks",      'K', Px::rgb(0x2E, 0xA0, 0x6A), || Box::new(TasksApp::new())),
-        icon("Terminal",   '>', Px::rgb(0x33, 0x33, 0x3A), || Box::new(ConsoleApp::new())),
-        icon("Calculator", '=', Px::rgb(0x6B, 0x4F, 0xC9), || Box::new(CalcApp::new())),
-        icon("Clock",      'C', Px::rgb(0xE8, 0x6B, 0x3D), || Box::new(ClockApp::new())),
-        icon("Monitor",    'M', Px::rgb(0x36, 0xB9, 0xB0), || Box::new(SysMonApp::new())),
-        icon("Sys Info",   'i', Px::rgb(0x2D, 0x82, 0xF0), || Box::new(SysInfoApp::new())),
-        icon("Chat",       '@', Px::rgb(0xE8, 0x4E, 0x95), move || Box::new(ChatApp::new(net_for_chat.clone()))),
-        icon("Paint",      'P', Px::rgb(0xC8, 0x36, 0x52), || Box::new(PaintApp::new())),
-        icon("Snake",      'S', Px::rgb(0x4F, 0xB8, 0x35), || Box::new(SnakeApp::new())),
-        icon("2048",       '2', Px::rgb(0xED, 0xC2, 0x2E), || Box::new(Game2048::new())),
-        icon("Mines",      '*', Px::rgb(0x4A, 0x6C, 0xD4), || Box::new(MinesApp::new())),
-        icon("Disks",      'D', Px::rgb(0x6E, 0x6E, 0x82), || Box::new(DisksApp::new())),
-        icon("Settings",   '*', Px::rgb(0x6B, 0x73, 0x80), move || Box::new(SettingsApp::new(net_for_settings.clone()))),
+        icon("Notes",      IconKind::Note,       Px::rgb(0xF2, 0xC0, 0x32), || Box::new(NotesApp::new())),
+        icon("Tasks",      IconKind::Tasks,      Px::rgb(0x2E, 0xA0, 0x6A), || Box::new(TasksApp::new())),
+        icon("Browser",    IconKind::Browser,    Px::rgb(0x1E, 0x9E, 0xD6), || Box::new(BrowserApp::new())),
+        icon("Terminal",   IconKind::Terminal,   Px::rgb(0x33, 0x33, 0x3A), || Box::new(ConsoleApp::new())),
+        icon("Calculator", IconKind::Calculator, Px::rgb(0x6B, 0x4F, 0xC9), || Box::new(CalcApp::new())),
+        icon("Clock",      IconKind::Clock,      Px::rgb(0xE8, 0x6B, 0x3D), || Box::new(ClockApp::new())),
+        icon("Monitor",    IconKind::Monitor,    Px::rgb(0x36, 0xB9, 0xB0), || Box::new(SysMonApp::new())),
+        icon("Sys Info",   IconKind::Info,       Px::rgb(0x2D, 0x82, 0xF0), || Box::new(SysInfoApp::new())),
+        icon("Network",    IconKind::Network,    Px::rgb(0x2B, 0x9B, 0x8A), move || Box::new(NetworkApp::new(net_for_network.clone()))),
+        icon("Chat",       IconKind::Chat,       Px::rgb(0xE8, 0x4E, 0x95), move || Box::new(ChatApp::new(net_for_chat.clone()))),
+        icon("Paint",      IconKind::Paint,      Px::rgb(0xC8, 0x36, 0x52), || Box::new(PaintApp::new())),
+        icon("Snake",      IconKind::Snake,      Px::rgb(0x4F, 0xB8, 0x35), || Box::new(SnakeApp::new())),
+        icon("2048",       IconKind::Dice2048,   Px::rgb(0xED, 0xC2, 0x2E), || Box::new(Game2048::new())),
+        icon("Mines",      IconKind::Mine,       Px::rgb(0x4A, 0x6C, 0xD4), || Box::new(MinesApp::new())),
+        icon("Disks",      IconKind::Disk,       Px::rgb(0x6E, 0x6E, 0x82), || Box::new(DisksApp::new())),
+        icon("Settings",   IconKind::Settings,   Px::rgb(0x6B, 0x73, 0x80), move || Box::new(SettingsApp::new(net_for_settings.clone()))),
     ]
 }
 
@@ -749,10 +1002,14 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
 /// DRDR_DEMO` snapshot path so generated screenshots show a working
 /// desktop (window chrome + real app text), never in a normal boot.
 pub fn open_demo_windows(wm: &mut WindowManager) {
-    wm.open(Rect::new(28, 60, 410, 330), Box::new(SysInfoApp::new()));
-    wm.open(Rect::new(470, 70, 300, 250), Box::new(Game2048::new()));
-    wm.open(Rect::new(250, 150, 360, 250), Box::new(CalcApp::new()));
-    wm.open(Rect::new(120, 280, 560, 360), Box::new(NotesApp::demo()));
+    // Show the editor on a real source file so the snapshot captures the
+    // menu bar + syntax highlighting, plus the browser homepage.
+    wm.open(Rect::new(20, 48, 520, 360), Box::new(EditApp::new("drdr-desk/src/main.rs")));
+    // A file-manager window so the snapshot shows the new Places sidebar.
+    wm.open(Rect::new(60, 250, 470, 320), Box::new(FilesApp::new(PathBuf::from("/"))));
+    wm.open(Rect::new(560, 60, 430, 320), Box::new(BrowserApp::new()));
+    wm.open(Rect::new(600, 360, 320, 220), Box::new(Game2048::new()));
+    wm.open(Rect::new(330, 430, 300, 150), Box::new(CalcApp::new()));
 }
 
 impl LauncherApp {
@@ -761,13 +1018,16 @@ impl LauncherApp {
     }
 
     fn launch(&mut self) {
-        if let Some((_, factory)) = self.items.get(self.sel) {
+        if let Some((_, _, factory)) = self.items.get(self.sel) {
             self.spawns.push(factory());
         }
     }
 }
 
 impl WindowApp for LauncherApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Settings
+    }
     fn title(&self) -> String {
         "Launcher".into()
     }
@@ -803,7 +1063,7 @@ impl WindowApp for LauncherApp {
 
     fn render(&mut self, g: &mut TextGrid) {
         g.text(1, 0, "Open a window (double-click or Enter):");
-        for (i, (label, _)) in self.items.iter().enumerate() {
+        for (i, (label, _, _)) in self.items.iter().enumerate() {
             let row = i as u32 + 2;
             let line = format!("  {label}");
             if i == self.sel {
@@ -846,6 +1106,9 @@ impl SystemApp {
 const SYS_ITEMS: [&str; 2] = ["Reboot", "Power off"];
 
 impl WindowApp for SystemApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Power
+    }
     fn title(&self) -> String {
         "System".into()
     }
@@ -920,6 +1183,9 @@ impl NetApp {
 }
 
 impl WindowApp for NetApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Network
+    }
     fn title(&self) -> String {
         match (net_snapshot(&self.net), &self.last) {
             (Some(_), Ok(_)) => "DrDrNet  * online".into(),
@@ -1030,6 +1296,9 @@ impl SettingsApp {
 }
 
 impl WindowApp for SettingsApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Settings
+    }
     fn title(&self) -> String {
         "Settings".into()
     }
@@ -1166,6 +1435,9 @@ impl DisksApp {
 }
 
 impl WindowApp for DisksApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Disk
+    }
     fn title(&self) -> String {
         "Disks".into()
     }
@@ -1271,29 +1543,6 @@ impl NotesApp {
         Self::open("notes.txt")
     }
 
-    /// In-memory note with sample text — for the snapshot/demo path only
-    /// (no disk read), so screenshots show real prose, not an empty grid.
-    fn demo() -> Self {
-        let lines = vec![
-            "Welcome to DrDrOS Notes.".to_string(),
-            "".to_string(),
-            "Your text is saved with Esc and survives a reboot".to_string(),
-            "once a disk is mounted (open Disks, pick a volume).".to_string(),
-            "".to_string(),
-            "The font is now anti-aliased - smooth, not blocky.".to_string(),
-        ];
-        Self {
-            name: "notes.txt".to_string(),
-            lines,
-            cx: 0,
-            cy: 0,
-            top: 0,
-            modified: false,
-            status: "demo".to_string(),
-            autosave: 0,
-        }
-    }
-
     fn open(name: &str) -> Self {
         let (lines, status) = match drdr_store::load(name) {
             Ok(bytes) => {
@@ -1382,6 +1631,9 @@ impl NotesApp {
 }
 
 impl WindowApp for NotesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Note
+    }
     fn title(&self) -> String {
         format!(
             "Notes - {}{}",
@@ -1527,6 +1779,9 @@ const KEYPAD: [[char; 4]; 4] = [
 ];
 
 impl WindowApp for CalcApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Calculator
+    }
     fn title(&self) -> String {
         "Calculator".into()
     }
@@ -1769,6 +2024,9 @@ fn uptime_secs() -> u64 {
 }
 
 impl WindowApp for ClockApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Clock
+    }
     fn title(&self) -> String {
         "Clock".into()
     }
@@ -1910,6 +2168,9 @@ fn bar(pct: u32, width: u32) -> String {
 }
 
 impl WindowApp for SysMonApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Monitor
+    }
     fn title(&self) -> String {
         "System Monitor".into()
     }
@@ -2139,6 +2400,9 @@ impl ConsoleApp {
 }
 
 impl WindowApp for ConsoleApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Terminal
+    }
     fn title(&self) -> String {
         format!("DrDrConsole - {}", self.cwd.display())
     }
@@ -2275,6 +2539,9 @@ fn fmt_hhmm(ts: u64) -> String {
 }
 
 impl WindowApp for ChatApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Chat
+    }
     fn title(&self) -> String {
         match net_snapshot(&self.net) {
             None => "DrDrChat - starting...".into(),
@@ -2449,6 +2716,9 @@ impl PaintApp {
 }
 
 impl WindowApp for PaintApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Paint
+    }
     fn title(&self) -> String {
         if self.erasing {
             "DrDrPaint - eraser".into()
@@ -2647,6 +2917,9 @@ impl SnakeApp {
 }
 
 impl WindowApp for SnakeApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Snake
+    }
     fn title(&self) -> String {
         if self.over {
             format!("DrDrSnake - GAME OVER (score {}) - R to restart", self.score)
@@ -2783,6 +3056,9 @@ impl TasksApp {
 }
 
 impl WindowApp for TasksApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Tasks
+    }
     fn title(&self) -> String {
         let open = self.tasks.iter().filter(|(d, _)| !*d).count();
         format!(
@@ -3035,6 +3311,9 @@ impl Game2048 {
 }
 
 impl WindowApp for Game2048 {
+    fn icon(&self) -> IconKind {
+        IconKind::Dice2048
+    }
     fn title(&self) -> String {
         format!("DrDr2048 - score {} (best {})", self.score, self.best.max(self.score))
     }
@@ -3282,6 +3561,9 @@ impl MinesApp {
 }
 
 impl WindowApp for MinesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Mine
+    }
     fn title(&self) -> String {
         let state = if self.won {
             "  WON!"
@@ -3420,6 +3702,9 @@ fn fmt_uptime(secs: u64) -> String {
 }
 
 impl WindowApp for SysInfoApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Info
+    }
     fn title(&self) -> String {
         "System Info".into()
     }
@@ -3487,6 +3772,1253 @@ impl WindowApp for SysInfoApp {
         line(g, "Desktop", &format!("drdr-desk v{}", env!("CARGO_PKG_VERSION")));
         line(g, "Storage", persist);
         line(g, "Data dir", &data.display().to_string());
+    }
+}
+
+// ─── File types, syntax highlighting & a clickable menu bar ──────────
+//
+// These three pieces are what make the editor and file manager feel like
+// a real desktop: the file manager knows a `.png` from a `.rs`, the
+// editor colours code by language, and a Windows-style menu bar offers
+// File / Format / Colour actions with the mouse — no memorising keys.
+
+/// Lowercased extension of a filename (`""` if none).
+pub fn ext_of(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((_, e)) if !e.is_empty() => e.to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// Broad class of a file — the file manager uses it to pick how to open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileClass {
+    Text,
+    Code,
+    Web,
+    Image,
+    Binary,
+}
+
+/// Classify a filename by extension.
+pub fn classify(name: &str) -> FileClass {
+    match ext_of(name).as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "ppm" | "webp" | "ico" | "tiff" => {
+            FileClass::Image
+        }
+        "html" | "htm" | "md" | "markdown" => FileClass::Web,
+        "rs" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "java" | "c" | "h" | "cpp" | "hpp"
+        | "cc" | "py" | "go" | "css" | "json" | "xml" | "sh" | "bash" | "toml" | "yaml"
+        | "yml" | "rb" | "php" | "sql" => FileClass::Code,
+        "pdf" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "zip" | "gz" | "xz" | "tar"
+        | "bin" | "exe" | "o" | "so" | "wasm" | "mp3" | "wav" | "mp4" => FileClass::Binary,
+        _ => FileClass::Text,
+    }
+}
+
+/// A short two-letter tag shown beside a file in the manager list.
+pub fn type_tag(name: &str, is_dir: bool) -> &'static str {
+    if is_dir {
+        return "DIR";
+    }
+    match classify(name) {
+        FileClass::Image => "IMG",
+        FileClass::Web => "WEB",
+        FileClass::Code => "<>",
+        FileClass::Binary => "BIN",
+        FileClass::Text => "TXT",
+    }
+}
+
+// ── Syntax highlighting ──────────────────────────────────────────────
+
+/// The languages the editor colours. `Plain` means "no highlighting".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lang {
+    Plain,
+    Rust,
+    JavaScript,
+    Java,
+    CLike,
+    Python,
+    Web,
+    Css,
+    Json,
+    Shell,
+}
+
+/// Pick a language from a filename.
+pub fn lang_for(name: &str) -> Lang {
+    match ext_of(name).as_str() {
+        "rs" => Lang::Rust,
+        "js" | "ts" | "jsx" | "tsx" | "mjs" => Lang::JavaScript,
+        "java" => Lang::Java,
+        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "go" => Lang::CLike,
+        "py" => Lang::Python,
+        "html" | "htm" | "xml" => Lang::Web,
+        "css" => Lang::Css,
+        "json" => Lang::Json,
+        "sh" | "bash" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" => Lang::Shell,
+        _ => Lang::Plain,
+    }
+}
+
+fn keywords(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Rust => &[
+            "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "impl", "trait",
+            "for", "while", "loop", "if", "else", "match", "return", "self", "Self",
+            "const", "static", "ref", "move", "as", "in", "where", "type", "dyn", "crate",
+            "true", "false", "Some", "None", "Ok", "Err", "Box", "Vec", "String",
+        ],
+        Lang::JavaScript => &[
+            "function", "let", "const", "var", "if", "else", "for", "while", "return",
+            "class", "new", "this", "import", "export", "from", "async", "await", "try",
+            "catch", "throw", "typeof", "null", "undefined", "true", "false", "of",
+        ],
+        Lang::Java => &[
+            "public", "private", "protected", "class", "interface", "void", "int", "long",
+            "double", "float", "boolean", "char", "new", "return", "if", "else", "for",
+            "while", "this", "static", "final", "import", "package", "extends", "implements",
+            "true", "false", "null", "try", "catch",
+        ],
+        Lang::CLike => &[
+            "int", "char", "void", "long", "short", "float", "double", "struct", "enum",
+            "union", "const", "static", "return", "if", "else", "for", "while", "switch",
+            "case", "break", "continue", "sizeof", "typedef", "unsigned", "signed", "func",
+            "package", "import", "type",
+        ],
+        Lang::Python => &[
+            "def", "class", "if", "elif", "else", "for", "while", "return", "import",
+            "from", "as", "try", "except", "finally", "with", "lambda", "None", "True",
+            "False", "and", "or", "not", "in", "is", "pass", "yield", "self",
+        ],
+        Lang::Web => &["html", "head", "body", "div", "span", "script", "style", "a", "p"],
+        Lang::Css => &["color", "background", "margin", "padding", "border", "font", "display"],
+        Lang::Json => &["true", "false", "null"],
+        Lang::Shell => &[
+            "if", "then", "else", "fi", "for", "do", "done", "while", "case", "esac",
+            "function", "echo", "export", "true", "false",
+        ],
+        Lang::Plain => &[],
+    }
+}
+
+/// Colour each character of `line` for `lang`; `fg` is the default. A
+/// tiny single-line lexer: line comments, quoted strings, numbers and
+/// keywords. Good enough to make code readable, cheap enough to run on
+/// every visible line each frame.
+pub fn highlight(line: &str, lang: Lang, fg: Px) -> Vec<Px> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut col = vec![fg; chars.len()];
+    if lang == Lang::Plain || chars.is_empty() {
+        return col;
+    }
+    let kw = Px::rgb(0x9B, 0x6B, 0xF0);
+    let strc = Px::rgb(0x2E, 0x9E, 0x4F);
+    let numc = Px::rgb(0xCB, 0x7B, 0x2E);
+    let comc = Px::rgb(0x8C, 0x8C, 0x96);
+    let line_comment = match lang {
+        Lang::Python | Lang::Shell => "#",
+        Lang::Css | Lang::Json | Lang::Web => "",
+        _ => "//",
+    };
+    let kws = keywords(lang);
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        // line comment → colour to end of line.
+        if !line_comment.is_empty()
+            && chars[i..].iter().collect::<String>().starts_with(line_comment)
+        {
+            for cc in col.iter_mut().skip(i) {
+                *cc = comc;
+            }
+            break;
+        }
+        // string literal.
+        if c == '"' || c == '\'' || c == '`' {
+            let quote = c;
+            col[i] = strc;
+            i += 1;
+            while i < chars.len() {
+                col[i] = strc;
+                if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                    if i < chars.len() {
+                        col[i] = strc;
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // number.
+        if c.is_ascii_digit() && (i == 0 || !chars[i - 1].is_alphanumeric()) {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                i += 1;
+            }
+            for cc in col.iter_mut().take(i).skip(start) {
+                *cc = numc;
+            }
+            continue;
+        }
+        // identifier / keyword.
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if kws.contains(&word.as_str()) {
+                for cc in col.iter_mut().take(i).skip(start) {
+                    *cc = kw;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    col
+}
+
+// ── Menu bar ─────────────────────────────────────────────────────────
+
+/// One row in a drop-down menu. `color` paints the label in its own
+/// colour (used for the colour picker swatches).
+struct MenuItem {
+    label: String,
+    action: &'static str,
+    color: Option<Px>,
+}
+
+/// A top-level menu: a title plus its drop-down rows.
+struct Menu {
+    title: String,
+    items: Vec<MenuItem>,
+}
+
+/// What a click on the menu bar did.
+pub enum MenuClick {
+    /// An item fired; here is its action id.
+    Action(&'static str),
+    /// The bar handled the click (toggled a menu) — don't treat as a
+    /// document click.
+    Consumed,
+    /// The click missed the bar; the app should handle it normally.
+    Passthrough,
+}
+
+/// A Windows-style clickable menu bar that renders into the top row of a
+/// [`TextGrid`] and pops a drop-down below the open menu.
+pub struct MenuBar {
+    menus: Vec<Menu>,
+    open: Option<usize>,
+}
+
+impl MenuBar {
+    fn item(label: &str, action: &'static str) -> MenuItem {
+        MenuItem { label: label.into(), action, color: None }
+    }
+    fn swatch(label: &str, action: &'static str, c: Px) -> MenuItem {
+        MenuItem { label: label.into(), action, color: Some(c) }
+    }
+
+    /// Column where menu `idx`'s padded title starts.
+    fn title_start(&self, idx: usize) -> u32 {
+        let mut c = 1u32;
+        for m in &self.menus[..idx] {
+            c += m.title.chars().count() as u32 + 2 + 1; // " title " + gap
+        }
+        c
+    }
+
+    fn title_at(&self, col: u32) -> Option<usize> {
+        for i in 0..self.menus.len() {
+            let s = self.title_start(i);
+            let e = s + self.menus[i].title.chars().count() as u32 + 2;
+            if col >= s && col < e {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn dropdown_w(&self, i: usize) -> u32 {
+        let longest = self.menus[i]
+            .items
+            .iter()
+            .map(|it| it.label.chars().count())
+            .max()
+            .unwrap_or(4) as u32;
+        longest + 4
+    }
+
+    /// True while a drop-down is showing (the app suppresses typing then).
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Close any open drop-down.
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+
+    /// Paint the bar (row 0) and, if open, its drop-down. `fg`/`bg` are
+    /// the grid's text/background; the bar reverses them so it reads as
+    /// chrome.
+    pub fn render(&self, g: &mut TextGrid, fg: Px, bg: Px) {
+        // Toolbar strip across the top in reverse video.
+        g.fill_row(0, bg, fg);
+        for (i, m) in self.menus.iter().enumerate() {
+            let s = self.title_start(i);
+            let label = format!(" {} ", m.title);
+            if self.open == Some(i) {
+                g.write(s, 0, &label, fg, bg); // highlighted = normal video
+            } else {
+                g.write(s, 0, &label, bg, fg); // reverse
+            }
+        }
+        if let Some(i) = self.open {
+            let s = self.title_start(i);
+            let w = self.dropdown_w(i);
+            for (j, it) in self.menus[i].items.iter().enumerate() {
+                let row = 1 + j as u32;
+                for c in 0..w {
+                    g.put(s + c, row, ' ', fg, bg);
+                }
+                let lc = it.color.unwrap_or(fg);
+                g.write(s + 2, row, &it.label, lc, bg);
+            }
+        }
+    }
+
+    /// Route a grid click. Row 0 toggles menus; a click inside the open
+    /// drop-down fires an action; anything else closes the menu.
+    pub fn on_click(&mut self, col: u32, row: u32) -> MenuClick {
+        if row == 0 {
+            self.open = match self.title_at(col) {
+                Some(i) if self.open == Some(i) => None,
+                other => other,
+            };
+            return MenuClick::Consumed;
+        }
+        if let Some(i) = self.open {
+            let s = self.title_start(i);
+            let w = self.dropdown_w(i);
+            let n = self.menus[i].items.len() as u32;
+            if row >= 1 && row <= n && col >= s && col < s + w {
+                let action = self.menus[i].items[(row - 1) as usize].action;
+                self.open = None;
+                return MenuClick::Action(action);
+            }
+            self.open = None;
+            return MenuClick::Passthrough;
+        }
+        MenuClick::Passthrough
+    }
+}
+
+/// Build the editor's menu bar. Colour swatches are painted in their own
+/// hue so the picker reads at a glance.
+fn editor_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "File".into(),
+                items: vec![
+                    MenuBar::item("New", "new"),
+                    MenuBar::item("Save", "save"),
+                    MenuBar::item("Save As", "saveas"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+            Menu {
+                title: "Format".into(),
+                items: vec![
+                    MenuBar::item("Bigger text", "size_up"),
+                    MenuBar::item("Smaller text", "size_down"),
+                    MenuBar::item("Colour this line", "colorline"),
+                    MenuBar::item("Reset colours", "color_reset"),
+                ],
+            },
+            Menu {
+                title: "Colour".into(),
+                items: vec![
+                    MenuBar::item("Default", "ink_default"),
+                    MenuBar::swatch("Red", "ink_red", Px::rgb(0xD0, 0x3A, 0x3A)),
+                    MenuBar::swatch("Orange", "ink_orange", Px::rgb(0xD9, 0x7A, 0x1E)),
+                    MenuBar::swatch("Green", "ink_green", Px::rgb(0x2E, 0x9E, 0x4F)),
+                    MenuBar::swatch("Teal", "ink_teal", Px::rgb(0x1E, 0x9E, 0x9E)),
+                    MenuBar::swatch("Blue", "ink_blue", Px::rgb(0x2D, 0x6C, 0xD8)),
+                    MenuBar::swatch("Purple", "ink_purple", Px::rgb(0x9B, 0x5C, 0xE0)),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle syntax", "syntax"),
+                    MenuBar::item("Toggle theme", "theme"),
+                ],
+            },
+        ],
+    }
+}
+
+/// Map a colour action id to its ink (None = default text colour).
+fn ink_for_action(a: &str) -> Option<Px> {
+    match a {
+        "ink_red" => Some(Px::rgb(0xD0, 0x3A, 0x3A)),
+        "ink_orange" => Some(Px::rgb(0xD9, 0x7A, 0x1E)),
+        "ink_green" => Some(Px::rgb(0x2E, 0x9E, 0x4F)),
+        "ink_teal" => Some(Px::rgb(0x1E, 0x9E, 0x9E)),
+        "ink_blue" => Some(Px::rgb(0x2D, 0x6C, 0xD8)),
+        "ink_purple" => Some(Px::rgb(0x9B, 0x5C, 0xE0)),
+        _ => None,
+    }
+}
+
+// ─── DrDrBrowser — a local web/document viewer ───────────────────────
+
+/// A from-scratch document browser: it renders local HTML and Markdown
+/// to formatted text (headings emphasised, links listed, tags stripped),
+/// shows a homepage that links to the user's Documents, and follows
+/// links between local files. No TLS stack, no JS engine — a real,
+/// honest *local* browser for the formats DrDrOS can actually parse.
+pub struct BrowserApp {
+    /// The rendered lines (text + colour) of the current page.
+    lines: Vec<(String, Px)>,
+    /// Link targets the page exposed, in display order (row → path).
+    links: Vec<(u32, PathBuf)>,
+    title: String,
+    scroll: usize,
+    spawns: Vec<Spawn>,
+}
+
+impl BrowserApp {
+    pub fn new() -> Self {
+        let mut a = Self {
+            lines: Vec::new(),
+            links: Vec::new(),
+            title: "Home".into(),
+            scroll: 0,
+            spawns: Vec::new(),
+        };
+        a.home();
+        a
+    }
+
+    pub fn open(path: PathBuf) -> Self {
+        let mut a = Self {
+            lines: Vec::new(),
+            links: Vec::new(),
+            title: "Browser".into(),
+            scroll: 0,
+            spawns: Vec::new(),
+        };
+        a.load(&path);
+        a
+    }
+
+    fn home(&mut self) {
+        self.title = "Home".into();
+        self.links.clear();
+        let accent = Px::rgb(0x2D, 0x6C, 0xD8);
+        let fg = Px::rgb(0x1B, 0x1B, 0x1B);
+        let mut lines = vec![
+            ("DrDrBrowser".to_string(), accent),
+            ("A local browser for HTML and Markdown.".to_string(), fg),
+            (String::new(), fg),
+            ("Your Documents:".to_string(), fg),
+        ];
+        let docs = drdr_store::documents_dir();
+        let mut linkrows: Vec<(u32, PathBuf)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(&docs) {
+            let mut names: Vec<String> = rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for n in names {
+                let row = lines.len() as u32;
+                lines.push((format!("  -> {n}"), accent));
+                linkrows.push((row, docs.join(&n)));
+            }
+        }
+        if linkrows.is_empty() {
+            lines.push(("  (no documents yet)".to_string(), Px::rgb(0x8C, 0x8C, 0x8C)));
+        }
+        lines.push((String::new(), fg));
+        lines.push((
+            "Open Files and double-click a .html or .md file,".to_string(),
+            fg,
+        ));
+        lines.push(("or click a link above. Arrows scroll.".to_string(), fg));
+        self.lines = lines;
+        self.links = linkrows;
+        self.scroll = 0;
+    }
+
+    fn load(&mut self, path: &std::path::Path) {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.title = name.clone();
+        self.links.clear();
+        self.scroll = 0;
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.lines = vec![(format!("cannot open {name}: {e}"), Px::rgb(0xD0, 0x3A, 0x3A))];
+                return;
+            }
+        };
+        self.lines = match ext_of(&name).as_str() {
+            "html" | "htm" => render_html(&text),
+            _ => render_markdown(&text),
+        };
+    }
+
+    fn activate_link(&mut self, row: usize) {
+        let abs = self.scroll + row;
+        if let Some((_, path)) = self.links.iter().find(|(r, _)| *r as usize == abs) {
+            let path = path.clone();
+            // Images and code open in their own viewers; pages stay here.
+            match classify(&path.to_string_lossy()) {
+                FileClass::Image => self.spawns.push(Spawn {
+                    rect: spawn_rect(),
+                    app: Box::new(ImageApp::open(path)),
+                }),
+                FileClass::Web | FileClass::Text => self.load(&path),
+                _ => self.spawns.push(Spawn {
+                    rect: spawn_rect(),
+                    app: Box::new(EditApp::new(path)),
+                }),
+            }
+        }
+    }
+}
+
+impl WindowApp for BrowserApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Browser
+    }
+    fn title(&self) -> String {
+        format!("Browser - {}", self.title)
+    }
+
+    fn take_spawns(&mut self) -> Vec<Spawn> {
+        std::mem::take(&mut self.spawns)
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        let page = (self.lines.len()).saturating_sub(1);
+        match key {
+            KeyCode::Down => self.scroll = (self.scroll + 1).min(page),
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = (self.scroll + 10).min(page),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::Char('h') => self.home(),
+            KeyCode::Escape => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, _col: u32, row: u32, _double: bool) -> AppControl {
+        if row >= 1 {
+            self.activate_link(row as usize - 1);
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let accent = Px::rgb(0x2D, 0x6C, 0xD8);
+        g.write(0, 0, &format!("h=home  Esc=close   [{}]", self.title), accent, g.bg());
+        let rows = g.rows.saturating_sub(1) as usize;
+        for vis in 0..rows {
+            let li = self.scroll + vis;
+            if li >= self.lines.len() {
+                break;
+            }
+            let (text, color) = &self.lines[li];
+            g.write(0, vis as u32 + 1, text, *color, g.bg());
+        }
+    }
+}
+
+/// Render HTML to coloured text lines: strip tags, surface headings and
+/// links, collapse whitespace. A deliberately small parser — enough to
+/// read a hand-written page, not a full DOM.
+fn render_html(src: &str) -> Vec<(String, Px)> {
+    let fg = Px::rgb(0x1B, 0x1B, 0x1B);
+    let head = Px::rgb(0x2D, 0x6C, 0xD8);
+    let link = Px::rgb(0x1E, 0x6E, 0xC0);
+    let mut out: Vec<(String, Px)> = Vec::new();
+    let bytes: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    let mut cur = String::new();
+    let mut color = fg;
+    let mut in_script = false;
+    let flush = |out: &mut Vec<(String, Px)>, cur: &mut String, color: Px| {
+        let t = cur.trim();
+        if !t.is_empty() {
+            out.push((t.to_string(), color));
+        }
+        cur.clear();
+    };
+    while i < bytes.len() {
+        if bytes[i] == '<' {
+            // read the tag name
+            let mut j = i + 1;
+            let mut tag = String::new();
+            while j < bytes.len() && bytes[j] != '>' {
+                tag.push(bytes[j]);
+                j += 1;
+            }
+            let lower = tag.to_ascii_lowercase();
+            let name: String = lower
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect();
+            match name.as_str() {
+                "script" | "style" => in_script = !lower.starts_with('/'),
+                "h1" | "h2" | "h3" | "h4" => {
+                    flush(&mut out, &mut cur, color);
+                    color = head;
+                }
+                "br" | "p" | "div" | "li" | "tr" | "ul" | "ol" => {
+                    flush(&mut out, &mut cur, color);
+                    color = fg;
+                }
+                "a" => {
+                    // surface href as a trailing marker
+                    if let Some(h) = extract_attr(&lower, "href") {
+                        cur.push_str(" [");
+                        cur.push_str(&h);
+                        cur.push(']');
+                    }
+                    color = link;
+                }
+                _ => {}
+            }
+            if name == "h1" || name == "h2" || name == "h3" || name == "h4" {
+                if lower.starts_with('/') {
+                    flush(&mut out, &mut cur, head);
+                    color = fg;
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if !in_script {
+            cur.push(bytes[i]);
+        }
+        i += 1;
+    }
+    flush(&mut out, &mut cur, color);
+    if out.is_empty() {
+        out.push(("(empty page)".to_string(), fg));
+    }
+    out
+}
+
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let key = format!("{attr}=");
+    let pos = tag.find(&key)? + key.len();
+    let rest = &tag[pos..];
+    let rest = rest.trim_start_matches(['"', '\'']);
+    let end = rest.find(['"', '\'', ' ']).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Render Markdown to coloured lines: headings emphasised, list bullets
+/// kept, `*`/`_`/`` ` `` markers stripped.
+fn render_markdown(src: &str) -> Vec<(String, Px)> {
+    let fg = Px::rgb(0x1B, 0x1B, 0x1B);
+    let head = Px::rgb(0x2D, 0x6C, 0xD8);
+    let code = Px::rgb(0x2E, 0x9E, 0x4F);
+    let mut out = Vec::new();
+    for raw in src.split('\n') {
+        let line = raw.trim_end();
+        if let Some(h) = line.trim_start().strip_prefix('#') {
+            let title = h.trim_start_matches('#').trim();
+            out.push((title.to_uppercase(), head));
+        } else if line.trim_start().starts_with("```") {
+            out.push(("----".to_string(), code));
+        } else {
+            let cleaned: String = line.chars().filter(|&c| c != '*' && c != '`' && c != '_').collect();
+            out.push((cleaned, fg));
+        }
+    }
+    if out.is_empty() {
+        out.push(("(empty)".to_string(), fg));
+    }
+    out
+}
+
+// ─── Network & Wi-Fi panel ───────────────────────────────────────────
+
+struct Iface {
+    name: String,
+    state: String,
+    mac: String,
+    wireless: bool,
+    carrier: bool,
+}
+
+/// A read-only network status panel: it enumerates the kernel's network
+/// interfaces from `/sys/class/net`, flags which are wireless, shows
+/// DrDrNet's LAN peers, and explains how to bring Wi-Fi up. Real data,
+/// honest about what the current build can and can't do.
+/// Which screen of the Network panel is showing.
+#[derive(PartialEq, Eq)]
+enum NetView {
+    Interfaces,
+    Wifi,
+    Password,
+}
+
+pub struct NetworkApp {
+    net: SharedNet,
+    ifaces: Vec<Iface>,
+    sel: usize,
+    status: String,
+    view: NetView,
+    wifi_iface: Option<String>,
+    networks: Vec<crate::wifi::Network>,
+    wifi_status: crate::wifi::WifiStatus,
+    msg: String,
+    pw: String,
+    pw_ssid: String,
+    /// Countdown after a scan request before results are read; also the
+    /// periodic status-refresh timer.
+    scan_ticks: u8,
+    tick: u8,
+}
+
+impl NetworkApp {
+    pub fn new(net: SharedNet) -> Self {
+        let mut a = Self {
+            net,
+            ifaces: Vec::new(),
+            sel: 0,
+            status: String::new(),
+            view: NetView::Interfaces,
+            wifi_iface: None,
+            networks: Vec::new(),
+            wifi_status: Default::default(),
+            msg: String::new(),
+            pw: String::new(),
+            pw_ssid: String::new(),
+            scan_ticks: 0,
+            tick: 0,
+        };
+        a.reload();
+        a
+    }
+
+    fn reload(&mut self) {
+        self.ifaces = list_ifaces();
+        self.sel = self.sel.min(self.ifaces.len().saturating_sub(1));
+        self.wifi_iface = crate::wifi::wireless_ifaces().into_iter().next();
+        self.status = format!("{} interface(s)", self.ifaces.len());
+    }
+
+    /// Enter the Wi-Fi view and kick off a scan.
+    fn start_wifi(&mut self) {
+        let Some(iface) = self.wifi_iface.clone() else {
+            self.msg = "no Wi-Fi radio found".into();
+            return;
+        };
+        self.view = NetView::Wifi;
+        self.sel = 0;
+        self.msg = match crate::wifi::trigger_scan(&iface) {
+            Ok(()) => "scanning...".into(),
+            Err(e) => e,
+        };
+        self.scan_ticks = 4; // ~1s before reading results
+    }
+
+    fn do_connect(&mut self, ssid: &str, psk: &str) {
+        let Some(iface) = self.wifi_iface.clone() else { return };
+        self.msg = match crate::wifi::connect(&iface, ssid, psk) {
+            Ok(()) => format!("connecting to {ssid}..."),
+            Err(e) => e,
+        };
+        self.view = NetView::Wifi;
+    }
+}
+
+fn list_ifaces() -> Vec<Iface> {
+    let mut v = Vec::new();
+    if let Ok(rd) = fs::read_dir("/sys/class/net") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let p = e.path();
+            let rd = |f: &str| fs::read_to_string(p.join(f)).map(|s| s.trim().to_string());
+            let state = rd("operstate").unwrap_or_else(|_| "unknown".into());
+            let mac = rd("address").unwrap_or_default();
+            let wireless = p.join("wireless").exists() || p.join("phy80211").exists();
+            let carrier = rd("carrier").map(|s| s == "1").unwrap_or(false);
+            v.push(Iface { name, state, mac, wireless, carrier });
+        }
+    }
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+impl WindowApp for NetworkApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Network
+    }
+    fn title(&self) -> String {
+        match self.view {
+            NetView::Interfaces => "Network & Wi-Fi".into(),
+            _ => format!(
+                "Wi-Fi{}",
+                if self.wifi_status.connected() {
+                    format!(" - {}", self.wifi_status.ssid)
+                } else {
+                    String::new()
+                }
+            ),
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        match self.view {
+            NetView::Interfaces => match key {
+                KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+                KeyCode::Down => self.sel = (self.sel + 1).min(self.ifaces.len().saturating_sub(1)),
+                KeyCode::Char('r') => self.reload(),
+                KeyCode::Char('w') | KeyCode::Enter => self.start_wifi(),
+                _ => {}
+            },
+            NetView::Wifi => match key {
+                KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+                KeyCode::Down => self.sel = (self.sel + 1).min(self.networks.len().saturating_sub(1)),
+                KeyCode::Char('s') => self.start_wifi(),
+                KeyCode::Backspace | KeyCode::Left => self.view = NetView::Interfaces,
+                KeyCode::Enter => {
+                    if let Some(n) = self.networks.get(self.sel).cloned() {
+                        if n.is_open() {
+                            self.do_connect(&n.ssid, "");
+                        } else {
+                            self.pw.clear();
+                            self.pw_ssid = n.ssid.clone();
+                            self.view = NetView::Password;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            NetView::Password => match key {
+                KeyCode::Char(c) => self.pw.push(c),
+                KeyCode::Space => self.pw.push(' '),
+                KeyCode::Backspace => {
+                    self.pw.pop();
+                }
+                KeyCode::Enter => {
+                    let (ssid, pw) = (self.pw_ssid.clone(), std::mem::take(&mut self.pw));
+                    self.do_connect(&ssid, &pw);
+                }
+                KeyCode::Escape => self.view = NetView::Wifi,
+                _ => {}
+            },
+        }
+        AppControl::Continue
+    }
+
+    fn on_tick(&mut self) -> AppControl {
+        // Only touch wpa_supplicant from the Wi-Fi screens (keeps the
+        // Interfaces view — and the host snapshot — free of subprocesses).
+        if self.view == NetView::Interfaces {
+            return AppControl::Continue;
+        }
+        if self.scan_ticks > 0 {
+            self.scan_ticks -= 1;
+            if self.scan_ticks == 0 {
+                if let Some(iface) = &self.wifi_iface {
+                    self.networks = crate::wifi::scan_results(iface);
+                    self.msg = format!("{} network(s) found", self.networks.len());
+                }
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick % 8 == 0 {
+            if let Some(iface) = &self.wifi_iface {
+                self.wifi_status = crate::wifi::status(iface);
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn on_click(&mut self, _c: u32, row: u32, double: bool) -> AppControl {
+        if self.view == NetView::Wifi && row >= 3 {
+            let idx = (row - 3) as usize;
+            if idx < self.networks.len() {
+                self.sel = idx;
+                if double {
+                    return self.on_key(KeyCode::Enter);
+                }
+            }
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        let teal = Px::rgb(0x2B, 0x9B, 0x8A);
+        let muted = Px::rgb(0x8C, 0x8C, 0x96);
+        let red = Px::rgb(0xC8, 0x2B, 0x2B);
+        let green = Px::rgb(0x2E, 0x9E, 0x4F);
+        match self.view {
+            NetView::Interfaces => {
+                g.write(0, 0, "Network interfaces   (w = scan Wi-Fi, r = rescan)", teal, g.bg());
+                g.text(0, 1, "NAME        TYPE   STATE     LINK  MAC");
+                let mut row = 2u32;
+                for (i, f) in self.ifaces.iter().enumerate() {
+                    let kind = if f.wireless { "wifi" } else if f.name == "lo" { "loop" } else { "lan" };
+                    let link = if f.carrier { "up" } else { "down" };
+                    let line = format!("{:<11} {:<6} {:<9} {:<5} {}", f.name, kind, f.state, link, f.mac);
+                    if i == self.sel {
+                        selected(g, row, &line);
+                    } else {
+                        g.text(0, row, &line);
+                    }
+                    row += 1;
+                }
+                if self.ifaces.is_empty() {
+                    g.write(0, row, "(no interfaces found)", red, g.bg());
+                    row += 1;
+                }
+                row += 1;
+                match net_snapshot(&self.net) {
+                    Some(net) => {
+                        let peers = net.directory.lock().map(|d| d.snapshot()).unwrap_or_default();
+                        g.write(0, row, &format!("DrDrNet: online, {} LAN peer(s)", peers.len()), teal, g.bg());
+                    }
+                    None => {
+                        g.write(0, row, "DrDrNet: starting...", muted, g.bg());
+                    }
+                }
+                row += 2;
+                match &self.wifi_iface {
+                    Some(w) => {
+                        g.write(0, row, &format!("Wi-Fi radio: {w}  -  press 'w' to scan and connect"), green, g.bg());
+                    }
+                    None => {
+                        g.write(0, row, "No Wi-Fi radio. Wired Ethernet auto-connects via DHCP.", muted, g.bg());
+                    }
+                }
+            }
+            NetView::Wifi => {
+                let iface = self.wifi_iface.clone().unwrap_or_default();
+                g.write(0, 0, &format!("Wi-Fi on {iface}   (Enter=connect  s=rescan  Backspace=back)"), teal, g.bg());
+                if self.wifi_status.connected() {
+                    g.write(0, 1, &format!("Connected: {}  IP {}", self.wifi_status.ssid, self.wifi_status.ip), green, g.bg());
+                } else if !self.msg.is_empty() {
+                    g.write(0, 1, &self.msg, muted, g.bg());
+                }
+                g.text(0, 2, "SIGNAL  SECURITY  SSID");
+                let visible = (g.rows as usize).saturating_sub(3);
+                for (i, n) in self.networks.iter().take(visible).enumerate() {
+                    let bars: String = (0..4).map(|b| if (b as u8) < n.bars() { '|' } else { '.' }).collect();
+                    let lock = if n.is_open() { "open" } else { "lock" };
+                    let line = format!("[{bars}]  {:<6} {}", lock, n.ssid);
+                    let row = i as u32 + 3;
+                    if i == self.sel {
+                        selected(g, row, &line);
+                    } else {
+                        g.text(0, row, &line);
+                    }
+                }
+                if self.networks.is_empty() {
+                    g.write(0, 3, "(no networks yet - press 's' to scan)", muted, g.bg());
+                }
+            }
+            NetView::Password => {
+                g.write(0, 0, &format!("Connect to: {}", self.pw_ssid), teal, g.bg());
+                let stars: String = std::iter::repeat_n('*', self.pw.chars().count()).collect();
+                g.text(0, 2, &format!("Password: {stars}_"));
+                g.write(0, 4, "Enter = connect    Esc = cancel", muted, g.bg());
+                g.text(0, 6, "WPA2/WPA3 is handled by wpa_supplicant; DrDrOS");
+                g.text(0, 7, "writes the config and brings the link up, then");
+                g.text(0, 8, "udhcpc pulls an address.");
+            }
+        }
+        if !self.msg.is_empty() && self.view != NetView::Password {
+            g.write(0, g.rows.saturating_sub(1), &self.msg, muted, g.bg());
+        }
+    }
+}
+
+// ─── Image viewer ────────────────────────────────────────────────────
+
+/// A decoded image as row-major pixels.
+struct DecodedImg {
+    w: u32,
+    h: u32,
+    px: Vec<Px>,
+}
+
+/// A real image viewer. It decodes PPM (P6) and uncompressed 24/32-bit
+/// BMP ourselves and paints them as colour cells (each grid cell is one
+/// down-sampled pixel — the closest a character grid gets to a bitmap),
+/// aspect-corrected for the 8×16 cell. PNG/JPEG are recognised and their
+/// dimensions reported, with an honest "preview not supported" note.
+pub struct ImageApp {
+    name: String,
+    img: Option<DecodedImg>,
+    info: Vec<String>,
+}
+
+impl ImageApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let (img, info) = decode_image(&name, &bytes);
+        Self { name, img, info }
+    }
+}
+
+impl WindowApp for ImageApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Image
+    }
+    fn title(&self) -> String {
+        format!("Image - {}", self.name)
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if key == KeyCode::Escape {
+            return AppControl::Close;
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        match &self.img {
+            None => {
+                for (i, l) in self.info.iter().enumerate() {
+                    g.text(1, i as u32 + 1, l);
+                }
+            }
+            Some(img) => {
+                let dim = format!("{}  {}x{}", self.name, img.w, img.h);
+                g.text(0, 0, &dim);
+                let avail_cols = g.cols.max(1);
+                let avail_rows = g.rows.saturating_sub(1).max(1);
+                // Fit aspect: cells are 8 wide, 16 tall, so a column is
+                // half the physical span of a row — halve the row count.
+                let ar = img.w as f32 / img.h as f32;
+                let mut uc = avail_cols;
+                let mut ur = (((uc * 8) as f32 / ar) / 16.0).round() as u32;
+                if ur > avail_rows {
+                    ur = avail_rows;
+                    uc = (((ur * 16) as f32 * ar) / 8.0).round() as u32;
+                }
+                uc = uc.clamp(1, avail_cols);
+                ur = ur.clamp(1, avail_rows);
+                let ox = (avail_cols - uc) / 2;
+                let oy = 1 + (avail_rows - ur) / 2;
+                for ry in 0..ur {
+                    for cx in 0..uc {
+                        let ix = (cx * img.w / uc).min(img.w - 1);
+                        let iy = (ry * img.h / ur).min(img.h - 1);
+                        let c = img.px[(iy * img.w + ix) as usize];
+                        g.put(ox + cx, oy + ry, ' ', c, c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sniff a file's magic bytes and decode (or describe) it.
+fn decode_image(name: &str, b: &[u8]) -> (Option<DecodedImg>, Vec<String>) {
+    if b.len() >= 2 && &b[0..2] == b"P6" {
+        if let Some(img) = decode_ppm(b) {
+            return (Some(img), vec![]);
+        }
+    }
+    if b.len() >= 2 && &b[0..2] == b"BM" {
+        if let Some(img) = decode_bmp(b) {
+            return (Some(img), vec![]);
+        }
+    }
+    if b.len() >= 24 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        return (
+            None,
+            vec![
+                format!("{name}: PNG image, {w}x{h}"),
+                String::new(),
+                "PNG decoding (zlib/DEFLATE) is on the roadmap.".into(),
+                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
+            ],
+        );
+    }
+    if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xD8 {
+        return (
+            None,
+            vec![
+                format!("{name}: JPEG image"),
+                String::new(),
+                "JPEG decoding is on the roadmap.".into(),
+                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
+            ],
+        );
+    }
+    (
+        None,
+        vec![
+            format!("{name}: unrecognised image ({} bytes)", b.len()),
+            "Supported previews: PPM (P6), BMP (24/32-bit).".into(),
+        ],
+    )
+}
+
+fn decode_ppm(b: &[u8]) -> Option<DecodedImg> {
+    let mut pos = 2usize;
+    let mut tok = || -> Option<u32> {
+        // skip whitespace and # comments
+        loop {
+            while pos < b.len() && (b[pos] as char).is_whitespace() {
+                pos += 1;
+            }
+            if pos < b.len() && b[pos] == b'#' {
+                while pos < b.len() && b[pos] != b'\n' {
+                    pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let start = pos;
+        while pos < b.len() && b[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        std::str::from_utf8(&b[start..pos]).ok()?.parse().ok()
+    };
+    let w = tok()?;
+    let h = tok()?;
+    let maxv = tok()?;
+    if w == 0 || h == 0 || maxv == 0 {
+        return None;
+    }
+    pos += 1; // single whitespace after maxval
+    let need = (w * h * 3) as usize;
+    if pos + need > b.len() {
+        return None;
+    }
+    let mut px = Vec::with_capacity((w * h) as usize);
+    for i in 0..(w * h) as usize {
+        let o = pos + i * 3;
+        px.push(Px::rgb(b[o], b[o + 1], b[o + 2]));
+    }
+    Some(DecodedImg { w, h, px })
+}
+
+fn decode_bmp(b: &[u8]) -> Option<DecodedImg> {
+    if b.len() < 54 || &b[0..2] != b"BM" {
+        return None;
+    }
+    let u32le = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let i32le = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let u16le = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let data_off = u32le(10) as usize;
+    let w = i32le(18);
+    let h = i32le(22);
+    let bpp = u16le(28);
+    let compression = u32le(30);
+    if compression != 0 || !(bpp == 24 || bpp == 32) || w == 0 || h == 0 {
+        return None;
+    }
+    let bytespp = (bpp / 8) as usize;
+    let width = w.unsigned_abs();
+    let height = h.unsigned_abs();
+    let topdown = h < 0;
+    let row_size = ((bpp as usize * width as usize + 31) / 32) * 4;
+    if width > 8192 || height > 8192 {
+        return None;
+    }
+    let mut px = vec![Px::BLACK; (width * height) as usize];
+    for row in 0..height {
+        let src_y = if topdown { row } else { height - 1 - row };
+        let ro = data_off + src_y as usize * row_size;
+        for x in 0..width {
+            let o = ro + x as usize * bytespp;
+            if o + 2 >= b.len() {
+                continue;
+            }
+            px[(row * width + x) as usize] = Px::rgb(b[o + 2], b[o + 1], b[o]);
+        }
+    }
+    Some(DecodedImg { w: width, h: height, px })
+}
+
+// ─── Binary file info ────────────────────────────────────────────────
+
+/// A safe, read-only viewer for binary files (PDF, DOCX, archives…): it
+/// never tries to interpret them as text (which would risk an empty
+/// "new file" overwrite), just reports size and a hex preview.
+pub struct BinaryInfoApp {
+    name: String,
+    size: u64,
+    head: Vec<u8>,
+}
+
+impl BinaryInfoApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let size = bytes.len() as u64;
+        let head = bytes.into_iter().take(256).collect();
+        Self { name, size, head }
+    }
+}
+
+impl WindowApp for BinaryInfoApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
+    fn title(&self) -> String {
+        format!("File info - {}", self.name)
+    }
+
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if key == KeyCode::Escape {
+            return AppControl::Close;
+        }
+        AppControl::Continue
+    }
+
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}  ({} bytes)", self.name, self.size));
+        g.text(0, 1, "This is a binary file. Hex preview of the first bytes:");
+        let mut row = 3u32;
+        for chunk in self.head.chunks(16) {
+            if row >= g.rows {
+                break;
+            }
+            let mut hex = String::new();
+            let mut asc = String::new();
+            for byte in chunk {
+                hex.push_str(&format!("{byte:02x} "));
+                asc.push(if byte.is_ascii_graphic() { *byte as char } else { '.' });
+            }
+            g.text(0, row, &format!("{hex:<48} {asc}"));
+            row += 1;
+        }
     }
 }
 
@@ -3669,5 +5201,151 @@ mod app_tests {
         }
         assert_eq!(t.tasks[0], (true, "buy milk".to_string()));
         assert_eq!(t.tasks[1], (false, "write code".to_string()));
+    }
+
+    #[test]
+    fn file_extension_and_classification() {
+        assert_eq!(ext_of("notes.TXT"), "txt");
+        assert_eq!(ext_of("Makefile"), "");
+        assert_eq!(ext_of(".bashrc"), "bashrc");
+        assert_eq!(classify("a.png"), FileClass::Image);
+        assert_eq!(classify("index.html"), FileClass::Web);
+        assert_eq!(classify("main.rs"), FileClass::Code);
+        assert_eq!(classify("report.pdf"), FileClass::Binary);
+        assert_eq!(classify("readme"), FileClass::Text);
+        // Tags follow the class.
+        assert_eq!(type_tag("a.rs", false), "<>");
+        assert_eq!(type_tag("a", true), "DIR");
+    }
+
+    #[test]
+    fn syntax_highlight_colours_keywords_strings_and_comments() {
+        let fg = Px::rgb(0x10, 0x10, 0x10);
+        let cols = highlight("let x = \"hi\"; // note", Lang::Rust, fg);
+        // "let" is a keyword → not the default colour.
+        assert_ne!(cols[0], fg);
+        // the string body differs from the default too.
+        let q = "let x = \"hi\"; // note".find('"').unwrap();
+        assert_ne!(cols[q], fg);
+        // a plain language leaves everything default.
+        let plain = highlight("let x = 1", Lang::Plain, fg);
+        assert!(plain.iter().all(|&c| c == fg));
+    }
+
+    #[test]
+    fn editor_menu_actions_change_state() {
+        let mut e = EditApp::new(std::path::PathBuf::from("/tmp/drdr_test_unused.txt"));
+        assert_eq!(e.text_zoom, 1);
+        e.do_action("size_up");
+        assert_eq!(e.text_zoom, 2);
+        e.do_action("size_down");
+        assert_eq!(e.text_zoom, 1);
+        assert!(e.ink.is_none());
+        e.do_action("ink_red");
+        assert!(e.ink.is_some());
+        e.do_action("ink_default");
+        assert!(e.ink.is_none());
+    }
+
+    #[test]
+    fn editor_keeps_colour_buffer_in_lock_step_with_text() {
+        let mut e = EditApp::new(std::path::PathBuf::from("/tmp/drdr_test_unused2.txt"));
+        e.ink = Some(Px::rgb(1, 2, 3));
+        for c in "abc".chars() {
+            e.insert(c);
+        }
+        e.newline();
+        for c in "de".chars() {
+            e.insert(c);
+        }
+        // Every line's colour row matches its char count.
+        for (line, colrow) in e.lines.iter().zip(e.colors.iter()) {
+            assert_eq!(line.chars().count(), colrow.len());
+        }
+        e.backspace();
+        for (line, colrow) in e.lines.iter().zip(e.colors.iter()) {
+            assert_eq!(line.chars().count(), colrow.len());
+        }
+    }
+
+    #[test]
+    fn menu_bar_click_fires_actions_and_closes() {
+        let mut m = editor_menu();
+        // Click the first title (File) → opens.
+        assert!(matches!(m.on_click(m.title_start(0), 0), MenuClick::Consumed));
+        assert!(m.is_open());
+        // Click its first item (row 1) → fires "new" and closes.
+        let s = m.title_start(0);
+        assert!(matches!(m.on_click(s + 1, 1), MenuClick::Action("new")));
+        assert!(!m.is_open());
+    }
+
+    #[test]
+    fn decodes_a_tiny_ppm() {
+        // 2x1 P6: red then green.
+        let mut bytes = b"P6 2 1 255 ".to_vec();
+        bytes.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
+        let (img, _) = decode_image("t.ppm", &bytes);
+        let img = img.expect("ppm should decode");
+        assert_eq!((img.w, img.h), (2, 1));
+        assert_eq!(img.px[0], Px::rgb(255, 0, 0));
+        assert_eq!(img.px[1], Px::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn html_render_strips_tags_and_surfaces_text() {
+        let out = render_html("<h1>Title</h1><p>Hello <b>world</b></p>");
+        let joined: String = out.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>().join("|");
+        assert!(joined.contains("Title"));
+        assert!(joined.contains("Hello"));
+        assert!(!joined.contains('<'));
+    }
+
+    // ─── phase 12: shell icons + file-manager sidebar ───────────────
+
+    #[test]
+    fn apps_report_their_own_icon() {
+        // A spread of apps each map to the right pictographic kind, so the
+        // taskbar / title bar draw a real icon, not the generic fallback.
+        assert_eq!(AboutApp.icon(), IconKind::Info);
+        assert_eq!(CalcApp::new().icon(), IconKind::Calculator);
+        assert_eq!(ClockApp::new().icon(), IconKind::Clock);
+        assert_eq!(BrowserApp::new().icon(), IconKind::Browser);
+        assert_eq!(SystemApp::new().icon(), IconKind::Power);
+        assert_eq!(
+            FilesApp::new(drdr_store::documents_dir()).icon(),
+            IconKind::Folder
+        );
+    }
+
+    #[test]
+    fn files_sidebar_has_the_expected_places() {
+        let f = FilesApp::new(drdr_store::documents_dir());
+        let labels: Vec<&str> = f.places().iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["Documents", "My Data", "Filesystem", "Scratch"]);
+    }
+
+    #[test]
+    fn clicking_a_place_navigates_there() {
+        // "Scratch" → /tmp is the 4th place (sidebar row 4, i.e. row index
+        // 4 = place index 3). A click in the sidebar column jumps the cwd.
+        let mut f = FilesApp::new(drdr_store::documents_dir());
+        let scratch = std::path::PathBuf::from("/tmp");
+        // Sidebar rows are 1-based; "Scratch" is the 4th place → row 4.
+        f.on_click(1, 4, false);
+        if scratch.is_dir() {
+            assert_eq!(f.cwd, scratch, "sidebar click should navigate to /tmp");
+        }
+    }
+
+    #[test]
+    fn region_line_preserves_the_sidebar_columns() {
+        // A selected list row must only repaint from x0 rightward, leaving
+        // the sidebar cells (col < x0) untouched.
+        let mut g = TextGrid::new(20, 3, Px::WHITE, Px::BLACK);
+        g.put(2, 1, 'S', Px::WHITE, Px::BLACK); // a sidebar glyph
+        region_line(&mut g, 1, FILES_LIST_X, "file.txt", true);
+        assert_eq!(g.cell(2, 1).ch, 'S', "sidebar glyph survived the fill");
+        assert_eq!(g.cell(FILES_LIST_X, 1).ch, 'f');
     }
 }

@@ -26,11 +26,13 @@
 //! buffer. Apps compose into the desktop for free; there is no
 //! sub-process, no pseudo-terminal, nothing borrowed from xterm.
 
+use crate::icon::{draw_icon, IconKind};
 use crate::input::{KeyCode, MouseButton, MouseEvent};
 use crate::{Rect, Theme};
 use drdr_fb::{Framebuffer, Pixel};
 use drdr_font::{
-    GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph_aa, draw_glyph_scaled_aa, draw_text_aa,
+    GLYPH_HEIGHT, GLYPH_WIDTH, draw_glyph_aa, draw_glyph_scaled_aa, draw_glyph_scaled_aa_over,
+    draw_text_aa,
 };
 
 // ─── Layout constants ────────────────────────────────────────────────
@@ -47,11 +49,11 @@ const BTN_W: u32 = TITLE_H;
 const TASKBAR_H: u32 = GLYPH_HEIGHT + 22;
 /// Soft drop-shadow reach (px) — how far the shadow extends past the
 /// window edge. Larger = softer, Win11/macOS look.
-const SHADOW_REACH: i32 = 18;
-/// Corner radius for windows, taskbar and Start menu — modern UIs use
-/// 6-10px; 8 reads clearly without eating too many pixels on small
-/// framebuffers.
-const RADIUS: u32 = 8;
+const SHADOW_REACH: i32 = 24;
+/// Corner radius for windows, taskbar and Start menu. Windows 11 uses a
+/// generous ~10-12px radius on top-level windows; 12 reads clearly as
+/// "rounded" without eating too many pixels on small framebuffers.
+const RADIUS: u32 = 12;
 
 // ─── TextGrid — the surface apps draw into ───────────────────────────
 
@@ -160,8 +162,12 @@ impl TextGrid {
         }
     }
 
-    fn cell(&self, col: u32, row: u32) -> Cell {
-        self.cells[(row * self.cols + col) as usize]
+    /// Read one cell. Used by the window manager to blit and by apps'
+    /// tests to assert what landed where. Out-of-bounds returns a blank.
+    pub fn cell(&self, col: u32, row: u32) -> Cell {
+        self.idx(col, row)
+            .map(|i| self.cells[i])
+            .unwrap_or(Cell { ch: ' ', fg: self.fg, bg: self.bg })
     }
 }
 
@@ -226,6 +232,22 @@ pub trait WindowApp {
     fn take_spawns(&mut self) -> Vec<Spawn> {
         Vec::new()
     }
+
+    /// Text magnification for this window's grid: 1 = normal, 2 = double
+    /// size, etc. Lets an app offer a "bigger / smaller text" control (the
+    /// editor's Format menu) — the WM sizes the grid in `zoom`-scaled
+    /// cells and draws every glyph at that scale. Clamped to 1..=3.
+    fn zoom(&self) -> u32 {
+        1
+    }
+
+    /// The pictographic icon for this app, drawn on its taskbar chip and
+    /// beside its title. Defaults to a generic glyph; apps override with
+    /// their own [`IconKind`] so the shell looks like a real desktop
+    /// instead of a row of unlabelled text buttons.
+    fn icon(&self) -> IconKind {
+        IconKind::Generic
+    }
 }
 
 // ─── Window ──────────────────────────────────────────────────────────
@@ -246,7 +268,7 @@ pub struct Window {
 
 impl Window {
     pub fn new(rect: Rect, app: Box<dyn WindowApp>) -> Self {
-        let (cols, rows) = Self::grid_dims(rect);
+        let (cols, rows) = Self::grid_dims(rect, app.zoom());
         Self {
             rect,
             app,
@@ -266,11 +288,13 @@ impl Window {
         )
     }
 
-    /// How many character cells fit in `rect`'s content area.
-    fn grid_dims(rect: Rect) -> (u32, u32) {
+    /// How many character cells fit in `rect`'s content area at the given
+    /// text `zoom` (1 = normal, 2 = double-size glyphs, …).
+    fn grid_dims(rect: Rect, zoom: u32) -> (u32, u32) {
+        let zoom = zoom.clamp(1, 3);
         let cw = rect.w.saturating_sub(BORDER * 2);
         let ch = rect.h.saturating_sub(TITLE_H + BORDER);
-        ((cw / GLYPH_WIDTH).max(1), (ch / GLYPH_HEIGHT).max(1))
+        ((cw / (GLYPH_WIDTH * zoom)).max(1), (ch / (GLYPH_HEIGHT * zoom)).max(1))
     }
 
     /// The draggable strip — the title bar minus the control buttons.
@@ -321,9 +345,10 @@ impl Window {
         if !hit(c, x, y) {
             return None;
         }
-        let col = (x - c.x as i32) as u32 / GLYPH_WIDTH;
-        let row = (y - c.y as i32) as u32 / GLYPH_HEIGHT;
-        let (cols, rows) = Self::grid_dims(self.rect);
+        let zoom = self.app.zoom().clamp(1, 3);
+        let col = (x - c.x as i32) as u32 / (GLYPH_WIDTH * zoom);
+        let row = (y - c.y as i32) as u32 / (GLYPH_HEIGHT * zoom);
+        let (cols, rows) = Self::grid_dims(self.rect, zoom);
         (col < cols && row < rows).then_some((col, row))
     }
 }
@@ -442,17 +467,17 @@ const SNAP_EDGE: i32 = 20;
 const ICON_TILE: u32 = 92;
 /// Gap between icons (horizontal AND vertical), in px.
 const ICON_GAP: u32 = 24;
-/// Rounded-corner radius of the icon tile.
-const ICON_RADIUS: u32 = 14;
+/// Rounded-corner radius of the icon tile (Win11-style "squircle" feel).
+const ICON_RADIUS: u32 = 20;
 /// Vertical padding above the icon grid (under the screen top).
 const ICON_GRID_TOP: u32 = 64;
 
 /// One icon on the desktop: a label, the app factory it should launch,
-/// and an optional "glyph" character (drawn 4x scaled inside the tile).
+/// and a real pictographic [`IconKind`] (drawn inside the tile).
 pub struct DesktopIcon {
     pub label: String,
-    pub glyph: char,
-    /// Background tint (paints behind the glyph). A soft, distinct
+    pub icon: IconKind,
+    /// Background tint (paints behind the icon). A soft, distinct
     /// colour per app helps the eye scan the grid.
     pub tint: Pixel,
     pub factory: Box<dyn Fn() -> Spawn>,
@@ -480,8 +505,9 @@ pub struct WindowManager {
     dirty: bool,
     /// Builds a fresh launcher window when the desktop empties.
     launcher: Option<Box<dyn Fn() -> Spawn>>,
-    /// Start-menu entries: a label and a factory that builds the window.
-    start_items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
+    /// Start-menu entries: a label, an icon and a factory that builds the
+    /// window.
+    start_items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     start_open: bool,
     /// While true, the keyboard-shortcut help overlay is drawn over the
     /// desktop (any key / click dismisses it).
@@ -598,11 +624,11 @@ impl WindowManager {
         self.launcher = Some(Box::new(f));
     }
 
-    /// Populate the Start menu. Each entry is a label and a factory that
-    /// builds its window when chosen.
+    /// Populate the Start menu. Each entry is a label, an icon and a
+    /// factory that builds its window when chosen.
     pub fn set_start_menu(
         &mut self,
-        items: Vec<(String, Box<dyn Fn() -> Spawn>)>,
+        items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     ) {
         self.start_items = items;
     }
@@ -892,7 +918,7 @@ impl WindowManager {
             let menu = self.start_menu_rect();
             if hit(menu, x, y) {
                 let row = ((y - menu.y as i32) as u32) / (GLYPH_HEIGHT + 6);
-                if let Some((_, factory)) = self.start_items.get(row as usize) {
+                if let Some((_, _, factory)) = self.start_items.get(row as usize) {
                     let s = factory();
                     self.open(s.rect, s.app); // also clears start_open
                 }
@@ -942,7 +968,7 @@ impl WindowManager {
     fn start_menu_rect(&self) -> Rect {
         let rows = self.start_items.len().max(1) as u32;
         let h = rows * (GLYPH_HEIGHT + 6) + 12;
-        let w = GLYPH_WIDTH * 26;
+        let w = GLYPH_WIDTH * 28 + GLYPH_HEIGHT;
         Rect::new(
             0,
             self.screen_h.saturating_sub(TASKBAR_H + h),
@@ -1104,11 +1130,18 @@ impl WindowManager {
         set_fb_pointer((self.pointer_x, self.pointer_y));
         let (w, h) = (fb.width, fb.height);
 
-        // Wallpaper: a soft vertical gradient + a faint centred wordmark
-        // so a bare desktop reads as DrDrOS, not a crash.
+        // Wallpaper: a soft vertical gradient + a Windows-11-style radial
+        // "bloom" glow in the accent hue (two big, very faint discs), then
+        // a faint centred wordmark so a bare desktop reads as DrDrOS.
         let top = theme.bg;
-        let bot = theme.bg.lerp(theme.accent, 22);
+        let bot = theme.bg.lerp(theme.accent, 24);
         fb.fill_rect_v(0, 0, w, h, top, bot);
+        // Cheap bloom: a couple of large, low-alpha accent discs. Painted
+        // once per frame over the gradient — soft, modern, not noisy.
+        let glow = Pixel::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 16);
+        let big = w.max(h) as i32;
+        fb.fill_circle((w as i32) * 30 / 100, (h as i32) * 24 / 100, big * 55 / 100, glow);
+        fb.fill_circle((w as i32) * 82 / 100, (h as i32) * 88 / 100, big * 45 / 100, glow);
         // Soft DrDrOS wordmark watermark only when nothing else fills
         // the wallpaper — once the user has icons the mark becomes
         // visual noise, so we skip it.
@@ -1295,19 +1328,18 @@ impl WindowManager {
                 fb.fill_rect(tile_x + ICON_TILE - 2, tile_y, 2, ICON_TILE, ring);
             }
 
-            // 4× scaled glyph in the centre — readable from a metre
-            // away on a 1080p screen; reuses the bitmap font.
-            let scale: u32 = 4;
-            let gw = GLYPH_WIDTH * scale;
-            let gh = GLYPH_HEIGHT * scale;
-            let gx = tile_x + (ICON_TILE.saturating_sub(gw)) / 2;
-            let gy = tile_y + (ICON_TILE.saturating_sub(gh)) / 2;
+            // Real pictographic icon, centred — a folder, a calculator,
+            // a globe… not a scaled font letter. Inked light on a dark
+            // tile, dark on a light one, so it always reads.
+            let isize = (ICON_TILE * 64) / 92; // ~64px inside a 92px tile
+            let ix = tile_x + (ICON_TILE.saturating_sub(isize)) / 2;
+            let iy = tile_y + (ICON_TILE.saturating_sub(isize)) / 2;
             let glyph_fg = if luminance_for(body) > 140 {
                 Pixel::rgb(0x10, 0x10, 0x14)
             } else {
                 Pixel::WHITE
             };
-            draw_glyph_scaled(fb, gx, gy, icon.glyph, glyph_fg, scale);
+            draw_icon(fb, ix, iy, isize, icon.icon, glyph_fg, body);
 
             // Label under the tile, centred.
             let label_y = tile_y + ICON_TILE + 4;
@@ -1332,9 +1364,14 @@ impl WindowManager {
 
     fn draw_taskbar(&self, fb: &mut Framebuffer, theme: &Theme) {
         let tb = self.taskbar_rect();
-        // Frosted bar: solid surface with a 1px accent-tinted hairline
-        // at the top so the bar reads as floating above the wallpaper.
-        fb.fill_rect(tb.x, tb.y, tb.w, tb.h, theme.surface);
+        // Acrylic bar: a near-opaque translucent surface so the wallpaper
+        // bloom faintly shows through (the Win11 "Mica/Acrylic" look),
+        // with a 1px accent-tinted hairline at the top so it reads as
+        // floating above the wallpaper.
+        fb.shade_rect(
+            tb.x, tb.y, tb.w, tb.h,
+            Pixel::rgba(theme.surface.r, theme.surface.g, theme.surface.b, 235),
+        );
         fb.fill_rect(tb.x, tb.y, tb.w, 1, theme.accent.lerp(theme.bg, 80));
 
         // Start button — accent chip with rounded corners + wordmark.
@@ -1389,10 +1426,16 @@ impl WindowManager {
                 let uw = if focused { slot_w - 4 } else { slot_w / 3 };
                 fb.fill_rect(x + 2, tb.y + tb.h - 3, uw, 2, theme.accent);
             }
+            // The app's pictographic icon, then its title — a real
+            // taskbar button, not a bare text label.
+            let isz = GLYPH_HEIGHT;
+            let iy = tb.y + (tb.h.saturating_sub(isz)) / 2;
+            draw_icon(fb, x + 10, iy, isz, win.app.icon(), fg, bg);
+            let tx = x + 14 + isz;
             let label = win.app.title();
-            let maxc = ((slot_w - 12) / GLYPH_WIDTH) as usize;
+            let maxc = ((slot_w.saturating_sub(18 + isz)) / GLYPH_WIDTH) as usize;
             let label: String = label.chars().take(maxc).collect();
-            draw_text_aa(fb, x + 10, ty, &label, fg, bg);
+            draw_text_aa(fb, tx, ty, &label, fg, bg);
             x += slot_w;
         }
 
@@ -1427,6 +1470,20 @@ impl WindowManager {
             theme.muted,
             theme.surface,
         );
+
+        // ── System tray indicators ──────────────────────────────────────
+        // A small cluster of status glyphs to the LEFT of the clock, the
+        // way Windows 11 / macOS show network + sound in the corner. They
+        // read as muted ink on the bar; the network glyph mirrors the
+        // DrDrNet reactor that the desktop genuinely runs.
+        let isz = GLYPH_HEIGHT;
+        let iy = tb.y + (tb.h.saturating_sub(isz)) / 2;
+        let gap = isz + 8;
+        let mut tix = tray_x.saturating_sub(gap * 2 + 6);
+        for kind in [IconKind::Network, IconKind::Music] {
+            draw_icon(fb, tix, iy, isz, kind, theme.muted, theme.surface);
+            tix += gap;
+        }
     }
 
     fn draw_start_menu(&self, fb: &mut Framebuffer, theme: &Theme) {
@@ -1443,7 +1500,8 @@ impl WindowManager {
         fb.fill_rect(m.x + RADIUS / 2, m.y, m.w.saturating_sub(RADIUS), 1, theme.accent);
 
         let row_h = GLYPH_HEIGHT + 6;
-        for (i, (label, _)) in self.start_items.iter().enumerate() {
+        let isz = GLYPH_HEIGHT; // small icon fits the row height
+        for (i, (label, kind, _)) in self.start_items.iter().enumerate() {
             let ry = m.y + 6 + i as u32 * row_h;
             let hot = self.pointer_y >= ry as i32
                 && self.pointer_y < (ry + row_h) as i32
@@ -1463,7 +1521,9 @@ impl WindowManager {
                     bg,
                 );
             }
-            draw_text_aa(fb, m.x + 16, ry + 3, label, fg, bg);
+            // A small real icon to the left of every Start-menu label.
+            draw_icon(fb, m.x + 10, ry + (row_h - isz) / 2, isz, *kind, fg, bg);
+            draw_text_aa(fb, m.x + 16 + isz, ry + 3, label, fg, bg);
         }
     }
 }
@@ -1492,14 +1552,6 @@ fn luminance_for(p: Pixel) -> u32 {
     (p.r as u32 * 299 + p.g as u32 * 587 + p.b as u32 * 114) / 1000
 }
 
-/// Draw a single bitmap glyph scaled `scale`× with **anti-aliased** edges
-/// (a smooth resample of the pixel art, not blocky replicated squares) —
-/// used by the desktop icons (large logos) and the wordmark. Composites
-/// over the back buffer so it sits cleanly on a tinted tile.
-fn draw_glyph_scaled(fb: &mut Framebuffer, x: u32, y: u32, ch: char, fg: Pixel, scale: u32) {
-    draw_glyph_scaled_aa(fb, x, y, ch, fg, scale);
-}
-
 /// 2×-scaled, anti-aliased text for the wallpaper wordmark.
 fn draw_text_2x(fb: &mut Framebuffer, x: u32, y: u32, text: &str, fg: Pixel) {
     let mut cx = x;
@@ -1516,14 +1568,15 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
     let r = win.rect;
     let radius = RADIUS.min(r.w / 2).min(r.h / 2);
 
-    // ── Title bar — flat color, only the TOP two corners rounded so it
-    //    meets the content area below with a clean straight seam.
+    // ── Title bar — Windows-11 "Mica" style: the bar shares the window's
+    //    surface colour so the title bar and body read as one continuous
+    //    rounded sheet, rather than a heavy coloured strip. The focused
+    //    bar gets a barely-there accent wash + an accent hairline below;
+    //    an unfocused bar greys back toward the wallpaper.
     let (bar_color, bar_fg) = if focused {
-        (theme.accent, theme.accent_fg)
+        (theme.surface.lerp(theme.accent, 12), theme.fg)
     } else {
-        // A slightly tinted surface so an unfocused bar still reads as
-        // chrome (distinct from the content area below).
-        (theme.surface.lerp(theme.muted, 26), theme.muted)
+        (theme.surface.lerp(theme.bg, 55), theme.muted)
     };
     fb.fill_round_rect_corners(
         r.x, r.y, r.w, TITLE_H,
@@ -1557,12 +1610,20 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
         sep,
     );
 
-    // ── Title text ──────────────────────────────────────────────────
-    let title = win.app.title();
+    // ── App icon + title text ───────────────────────────────────────
+    // A small pictographic icon sits at the left of the title bar (like
+    // every real window manager), then the title text. The icon box is
+    // the glyph height so it lines up with the text baseline.
     let ty = r.y + (TITLE_H.saturating_sub(GLYPH_HEIGHT)) / 2;
-    let maxc = ((r.w.saturating_sub(BTN_W * 3 + 16)) / GLYPH_WIDTH) as usize;
+    let isz = GLYPH_HEIGHT;
+    let iy = r.y + (TITLE_H.saturating_sub(isz)) / 2;
+    draw_icon(fb, r.x + 10, iy, isz, win.app.icon(), bar_fg, bar_color);
+    let text_x = r.x + 14 + isz;
+    let title = win.app.title();
+    let avail = r.w.saturating_sub(BTN_W * 3 + 18 + isz);
+    let maxc = (avail / GLYPH_WIDTH) as usize;
     let title: String = title.chars().take(maxc.max(1)).collect();
-    draw_text_aa(fb, r.x + 14, ty, &title, bar_fg, bar_color);
+    draw_text_aa(fb, text_x, ty, &title, bar_fg, bar_color);
 
     // ── Window controls: minimise / maximise / close ────────────────
     // Close reddens on hover (Windows convention); maximise toggles
@@ -1614,7 +1675,9 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
     // grid-bg fill by `radius` at the bottom so the rounded body's
     // alpha-blended corner pixels stay visible underneath.
     let content = win.content_rect();
-    let (cols, rows) = Window::grid_dims(r);
+    let zoom = win.app.zoom().clamp(1, 3);
+    let (cw, chh) = (GLYPH_WIDTH * zoom, GLYPH_HEIGHT * zoom);
+    let (cols, rows) = Window::grid_dims(r, zoom);
     win.grid.resize(cols, rows, theme.fg, theme.surface);
     win.grid.clear();
     win.app.render(&mut win.grid);
@@ -1629,13 +1692,19 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
             win.grid.bg(),
         );
     }
-    // Cell glyphs — same as before.
+    // Cell glyphs — at zoom 1 the crisp 1× AA path; at higher zoom each
+    // cell gets its background painted then a smooth supersampled glyph.
     for gy in 0..win.grid.rows {
         for gx in 0..win.grid.cols {
             let cell = win.grid.cell(gx, gy);
-            let pxg = content.x + gx * GLYPH_WIDTH;
-            let pyg = content.y + gy * GLYPH_HEIGHT;
-            draw_glyph_aa(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
+            let pxg = content.x + gx * cw;
+            let pyg = content.y + gy * chh;
+            if zoom == 1 {
+                draw_glyph_aa(fb, pxg, pyg, cell.ch, cell.fg, cell.bg);
+            } else {
+                fb.fill_rect(pxg, pyg, cw, chh, cell.bg);
+                draw_glyph_scaled_aa_over(fb, pxg, pyg, cell.ch, cell.fg, cell.bg, zoom);
+            }
         }
     }
 }
@@ -1874,6 +1943,7 @@ mod tests {
         let mut m = WindowManager::new(1000, 800);
         m.set_start_menu(vec![(
             "X".into(),
+            IconKind::Generic,
             Box::new(|| Spawn {
                 rect: Rect::new(0, 0, 100, 100),
                 app: Box::new(Dummy("x")),
