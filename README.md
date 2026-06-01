@@ -175,10 +175,10 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **18116 lines** across **28 files** |
+| Rust source | **18352 lines** across **28 files** |
 | Workspace crates | **13** (every `drdr-*`) |
-| Tests | **111** (`cargo test`, all green) |
-| Git commits | **49** |
+| Tests | **115** (`cargo test`, all green) |
+| Git commits | **51** |
 | Tracked files (excl. `buildroot/`) | **57** |
 | Development window | 2026-05-14
 ? → 2026-06-01 |
@@ -187,8 +187,8 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  6091 | window manager + apps |
-| drdr-ui    |  4146 | GUI framework + WM + shell |
+| drdr-desk  |  6287 | window manager + apps |
+| drdr-ui    |  4186 | GUI framework + WM + shell |
 | drdr-net   |  1911 | binary proto + reactor |
 | drdr-codec |  1026 | — |
 | drdr-fb    |   976 | framebuffer (all bpp) |

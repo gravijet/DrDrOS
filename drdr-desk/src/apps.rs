@@ -83,6 +83,9 @@ fn spawn_rect() -> Rect {
 pub struct AboutApp;
 
 impl WindowApp for AboutApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Info
+    }
     fn title(&self) -> String {
         "About DrDrOS".into()
     }
@@ -254,9 +257,53 @@ impl FilesApp {
         }
         self.sel = (self.sel as i32 + delta).clamp(0, n - 1) as usize;
     }
+
+    /// The "Places" shortcuts shown in the left sidebar: the writable
+    /// Documents / Data folders, the filesystem root, and the scratch
+    /// area. A click jumps straight there — the navigation rail every
+    /// modern file manager has.
+    fn places(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("Documents", drdr_store::documents_dir()),
+            ("My Data", drdr_store::data_dir()),
+            ("Filesystem", PathBuf::from("/")),
+            ("Scratch", PathBuf::from("/tmp")),
+        ]
+    }
+
+    /// Jump to a Places shortcut (only if it's a readable directory).
+    fn nav_to(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.cwd = p;
+            self.reload();
+        }
+    }
+}
+
+/// Width of the file-manager navigation sidebar, in character cells.
+const FILES_SIDEBAR_W: u32 = 14;
+/// First content column to the right of the sidebar + its divider.
+const FILES_LIST_X: u32 = FILES_SIDEBAR_W + 2;
+
+/// Write one list line in the content region `[x0, cols)`, painting a
+/// reverse-video background across just that region when selected — so a
+/// left sidebar drawn earlier is never overwritten.
+fn region_line(g: &mut TextGrid, row: u32, x0: u32, text: &str, sel: bool) {
+    if sel {
+        let (fg, bg) = (g.bg(), g.fg());
+        for c in x0..g.cols {
+            g.put(c, row, ' ', fg, bg);
+        }
+        g.write(x0, row, text, fg, bg);
+    } else {
+        g.text(x0, row, text);
+    }
 }
 
 impl WindowApp for FilesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Folder
+    }
     fn title(&self) -> String {
         format!("DrDrFiles - {}", self.cwd.display())
     }
@@ -309,9 +356,22 @@ impl WindowApp for FilesApp {
         AppControl::Continue
     }
 
-    fn on_click(&mut self, _col: u32, row: u32, double: bool) -> AppControl {
-        // Row 0 is the header; entries start at row 1.
-        if !matches!(self.mode, FMode::Browse) || row == 0 {
+    fn on_click(&mut self, col: u32, row: u32, double: bool) -> AppControl {
+        if !matches!(self.mode, FMode::Browse) {
+            return AppControl::Continue;
+        }
+        // A click in the left sidebar jumps to that Place.
+        if col < FILES_SIDEBAR_W {
+            if row >= 1 {
+                let places = self.places();
+                if let Some((_, p)) = places.get(row as usize - 1) {
+                    self.nav_to(p.clone());
+                }
+            }
+            return AppControl::Continue;
+        }
+        // The file list: row 0 is the header; entries start at row 1.
+        if row == 0 {
             return AppControl::Continue;
         }
         let idx = self.scroll + (row as usize - 1);
@@ -325,9 +385,33 @@ impl WindowApp for FilesApp {
     }
 
     fn render(&mut self, g: &mut TextGrid) {
+        // ── Left navigation sidebar ("Places") ──────────────────────────
+        let muted = g.fg();
+        g.write(1, 0, "PLACES", muted, g.bg());
+        let active_place = self.places().iter().position(|(_, p)| *p == self.cwd);
+        for (i, (label, _)) in self.places().iter().enumerate() {
+            let row = i as u32 + 1;
+            let sel = active_place == Some(i);
+            if sel {
+                let (fg, bg) = (g.bg(), g.fg());
+                for c in 0..FILES_SIDEBAR_W {
+                    g.put(c, row, ' ', fg, bg);
+                }
+                g.write(1, row, label, fg, bg);
+            } else {
+                g.write(1, row, label, g.fg(), g.bg());
+            }
+        }
+        // Vertical divider between the sidebar and the file list.
+        for r in 0..g.rows {
+            g.put(FILES_SIDEBAR_W, r, '|', muted, g.bg());
+        }
+
+        let x0 = FILES_LIST_X;
         if let Some(e) = &self.err {
-            g.text(1, 1, e);
-            g.text(1, 3, "(any key / r to reload)");
+            let e = e.clone();
+            g.text(x0, 1, &e);
+            g.text(x0, 3, "(any key / r to reload)");
         }
         let rows = g.rows as usize;
         let visible = rows.saturating_sub(2);
@@ -348,7 +432,7 @@ impl WindowApp for FilesApp {
                 format!("delete '{n}' ?  y = yes, any other key = no")
             }
         };
-        g.text(0, 0, &header);
+        g.text(x0, 0, &header);
 
         if self.err.is_some() {
             return;
@@ -361,11 +445,7 @@ impl WindowApp for FilesApp {
             let it = &self.items[idx];
             let line = format!("{:<4} {}", type_tag(&it.name, it.is_dir), it.name);
             let row = vis as u32 + 1;
-            if idx == self.sel {
-                selected(g, row, &line);
-            } else {
-                g.text(0, row, &line);
-            }
+            region_line(g, row, x0, &line, idx == self.sel);
         }
     }
 }
@@ -619,6 +699,9 @@ impl EditApp {
 }
 
 impl WindowApp for EditApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
     fn title(&self) -> String {
         let star = if self.modified { "*" } else { "" };
         format!("DrDrEdit{star} - {}", self.path.display())
@@ -921,10 +1004,12 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
 pub fn open_demo_windows(wm: &mut WindowManager) {
     // Show the editor on a real source file so the snapshot captures the
     // menu bar + syntax highlighting, plus the browser homepage.
-    wm.open(Rect::new(20, 48, 540, 430), Box::new(EditApp::new("drdr-desk/src/main.rs")));
-    wm.open(Rect::new(580, 60, 410, 320), Box::new(BrowserApp::new()));
-    wm.open(Rect::new(360, 330, 320, 240), Box::new(Game2048::new()));
-    wm.open(Rect::new(120, 300, 300, 220), Box::new(CalcApp::new()));
+    wm.open(Rect::new(20, 48, 520, 360), Box::new(EditApp::new("drdr-desk/src/main.rs")));
+    // A file-manager window so the snapshot shows the new Places sidebar.
+    wm.open(Rect::new(60, 250, 470, 320), Box::new(FilesApp::new(PathBuf::from("/"))));
+    wm.open(Rect::new(560, 60, 430, 320), Box::new(BrowserApp::new()));
+    wm.open(Rect::new(600, 360, 320, 220), Box::new(Game2048::new()));
+    wm.open(Rect::new(330, 430, 300, 150), Box::new(CalcApp::new()));
 }
 
 impl LauncherApp {
@@ -940,6 +1025,9 @@ impl LauncherApp {
 }
 
 impl WindowApp for LauncherApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Settings
+    }
     fn title(&self) -> String {
         "Launcher".into()
     }
@@ -1018,6 +1106,9 @@ impl SystemApp {
 const SYS_ITEMS: [&str; 2] = ["Reboot", "Power off"];
 
 impl WindowApp for SystemApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Power
+    }
     fn title(&self) -> String {
         "System".into()
     }
@@ -1092,6 +1183,9 @@ impl NetApp {
 }
 
 impl WindowApp for NetApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Network
+    }
     fn title(&self) -> String {
         match (net_snapshot(&self.net), &self.last) {
             (Some(_), Ok(_)) => "DrDrNet  * online".into(),
@@ -1202,6 +1296,9 @@ impl SettingsApp {
 }
 
 impl WindowApp for SettingsApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Settings
+    }
     fn title(&self) -> String {
         "Settings".into()
     }
@@ -1338,6 +1435,9 @@ impl DisksApp {
 }
 
 impl WindowApp for DisksApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Disk
+    }
     fn title(&self) -> String {
         "Disks".into()
     }
@@ -1531,6 +1631,9 @@ impl NotesApp {
 }
 
 impl WindowApp for NotesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Note
+    }
     fn title(&self) -> String {
         format!(
             "Notes - {}{}",
@@ -1676,6 +1779,9 @@ const KEYPAD: [[char; 4]; 4] = [
 ];
 
 impl WindowApp for CalcApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Calculator
+    }
     fn title(&self) -> String {
         "Calculator".into()
     }
@@ -1918,6 +2024,9 @@ fn uptime_secs() -> u64 {
 }
 
 impl WindowApp for ClockApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Clock
+    }
     fn title(&self) -> String {
         "Clock".into()
     }
@@ -2059,6 +2168,9 @@ fn bar(pct: u32, width: u32) -> String {
 }
 
 impl WindowApp for SysMonApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Monitor
+    }
     fn title(&self) -> String {
         "System Monitor".into()
     }
@@ -2288,6 +2400,9 @@ impl ConsoleApp {
 }
 
 impl WindowApp for ConsoleApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Terminal
+    }
     fn title(&self) -> String {
         format!("DrDrConsole - {}", self.cwd.display())
     }
@@ -2424,6 +2539,9 @@ fn fmt_hhmm(ts: u64) -> String {
 }
 
 impl WindowApp for ChatApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Chat
+    }
     fn title(&self) -> String {
         match net_snapshot(&self.net) {
             None => "DrDrChat - starting...".into(),
@@ -2598,6 +2716,9 @@ impl PaintApp {
 }
 
 impl WindowApp for PaintApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Paint
+    }
     fn title(&self) -> String {
         if self.erasing {
             "DrDrPaint - eraser".into()
@@ -2796,6 +2917,9 @@ impl SnakeApp {
 }
 
 impl WindowApp for SnakeApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Snake
+    }
     fn title(&self) -> String {
         if self.over {
             format!("DrDrSnake - GAME OVER (score {}) - R to restart", self.score)
@@ -2932,6 +3056,9 @@ impl TasksApp {
 }
 
 impl WindowApp for TasksApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Tasks
+    }
     fn title(&self) -> String {
         let open = self.tasks.iter().filter(|(d, _)| !*d).count();
         format!(
@@ -3184,6 +3311,9 @@ impl Game2048 {
 }
 
 impl WindowApp for Game2048 {
+    fn icon(&self) -> IconKind {
+        IconKind::Dice2048
+    }
     fn title(&self) -> String {
         format!("DrDr2048 - score {} (best {})", self.score, self.best.max(self.score))
     }
@@ -3431,6 +3561,9 @@ impl MinesApp {
 }
 
 impl WindowApp for MinesApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Mine
+    }
     fn title(&self) -> String {
         let state = if self.won {
             "  WON!"
@@ -3569,6 +3702,9 @@ fn fmt_uptime(secs: u64) -> String {
 }
 
 impl WindowApp for SysInfoApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Info
+    }
     fn title(&self) -> String {
         "System Info".into()
     }
@@ -4169,6 +4305,9 @@ impl BrowserApp {
 }
 
 impl WindowApp for BrowserApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Browser
+    }
     fn title(&self) -> String {
         format!("Browser - {}", self.title)
     }
@@ -4437,6 +4576,9 @@ fn list_ifaces() -> Vec<Iface> {
 }
 
 impl WindowApp for NetworkApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Network
+    }
     fn title(&self) -> String {
         match self.view {
             NetView::Interfaces => "Network & Wi-Fi".into(),
@@ -4648,6 +4790,9 @@ impl ImageApp {
 }
 
 impl WindowApp for ImageApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Image
+    }
     fn title(&self) -> String {
         format!("Image - {}", self.name)
     }
@@ -4843,6 +4988,9 @@ impl BinaryInfoApp {
 }
 
 impl WindowApp for BinaryInfoApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
     fn title(&self) -> String {
         format!("File info - {}", self.name)
     }
@@ -5151,5 +5299,53 @@ mod app_tests {
         assert!(joined.contains("Title"));
         assert!(joined.contains("Hello"));
         assert!(!joined.contains('<'));
+    }
+
+    // ─── phase 12: shell icons + file-manager sidebar ───────────────
+
+    #[test]
+    fn apps_report_their_own_icon() {
+        // A spread of apps each map to the right pictographic kind, so the
+        // taskbar / title bar draw a real icon, not the generic fallback.
+        assert_eq!(AboutApp.icon(), IconKind::Info);
+        assert_eq!(CalcApp::new().icon(), IconKind::Calculator);
+        assert_eq!(ClockApp::new().icon(), IconKind::Clock);
+        assert_eq!(BrowserApp::new().icon(), IconKind::Browser);
+        assert_eq!(SystemApp::new().icon(), IconKind::Power);
+        assert_eq!(
+            FilesApp::new(drdr_store::documents_dir()).icon(),
+            IconKind::Folder
+        );
+    }
+
+    #[test]
+    fn files_sidebar_has_the_expected_places() {
+        let f = FilesApp::new(drdr_store::documents_dir());
+        let labels: Vec<&str> = f.places().iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["Documents", "My Data", "Filesystem", "Scratch"]);
+    }
+
+    #[test]
+    fn clicking_a_place_navigates_there() {
+        // "Scratch" → /tmp is the 4th place (sidebar row 4, i.e. row index
+        // 4 = place index 3). A click in the sidebar column jumps the cwd.
+        let mut f = FilesApp::new(drdr_store::documents_dir());
+        let scratch = std::path::PathBuf::from("/tmp");
+        // Sidebar rows are 1-based; "Scratch" is the 4th place → row 4.
+        f.on_click(1, 4, false);
+        if scratch.is_dir() {
+            assert_eq!(f.cwd, scratch, "sidebar click should navigate to /tmp");
+        }
+    }
+
+    #[test]
+    fn region_line_preserves_the_sidebar_columns() {
+        // A selected list row must only repaint from x0 rightward, leaving
+        // the sidebar cells (col < x0) untouched.
+        let mut g = TextGrid::new(20, 3, Px::WHITE, Px::BLACK);
+        g.put(2, 1, 'S', Px::WHITE, Px::BLACK); // a sidebar glyph
+        region_line(&mut g, 1, FILES_LIST_X, "file.txt", true);
+        assert_eq!(g.cell(2, 1).ch, 'S', "sidebar glyph survived the fill");
+        assert_eq!(g.cell(FILES_LIST_X, 1).ch, 'f');
     }
 }
