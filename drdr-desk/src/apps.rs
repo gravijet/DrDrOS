@@ -206,6 +206,9 @@ impl FilesApp {
             let app: Box<dyn WindowApp> = match classify(&it.name) {
                 FileClass::Image => Box::new(ImageApp::open(path)),
                 FileClass::Web => Box::new(BrowserApp::open(path)),
+                FileClass::Pdf => Box::new(PdfApp::open(path)),
+                FileClass::Archive => Box::new(ArchiveApp::open(path)),
+                FileClass::Media => Box::new(MediaApp::open(path)),
                 FileClass::Binary => Box::new(BinaryInfoApp::open(path)),
                 _ => Box::new(EditApp::new(path)),
             };
@@ -1002,14 +1005,23 @@ pub fn desktop_icons(net: SharedNet) -> Vec<DesktopIcon> {
 /// DRDR_DEMO` snapshot path so generated screenshots show a working
 /// desktop (window chrome + real app text), never in a normal boot.
 pub fn open_demo_windows(wm: &mut WindowManager) {
-    // Show the editor on a real source file so the snapshot captures the
-    // menu bar + syntax highlighting, plus the browser homepage.
-    wm.open(Rect::new(20, 48, 520, 360), Box::new(EditApp::new("drdr-desk/src/main.rs")));
-    // A file-manager window so the snapshot shows the new Places sidebar.
-    wm.open(Rect::new(60, 250, 470, 320), Box::new(FilesApp::new(PathBuf::from("/"))));
-    wm.open(Rect::new(560, 60, 430, 320), Box::new(BrowserApp::new()));
-    wm.open(Rect::new(600, 360, 320, 220), Box::new(Game2048::new()));
-    wm.open(Rect::new(330, 430, 300, 150), Box::new(CalcApp::new()));
+    // Editor on a real source file → menu bar + syntax highlighting.
+    wm.open(Rect::new(12, 40, 410, 250), Box::new(EditApp::new("drdr-desk/src/main.rs")));
+    // Notes → its new menu bar.
+    wm.open(Rect::new(20, 300, 400, 250), Box::new(NotesApp::new()));
+    // Paint → its new left tool palette.
+    wm.open(Rect::new(300, 360, 380, 250), Box::new(PaintApp::new()));
+    // A real web browser, navigated to a live http:// page when the snapshot
+    // host has network (it degrades to an honest error page otherwise).
+    let mut browser = BrowserApp::new();
+    if std::env::var_os("DRDR_DEMO_WEB").is_some() {
+        browser.navigate("http://example.com");
+    }
+    wm.open(Rect::new(450, 40, 555, 360), Box::new(browser));
+    let img = std::path::Path::new("/tmp/drdr-demo.jpg");
+    if img.exists() {
+        wm.open(Rect::new(700, 410, 300, 200), Box::new(ImageApp::open(img.into())));
+    }
 }
 
 impl LauncherApp {
@@ -1536,6 +1548,8 @@ pub struct NotesApp {
     /// Ticks elapsed since the last edit while still dirty — drives the
     /// autosave so work is never lost just because Esc wasn't pressed.
     autosave: u16,
+    /// The clickable File / View menu bar.
+    menu: MenuBar,
 }
 
 impl NotesApp {
@@ -1564,11 +1578,34 @@ impl NotesApp {
             modified: false,
             status,
             autosave: 0,
+            menu: notes_menu(),
         }
     }
 
     fn cur_len(&self) -> usize {
         self.lines[self.cy].chars().count()
+    }
+
+    /// Apply a menu action.
+    fn do_action(&mut self, action: &str) -> AppControl {
+        match action {
+            "save" => self.save(),
+            "new" => {
+                self.lines = vec![String::new()];
+                self.cx = 0;
+                self.cy = 0;
+                self.top = 0;
+                self.modified = true;
+                self.status = "new note".into();
+            }
+            "close" => {
+                self.save();
+                return AppControl::Close;
+            }
+            "theme" => toggle_theme(),
+            _ => {}
+        }
+        AppControl::Continue
     }
 
     fn save(&mut self) {
@@ -1643,6 +1680,10 @@ impl WindowApp for NotesApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
         match key {
             KeyCode::Escape => self.save(),
             KeyCode::Char(c) => self.insert(c),
@@ -1679,8 +1720,14 @@ impl WindowApp for NotesApp {
     }
 
     fn on_click(&mut self, col: u32, row: u32, _d: bool) -> AppControl {
-        if row >= 1 {
-            let target = self.top + (row as usize - 1);
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Row 0 = menu bar, row 1 = status; note text from row 2.
+        if row >= 2 {
+            let target = self.top + (row as usize - 2);
             if target < self.lines.len() {
                 self.cy = target;
                 self.cx = (col as usize).min(self.cur_len());
@@ -1706,7 +1753,8 @@ impl WindowApp for NotesApp {
 
     fn render(&mut self, g: &mut TextGrid) {
         let rows = g.rows as usize;
-        let text_rows = rows.saturating_sub(1);
+        // Row 0 = menu bar, row 1 = status; note text uses the rest.
+        let text_rows = rows.saturating_sub(2);
         if self.cy < self.top {
             self.top = self.cy;
         } else if text_rows > 0 && self.cy >= self.top + text_rows {
@@ -1714,23 +1762,48 @@ impl WindowApp for NotesApp {
         }
         g.text(
             0,
-            0,
+            1,
             &format!("Esc=save (autosaves)  [{} lines]  {}", self.lines.len(), self.status),
         );
+        let fg = g.fg();
+        let bg = g.bg();
         for vis in 0..text_rows {
             let li = self.top + vis;
             if li >= self.lines.len() {
                 break;
             }
-            let row = vis as u32 + 1;
+            let row = vis as u32 + 2;
             g.text(0, row, &self.lines[li]);
             if li == self.cy {
                 let ch = self.lines[li].chars().nth(self.cx).unwrap_or(' ');
                 if (self.cx as u32) < g.cols {
-                    g.put(self.cx as u32, row, ch, g.bg(), g.fg());
+                    g.put(self.cx as u32, row, ch, bg, fg);
                 }
             }
         }
+        // Menu bar last so its drop-down overlays the note.
+        self.menu.render(g, fg, bg);
+    }
+}
+
+/// The Notes menu bar — simpler than the editor's (one fixed file).
+fn notes_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "File".into(),
+                items: vec![
+                    MenuBar::item("Save", "save"),
+                    MenuBar::item("New", "new"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![MenuBar::item("Toggle theme", "theme")],
+            },
+        ],
     }
 }
 
@@ -2636,12 +2709,19 @@ impl WindowApp for ChatApp {
 /// is a palette of swatches; clicking a swatch selects that colour. The
 /// rest of the grid is the canvas. Each painted cell stores its own
 /// colour — `c` clears, `e` toggles the eraser.
+/// Width of the Paint tool sidebar, in character cells.
+const PAINT_SIDEBAR_W: u32 = 9;
+/// First canvas column (right of the sidebar + its 1-col divider).
+const PAINT_CANVAS_X: u32 = PAINT_SIDEBAR_W + 1;
+
 pub struct PaintApp {
     /// Canvas cells. None = transparent (theme bg), Some(px) = painted.
     cells: Vec<Vec<Option<Px>>>,
     palette: Vec<Px>,
     sel: usize,
     erasing: bool,
+    /// Brush size in cells (1..=5) — a fat brush paints a square.
+    brush: u32,
     /// Last canvas size we rendered with. The grid is sized to the
     /// window: a resize would invalidate the buffer, so we rebuild on
     /// the first render at a new size. Cheap because we never read what
@@ -2666,6 +2746,7 @@ impl PaintApp {
             ],
             sel: 4, // blue
             erasing: false,
+            brush: 1,
             cur_w: 0,
             cur_h: 0,
         }
@@ -2680,30 +2761,52 @@ impl PaintApp {
         self.cur_h = h;
     }
 
-    /// Paint or erase the cell under `(col, row)`. Row 0 is the
-    /// palette strip; row 1 is the status line; row 2+ is the canvas.
+    /// A click/drag at grid `(col, row)`: the left sidebar selects a tool;
+    /// the canvas to its right paints (a `brush`-sized square).
     fn touch(&mut self, col: u32, row: u32) {
-        if row == 0 {
-            let idx = (col as usize) / 3;
-            if idx < self.palette.len() {
-                self.sel = idx;
-                self.erasing = false;
+        if col < PAINT_SIDEBAR_W {
+            self.sidebar_action(row);
+            return;
+        }
+        if col < PAINT_CANVAS_X {
+            return; // the divider column
+        }
+        let cx = (col - PAINT_CANVAS_X) as usize;
+        let cy = row as usize;
+        if self.cells.is_empty() {
+            return;
+        }
+        let r = self.brush as usize;
+        for dy in 0..r {
+            for dx in 0..r {
+                let y = cy + dy;
+                let x = cx + dx;
+                if y < self.cells.len() && x < self.cells[0].len() {
+                    self.cells[y][x] = if self.erasing {
+                        None
+                    } else {
+                        Some(self.palette[self.sel])
+                    };
+                }
             }
-            return;
         }
-        if row < 2 {
-            return;
+    }
+
+    /// Sidebar rows: 1..=8 colours, then Eraser, Clear, Size-, Size+.
+    fn sidebar_action(&mut self, row: u32) {
+        let n = self.palette.len() as u32;
+        if (1..=n).contains(&row) {
+            self.sel = (row - 1) as usize;
+            self.erasing = false;
+        } else if row == n + 1 {
+            self.erasing = !self.erasing;
+        } else if row == n + 2 {
+            self.clear();
+        } else if row == n + 3 {
+            self.brush = self.brush.saturating_sub(1).max(1);
+        } else if row == n + 4 {
+            self.brush = (self.brush + 1).min(5);
         }
-        let cy = (row - 2) as usize;
-        let cx = col as usize;
-        if cy >= self.cells.len() || cx >= self.cells[0].len() {
-            return;
-        }
-        self.cells[cy][cx] = if self.erasing {
-            None
-        } else {
-            Some(self.palette[self.sel])
-        };
     }
 
     fn clear(&mut self) {
@@ -2735,6 +2838,8 @@ impl WindowApp for PaintApp {
                 self.sel = (d as u32 - '1' as u32) as usize;
                 self.erasing = false;
             }
+            KeyCode::Char('+') | KeyCode::Char('=') => self.brush = (self.brush + 1).min(5),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.brush = self.brush.saturating_sub(1).max(1),
             _ => {}
         }
         AppControl::Continue
@@ -2751,37 +2856,40 @@ impl WindowApp for PaintApp {
     }
 
     fn render(&mut self, g: &mut TextGrid) {
-        self.ensure_size(g.cols, g.rows.saturating_sub(2));
+        let canvas_w = g.cols.saturating_sub(PAINT_CANVAS_X);
+        self.ensure_size(canvas_w, g.rows);
+        let fg = g.fg();
         let bg = g.bg();
-        // Palette row: each colour occupies three cells of solid block.
+
+        // ── Tool sidebar ───────────────────────────────────────────────
+        g.write(1, 0, "TOOLS", fg, bg);
         for (i, c) in self.palette.iter().enumerate() {
-            for k in 0..3 {
-                let col = (i * 3 + k) as u32;
-                if col < g.cols {
-                    g.put(col, 0, '\u{2588}', *c, bg);
-                }
+            let row = i as u32 + 1;
+            // A solid swatch + selection marker.
+            for col in 1..4u32 {
+                g.put(col, row, '\u{2588}', *c, bg);
+            }
+            if i == self.sel && !self.erasing {
+                g.write(5, row, "<", fg, bg);
             }
         }
-        // Selection marker: an underline below the chosen swatch.
-        let sel_col = (self.sel * 3 + 1) as u32;
-        if sel_col < g.cols {
-            let mark = if self.erasing { 'X' } else { '^' };
-            g.text(sel_col, 1, &mark.to_string());
+        let n = self.palette.len() as u32;
+        let mark = |on: bool| if on { "[x]" } else { "[ ]" };
+        g.write(1, n + 1, &format!("{} Eras", mark(self.erasing)), fg, bg);
+        g.write(1, n + 2, "Clear", fg, bg);
+        g.write(1, n + 3, "Size -", fg, bg);
+        g.write(1, n + 4, &format!("Size + ({})", self.brush), fg, bg);
+
+        // Divider between sidebar and canvas.
+        for r in 0..g.rows {
+            g.put(PAINT_SIDEBAR_W, r, '|', fg, bg);
         }
-        // Status hint to the right of the palette.
-        let hint_col = (self.palette.len() * 3 + 2) as u32;
-        if hint_col < g.cols {
-            g.text(
-                hint_col,
-                0,
-                "click/drag to paint  |  1-8 colour  e eraser  c clear",
-            );
-        }
-        // Canvas rows: render only painted cells; unpainted = theme bg.
+
+        // ── Canvas ─────────────────────────────────────────────────────
         for (cy, row) in self.cells.iter().enumerate() {
             for (cx, cell) in row.iter().enumerate() {
                 if let Some(px) = cell {
-                    g.put(cx as u32, 2 + cy as u32, '\u{2588}', *px, bg);
+                    g.put(PAINT_CANVAS_X + cx as u32, cy as u32, '\u{2588}', *px, bg);
                 }
             }
         }
@@ -3797,6 +3905,9 @@ pub enum FileClass {
     Code,
     Web,
     Image,
+    Pdf,
+    Archive,
+    Media,
     Binary,
 }
 
@@ -3806,23 +3917,30 @@ pub fn classify(name: &str) -> FileClass {
         "png" | "jpg" | "jpeg" | "bmp" | "gif" | "ppm" | "webp" | "ico" | "tiff" => {
             FileClass::Image
         }
+        "pdf" => FileClass::Pdf,
+        "zip" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "jar" | "apk"
+        | "epub" => FileClass::Archive,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "flv" | "wmv" | "mpg" | "mpeg"
+        | "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "wma" => FileClass::Media,
         "html" | "htm" | "md" | "markdown" => FileClass::Web,
         "rs" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "java" | "c" | "h" | "cpp" | "hpp"
         | "cc" | "py" | "go" | "css" | "json" | "xml" | "sh" | "bash" | "toml" | "yaml"
         | "yml" | "rb" | "php" | "sql" => FileClass::Code,
-        "pdf" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "zip" | "gz" | "xz" | "tar"
-        | "bin" | "exe" | "o" | "so" | "wasm" | "mp3" | "wav" | "mp4" => FileClass::Binary,
+        "gz" | "xz" | "tar" | "bin" | "exe" | "o" | "so" | "wasm" => FileClass::Binary,
         _ => FileClass::Text,
     }
 }
 
-/// A short two-letter tag shown beside a file in the manager list.
+/// A short tag shown beside a file in the manager list.
 pub fn type_tag(name: &str, is_dir: bool) -> &'static str {
     if is_dir {
         return "DIR";
     }
     match classify(name) {
         FileClass::Image => "IMG",
+        FileClass::Pdf => "PDF",
+        FileClass::Archive => "ZIP",
+        FileClass::Media => "AV",
         FileClass::Web => "WEB",
         FileClass::Code => "<>",
         FileClass::Binary => "BIN",
@@ -4185,19 +4303,33 @@ fn ink_for_action(a: &str) -> Option<Px> {
     }
 }
 
-// ─── DrDrBrowser — a local web/document viewer ───────────────────────
+// ─── DrDrBrowser — a real (http) web + local document browser ────────
 
-/// A from-scratch document browser: it renders local HTML and Markdown
-/// to formatted text (headings emphasised, links listed, tags stripped),
-/// shows a homepage that links to the user's Documents, and follows
-/// links between local files. No TLS stack, no JS engine — a real,
-/// honest *local* browser for the formats DrDrOS can actually parse.
+/// Where a clickable link points.
+enum Link {
+    Local(PathBuf),
+    Web(String),
+}
+
+/// A from-scratch browser. It renders local HTML/Markdown **and** fetches
+/// real `http://` pages over our own tiny HTTP client ([`crate::http`]),
+/// with an editable address bar, a menu bar (Go / View), and Back
+/// history. `https://` is refused with an honest "no TLS stack" message;
+/// there is no JS engine — it's a readable document browser, not Chrome.
 pub struct BrowserApp {
     /// The rendered lines (text + colour) of the current page.
     lines: Vec<(String, Px)>,
-    /// Link targets the page exposed, in display order (row → path).
-    links: Vec<(u32, PathBuf)>,
+    /// Clickable targets keyed by absolute line index.
+    links: Vec<(usize, Link)>,
     title: String,
+    /// The address-bar text (a URL or "home").
+    addr: String,
+    /// True while the user is typing into the address bar.
+    editing: bool,
+    /// Visited addresses, for Back.
+    history: Vec<String>,
+    status: String,
+    menu: MenuBar,
     scroll: usize,
     spawns: Vec<Spawn>,
 }
@@ -4208,6 +4340,11 @@ impl BrowserApp {
             lines: Vec::new(),
             links: Vec::new(),
             title: "Home".into(),
+            addr: "home".into(),
+            editing: false,
+            history: Vec::new(),
+            status: "type a URL (http://…) and press Enter".into(),
+            menu: browser_menu(),
             scroll: 0,
             spawns: Vec::new(),
         };
@@ -4216,30 +4353,26 @@ impl BrowserApp {
     }
 
     pub fn open(path: PathBuf) -> Self {
-        let mut a = Self {
-            lines: Vec::new(),
-            links: Vec::new(),
-            title: "Browser".into(),
-            scroll: 0,
-            spawns: Vec::new(),
-        };
+        let mut a = Self::new();
         a.load(&path);
         a
     }
 
     fn home(&mut self) {
         self.title = "Home".into();
+        self.addr = "home".into();
         self.links.clear();
         let accent = Px::rgb(0x2D, 0x6C, 0xD8);
         let fg = Px::rgb(0x1B, 0x1B, 0x1B);
         let mut lines = vec![
             ("DrDrBrowser".to_string(), accent),
-            ("A local browser for HTML and Markdown.".to_string(), fg),
+            ("A browser for http:// pages, plus local HTML/Markdown.".to_string(), fg),
+            ("Type a URL in the bar above (e.g. http://example.com).".to_string(), fg),
             (String::new(), fg),
             ("Your Documents:".to_string(), fg),
         ];
         let docs = drdr_store::documents_dir();
-        let mut linkrows: Vec<(u32, PathBuf)> = Vec::new();
+        let mut links: Vec<(usize, Link)> = Vec::new();
         if let Ok(rd) = fs::read_dir(&docs) {
             let mut names: Vec<String> = rd
                 .flatten()
@@ -4247,28 +4380,23 @@ impl BrowserApp {
                 .collect();
             names.sort();
             for n in names {
-                let row = lines.len() as u32;
+                links.push((lines.len(), Link::Local(docs.join(&n))));
                 lines.push((format!("  -> {n}"), accent));
-                linkrows.push((row, docs.join(&n)));
             }
         }
-        if linkrows.is_empty() {
+        if links.is_empty() {
             lines.push(("  (no documents yet)".to_string(), Px::rgb(0x8C, 0x8C, 0x8C)));
         }
-        lines.push((String::new(), fg));
-        lines.push((
-            "Open Files and double-click a .html or .md file,".to_string(),
-            fg,
-        ));
-        lines.push(("or click a link above. Arrows scroll.".to_string(), fg));
         self.lines = lines;
-        self.links = linkrows;
+        self.links = links;
         self.scroll = 0;
+        self.status = "home".into();
     }
 
     fn load(&mut self, path: &std::path::Path) {
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         self.title = name.clone();
+        self.addr = path.to_string_lossy().into_owned();
         self.links.clear();
         self.scroll = 0;
         let text = match fs::read_to_string(path) {
@@ -4282,24 +4410,139 @@ impl BrowserApp {
             "html" | "htm" => render_html(&text),
             _ => render_markdown(&text),
         };
+        self.status = format!("loaded {name}");
     }
 
-    fn activate_link(&mut self, row: usize) {
-        let abs = self.scroll + row;
-        if let Some((_, path)) = self.links.iter().find(|(r, _)| *r as usize == abs) {
-            let path = path.clone();
-            // Images and code open in their own viewers; pages stay here.
-            match classify(&path.to_string_lossy()) {
-                FileClass::Image => self.spawns.push(Spawn {
-                    rect: spawn_rect(),
-                    app: Box::new(ImageApp::open(path)),
-                }),
-                FileClass::Web | FileClass::Text => self.load(&path),
-                _ => self.spawns.push(Spawn {
-                    rect: spawn_rect(),
-                    app: Box::new(EditApp::new(path)),
-                }),
+    /// Fetch and render a real web page over HTTP.
+    fn go_web(&mut self, url: &str) {
+        self.scroll = 0;
+        self.links.clear();
+        match crate::http::fetch(url) {
+            Ok(page) => {
+                self.addr = page.final_url.clone();
+                self.title = page.final_url.clone();
+                let mut lines = if page.content_type.contains("text/html")
+                    || page.content_type.is_empty()
+                {
+                    render_html(&page.body)
+                } else {
+                    page.body.lines().map(|l| (l.to_string(), Px::rgb(0x1B, 0x1B, 0x1B))).collect()
+                };
+                // Append a clickable link index harvested from the HTML.
+                let weblinks = extract_links(&page.body, &page.final_url);
+                if !weblinks.is_empty() {
+                    let accent = Px::rgb(0x1E, 0x6E, 0xC0);
+                    lines.push((String::new(), accent));
+                    lines.push(("-- Links on this page --".to_string(), accent));
+                    for (label, target) in weblinks.into_iter().take(80) {
+                        self.links.push((lines.len(), Link::Web(target)));
+                        lines.push((format!("  -> {label}"), accent));
+                    }
+                }
+                self.lines = lines;
+                self.status = format!("{} ({} lines)", page.status, self.lines.len());
             }
+            Err(e) => {
+                self.addr = url.to_string();
+                self.title = "Error".into();
+                self.lines = e
+                    .lines()
+                    .map(|l| (l.to_string(), Px::rgb(0xD0, 0x3A, 0x3A)))
+                    .collect();
+                self.status = "request failed".into();
+            }
+        }
+    }
+
+    /// Decide whether the address is a web URL or a local path and go.
+    fn navigate(&mut self, input: &str) {
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            return;
+        }
+        // Remember where we were so Back works.
+        if self.addr != input {
+            self.history.push(self.addr.clone());
+        }
+        if input == "home" {
+            self.home();
+        } else if input.starts_with("http://") || input.starts_with("https://") {
+            self.go_web(&input);
+        } else if looks_like_domain(&input) {
+            self.go_web(&format!("http://{input}"));
+        } else {
+            self.load(std::path::Path::new(&input));
+        }
+    }
+
+    fn back(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            let cur = self.addr.clone();
+            // navigate() would re-push; call the destination directly.
+            self.addr = prev.clone();
+            if prev == "home" {
+                self.home();
+            } else if prev.starts_with("http") {
+                self.go_web(&prev);
+            } else {
+                self.load(std::path::Path::new(&prev));
+            }
+            let _ = cur;
+        } else {
+            self.status = "no history".into();
+        }
+    }
+
+    fn activate_link(&mut self, line_idx: usize) {
+        let target = self.links.iter().find(|(i, _)| *i == line_idx);
+        match target {
+            Some((_, Link::Web(url))) => {
+                let url = url.clone();
+                self.navigate(&url);
+            }
+            Some((_, Link::Local(path))) => {
+                let path = path.clone();
+                match classify(&path.to_string_lossy()) {
+                    FileClass::Image => self.spawns.push(Spawn {
+                        rect: spawn_rect(),
+                        app: Box::new(ImageApp::open(path)),
+                    }),
+                    FileClass::Web | FileClass::Text => self.load(&path),
+                    _ => self.spawns.push(Spawn {
+                        rect: spawn_rect(),
+                        app: Box::new(EditApp::new(path)),
+                    }),
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn do_action(&mut self, action: &str) -> AppControl {
+        match action {
+            "back" => self.back(),
+            "reload" => {
+                let a = self.addr.clone();
+                self.go_web_or_local(&a);
+            }
+            "home" => self.home(),
+            "edit_addr" => self.editing = true,
+            "theme" => toggle_theme(),
+            "close" => return AppControl::Close,
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    /// Reload helper that doesn't touch history.
+    fn go_web_or_local(&mut self, addr: &str) {
+        if addr == "home" {
+            self.home();
+        } else if addr.starts_with("http") || looks_like_domain(addr) {
+            let url = if addr.starts_with("http") { addr.to_string() } else { format!("http://{addr}") };
+            self.go_web(&url);
+        } else {
+            self.load(std::path::Path::new(addr));
         }
     }
 }
@@ -4317,13 +4560,37 @@ impl WindowApp for BrowserApp {
     }
 
     fn on_key(&mut self, key: KeyCode) -> AppControl {
-        let page = (self.lines.len()).saturating_sub(1);
+        if self.menu.is_open() {
+            self.menu.close();
+            return AppControl::Continue;
+        }
+        // Address-bar editing captures input until Enter / Esc.
+        if self.editing {
+            match key {
+                KeyCode::Char(c) => self.addr.push(c),
+                KeyCode::Space => self.addr.push(' '),
+                KeyCode::Backspace => {
+                    self.addr.pop();
+                }
+                KeyCode::Enter => {
+                    self.editing = false;
+                    let a = self.addr.clone();
+                    self.navigate(&a);
+                }
+                KeyCode::Escape => self.editing = false,
+                _ => {}
+            }
+            return AppControl::Continue;
+        }
+        let page = self.lines.len().saturating_sub(1);
         match key {
             KeyCode::Down => self.scroll = (self.scroll + 1).min(page),
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::PageDown => self.scroll = (self.scroll + 10).min(page),
+            KeyCode::PageDown | KeyCode::Space => self.scroll = (self.scroll + 10).min(page),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Home => self.scroll = 0,
+            KeyCode::Backspace => self.back(),
+            KeyCode::Char('g') => self.editing = true, // 'g' = go to address
             KeyCode::Char('h') => self.home(),
             KeyCode::Escape => return AppControl::Close,
             _ => {}
@@ -4331,25 +4598,165 @@ impl WindowApp for BrowserApp {
         AppControl::Continue
     }
 
-    fn on_click(&mut self, _col: u32, row: u32, _double: bool) -> AppControl {
-        if row >= 1 {
-            self.activate_link(row as usize - 1);
+    fn on_click(&mut self, col: u32, row: u32, _double: bool) -> AppControl {
+        match self.menu.on_click(col, row) {
+            MenuClick::Action(a) => return self.do_action(a),
+            MenuClick::Consumed => return AppControl::Continue,
+            MenuClick::Passthrough => {}
+        }
+        // Row 1 is the address bar — click to edit it.
+        if row == 1 {
+            self.editing = true;
+            return AppControl::Continue;
+        }
+        // Content starts at row 2.
+        if row >= 2 {
+            let line_idx = self.scroll + (row as usize - 2);
+            self.activate_link(line_idx);
         }
         AppControl::Continue
     }
 
     fn render(&mut self, g: &mut TextGrid) {
+        let fg = g.fg();
+        let bg = g.bg();
         let accent = Px::rgb(0x2D, 0x6C, 0xD8);
-        g.write(0, 0, &format!("h=home  Esc=close   [{}]", self.title), accent, g.bg());
-        let rows = g.rows.saturating_sub(1) as usize;
+        // Row 1: the address bar (reverse-video field), with status to its
+        // right. A caret shows while editing.
+        let bar = if self.editing {
+            format!("{}_", self.addr)
+        } else {
+            self.addr.clone()
+        };
+        let label = "URL: ";
+        g.write(0, 1, label, accent, bg);
+        let field_x = label.len() as u32;
+        let maxc = g.cols.saturating_sub(field_x + 1) as usize;
+        let shown: String = bar.chars().rev().take(maxc).collect::<Vec<_>>().into_iter().rev().collect();
+        // A subtle field background.
+        for c in field_x..g.cols {
+            g.put(c, 1, ' ', fg, bg.lerp(accent, 18));
+        }
+        g.write(field_x, 1, &shown, fg, bg.lerp(accent, 18));
+
+        // Content from row 2.
+        let rows = g.rows.saturating_sub(2) as usize;
         for vis in 0..rows {
             let li = self.scroll + vis;
             if li >= self.lines.len() {
                 break;
             }
             let (text, color) = &self.lines[li];
-            g.write(0, vis as u32 + 1, text, *color, g.bg());
+            g.write(0, vis as u32 + 2, text, *color, bg);
         }
+
+        // Status into the last row's tail if room (kept subtle).
+        if g.rows >= 2 {
+            let s = format!(" {} ", self.status);
+            let sx = g.cols.saturating_sub(s.chars().count() as u32);
+            g.write(sx, 1, &s, g.fg(), bg.lerp(accent, 18));
+        }
+
+        // Menu bar painted last so its drop-down overlays the page.
+        self.menu.render(g, fg, bg);
+    }
+}
+
+/// True if the string looks like a bare domain (so we can prepend http://).
+fn looks_like_domain(s: &str) -> bool {
+    !s.contains(' ')
+        && !s.starts_with('/')
+        && !s.starts_with('.')
+        && s.contains('.')
+        && s.split('.').next_back().map(|t| t.len() >= 2).unwrap_or(false)
+        && !std::path::Path::new(s).exists()
+}
+
+/// Harvest `<a href="…">label</a>` pairs from HTML into absolute URLs.
+fn extract_links(html: &str, base: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find("<a ") {
+        let tag_start = i + rel;
+        let Some(tag_end_rel) = lower[tag_start..].find('>') else { break };
+        let tag_end = tag_start + tag_end_rel;
+        let tag = &html[tag_start..tag_end];
+        // Pull href="…" or href='…'.
+        if let Some(href) = attr_value(tag, "href") {
+            // The link text runs until the closing </a>.
+            let after = tag_end + 1;
+            let label_end = lower[after..].find("</a>").map(|e| after + e).unwrap_or(after);
+            let raw_label = strip_tags(&html[after..label_end]);
+            let label = raw_label.trim();
+            let label = if label.is_empty() { href.clone() } else { label.to_string() };
+            if !href.starts_with('#') && !href.starts_with("javascript:") {
+                out.push((label, crate::http::resolve(base, &href)));
+            }
+            i = label_end + 4;
+        } else {
+            i = tag_end + 1;
+        }
+        let _ = bytes;
+    }
+    out
+}
+
+/// Extract a quoted attribute value from a tag fragment.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let at = lower.find(&key)? + key.len();
+    let rest = &tag[at..];
+    let quote = rest.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let end = rest[1..].find(quote)? + 1;
+        Some(rest[1..end].to_string())
+    } else {
+        // Unquoted: up to whitespace or end.
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    }
+}
+
+/// Strip any tags from a small HTML fragment (for link labels).
+fn strip_tags(frag: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in frag.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The browser's menu bar.
+fn browser_menu() -> MenuBar {
+    MenuBar {
+        open: None,
+        menus: vec![
+            Menu {
+                title: "Go".into(),
+                items: vec![
+                    MenuBar::item("Back", "back"),
+                    MenuBar::item("Reload", "reload"),
+                    MenuBar::item("Home", "home"),
+                    MenuBar::item("Edit address", "edit_addr"),
+                ],
+            },
+            Menu {
+                title: "View".into(),
+                items: vec![
+                    MenuBar::item("Toggle theme", "theme"),
+                    MenuBar::item("Close", "close"),
+                ],
+            },
+        ],
     }
 }
 
@@ -4769,11 +5176,11 @@ struct DecodedImg {
     px: Vec<Px>,
 }
 
-/// A real image viewer. It decodes PPM (P6) and uncompressed 24/32-bit
-/// BMP ourselves and paints them as colour cells (each grid cell is one
-/// down-sampled pixel — the closest a character grid gets to a bitmap),
-/// aspect-corrected for the 8×16 cell. PNG/JPEG are recognised and their
-/// dimensions reported, with an honest "preview not supported" note.
+/// A real image viewer. It decodes **PNG, GIF and baseline JPEG** (via
+/// our own `drdr-codec`), plus PPM (P6) and uncompressed 24/32-bit BMP,
+/// and paints them as colour cells (each grid cell is one down-sampled
+/// pixel — the closest a character grid gets to a bitmap), aspect-corrected
+/// for the 8×16 cell.
 pub struct ImageApp {
     name: String,
     img: Option<DecodedImg>,
@@ -4842,7 +5249,21 @@ impl WindowApp for ImageApp {
     }
 }
 
-/// Sniff a file's magic bytes and decode (or describe) it.
+/// Convert a `drdr_codec` RGBA image into the viewer's `Px` buffer,
+/// compositing any alpha over white so transparent PNG/GIF read cleanly.
+fn img_from_codec(img: drdr_codec::Image) -> DecodedImg {
+    let mut px = Vec::with_capacity((img.w * img.h) as usize);
+    for p in img.rgba.chunks_exact(4) {
+        let (r, g, b, a) = (p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32);
+        let over = |c: u32| ((c * a + 255 * (255 - a)) / 255) as u8;
+        px.push(Px::rgb(over(r), over(g), over(b)));
+    }
+    DecodedImg { w: img.w, h: img.h, px }
+}
+
+/// Sniff a file's magic bytes and decode (or describe) it. PNG, GIF and
+/// baseline JPEG are decoded for real by our own `drdr-codec`; PPM and
+/// BMP have their own small decoders here.
 fn decode_image(name: &str, b: &[u8]) -> (Option<DecodedImg>, Vec<String>) {
     if b.len() >= 2 && &b[0..2] == b"P6" {
         if let Some(img) = decode_ppm(b) {
@@ -4854,35 +5275,36 @@ fn decode_image(name: &str, b: &[u8]) -> (Option<DecodedImg>, Vec<String>) {
             return (Some(img), vec![]);
         }
     }
-    if b.len() >= 24 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
-        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
-        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
-        return (
-            None,
-            vec![
-                format!("{name}: PNG image, {w}x{h}"),
-                String::new(),
-                "PNG decoding (zlib/DEFLATE) is on the roadmap.".into(),
-                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
-            ],
-        );
+    if b.len() >= 8 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return match drdr_codec::decode_png(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (None, vec![format!("{name}: {e}")]),
+        };
+    }
+    if b.len() >= 6 && (&b[0..6] == b"GIF87a" || &b[0..6] == b"GIF89a") {
+        return match drdr_codec::decode_gif(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (None, vec![format!("{name}: {e}")]),
+        };
     }
     if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xD8 {
-        return (
-            None,
-            vec![
-                format!("{name}: JPEG image"),
-                String::new(),
-                "JPEG decoding is on the roadmap.".into(),
-                "PPM (.ppm) and BMP (.bmp) preview in full colour.".into(),
-            ],
-        );
+        return match drdr_codec::decode_jpeg(b) {
+            Ok(img) => (Some(img_from_codec(img)), vec![]),
+            Err(e) => (
+                None,
+                vec![
+                    format!("{name}: {e}"),
+                    String::new(),
+                    "(baseline JPEG decodes; progressive is not supported yet)".into(),
+                ],
+            ),
+        };
     }
     (
         None,
         vec![
             format!("{name}: unrecognised image ({} bytes)", b.len()),
-            "Supported previews: PPM (P6), BMP (24/32-bit).".into(),
+            "Supported: PNG, GIF, baseline JPEG, BMP, PPM.".into(),
         ],
     )
 }
@@ -5022,6 +5444,231 @@ impl WindowApp for BinaryInfoApp {
     }
 }
 
+// ─── A scrollable read-only text pane (shared by the doc viewers) ────
+
+/// The common machinery behind the PDF / archive / media viewers: a list
+/// of lines you can scroll with the arrows / PageUp-Down, Esc to close.
+struct TextPane {
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+impl TextPane {
+    fn new(lines: Vec<String>) -> Self {
+        Self { lines, scroll: 0 }
+    }
+
+    fn on_key(&mut self, key: KeyCode, page: usize) -> AppControl {
+        match key {
+            KeyCode::Escape => return AppControl::Close,
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll += 1,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Space => self.scroll += page,
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = self.lines.len(),
+            _ => {}
+        }
+        AppControl::Continue
+    }
+
+    /// Paint from `top` row, returning nothing. Clamps the scroll so the
+    /// last page always shows content.
+    fn render(&mut self, g: &mut TextGrid, top: u32) {
+        let body = g.rows.saturating_sub(top) as usize;
+        let max_scroll = self.lines.len().saturating_sub(body);
+        self.scroll = self.scroll.min(max_scroll);
+        for (i, line) in self.lines.iter().skip(self.scroll).take(body).enumerate() {
+            g.text(0, top + i as u32, line);
+        }
+    }
+}
+
+/// Strip XML tags to readable text, turning paragraph/break closers into
+/// newlines and decoding the handful of entities Office documents use.
+/// Good enough to surface the words in a `.docx` / `.xlsx` / `.pptx`.
+fn xml_to_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut chars = xml.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            // Read the tag name to decide whether it ends a paragraph.
+            let rest = &xml[i..];
+            let end = rest.find('>').map(|e| i + e + 1).unwrap_or(xml.len());
+            let tag = &xml[i..end];
+            if tag.starts_with("</w:p")
+                || tag.starts_with("</a:p")
+                || tag.starts_with("</text:p")
+                || tag.starts_with("<w:br")
+                || tag.starts_with("</tr")
+            {
+                out.push('\n');
+            }
+            // Skip to the end of the tag.
+            while let Some(&(j, _)) = chars.peek() {
+                if j >= end {
+                    break;
+                }
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+/// Pull readable text out of an Office Open XML container (docx/xlsx/pptx)
+/// already opened as a ZIP. Returns `None` if it isn't an office file.
+fn office_text(data: &[u8], entries: &[drdr_codec::ZipEntry]) -> Option<String> {
+    // The part that holds the body text differs per app.
+    let part = entries.iter().find(|e| {
+        e.name == "word/document.xml"
+            || e.name == "xl/sharedStrings.xml"
+            || e.name == "ppt/slides/slide1.xml"
+    })?;
+    let raw = drdr_codec::read_zip_entry(data, part).ok()?;
+    let xml = String::from_utf8_lossy(&raw);
+    Some(xml_to_text(&xml))
+}
+
+// ─── PDF viewer ──────────────────────────────────────────────────────
+
+/// Opens a PDF and shows its extracted text (via our own `drdr-codec`
+/// PDF text extractor — DEFLATE-decompressing content streams and pulling
+/// the strings out). Not a full renderer; an honest, readable text view.
+pub struct PdfApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl PdfApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let lines = match drdr_codec::pdf::extract_pdf_text(&bytes) {
+            Ok(ls) if !ls.is_empty() => ls,
+            Ok(_) => vec!["(no extractable text — likely a scanned/image PDF)".into()],
+            Err(e) => vec![format!("Could not read PDF: {e}")],
+        };
+        Self { name, pane: TextPane::new(lines) }
+    }
+}
+
+impl WindowApp for PdfApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Document
+    }
+    fn title(&self) -> String {
+        format!("PDF - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        let page = 10;
+        self.pane.on_key(key, page)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (arrows/PageUp-Down scroll, Esc close)", self.name));
+        self.pane.render(g, 2);
+    }
+}
+
+// ─── Archive / Office document viewer ────────────────────────────────
+
+/// Lists a ZIP's entries and, when it's an Office document, shows the
+/// extracted body text underneath — all via our own ZIP reader + DEFLATE.
+pub struct ArchiveApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl ArchiveApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let mut lines = Vec::new();
+        match drdr_codec::list_zip(&bytes) {
+            Ok(entries) => {
+                if let Some(text) = office_text(&bytes, &entries) {
+                    lines.push("-- Document text --".into());
+                    for l in text.lines() {
+                        let l = l.trim_end();
+                        if !l.is_empty() {
+                            lines.push(l.to_string());
+                        }
+                    }
+                    lines.push(String::new());
+                }
+                lines.push(format!("-- {} entries --", entries.len()));
+                for e in &entries {
+                    lines.push(format!(
+                        "{:>9} B  {}",
+                        e.uncomp_size,
+                        e.name
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("Could not read archive: {e}")),
+        }
+        Self { name, pane: TextPane::new(lines) }
+    }
+}
+
+impl WindowApp for ArchiveApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Folder
+    }
+    fn title(&self) -> String {
+        format!("Archive - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        self.pane.on_key(key, 10)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (arrows scroll, Esc close)", self.name));
+        self.pane.render(g, 2);
+    }
+}
+
+// ─── Media (audio/video) info ────────────────────────────────────────
+
+/// Shows what a video/audio file *is* — container, duration, resolution,
+/// codecs, tracks — parsed from MP4 / Matroska metadata by our own
+/// `drdr-codec`. It does not decode compressed frames (an honest line in
+/// the panel says so); it's the "properties" view a desktop should give.
+pub struct MediaApp {
+    name: String,
+    pane: TextPane,
+}
+
+impl MediaApp {
+    pub fn open(path: PathBuf) -> Self {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(&path).unwrap_or_default();
+        let info = drdr_codec::probe_media(&bytes, &ext_of(&name));
+        Self { name, pane: TextPane::new(info.summary()) }
+    }
+}
+
+impl WindowApp for MediaApp {
+    fn icon(&self) -> IconKind {
+        IconKind::Music
+    }
+    fn title(&self) -> String {
+        format!("Media - {}", self.name)
+    }
+    fn on_key(&mut self, key: KeyCode) -> AppControl {
+        self.pane.on_key(key, 6)
+    }
+    fn render(&mut self, g: &mut TextGrid) {
+        g.text(0, 0, &format!("{}   (Esc close)", self.name));
+        self.pane.render(g, 2);
+    }
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -5108,8 +5755,8 @@ mod app_tests {
     #[test]
     fn paint_palette_click_selects_swatch() {
         let mut p = PaintApp::new();
-        // Each swatch is 3 cells wide on row 0; cell 6 lands in swatch 2.
-        p.touch(6, 0);
+        // Swatches now stack vertically in the sidebar: row 3 = swatch 2.
+        p.touch(1, 3);
         assert_eq!(p.sel, 2);
         assert!(!p.erasing);
     }
@@ -5119,11 +5766,13 @@ mod app_tests {
         let mut p = PaintApp::new();
         p.ensure_size(20, 10);
         p.sel = 0;
-        p.touch(3, 5); // row 5 in window-space → canvas row 3
-        assert!(p.cells[3][3].is_some());
+        p.brush = 1;
+        // Canvas starts at column PAINT_CANVAS_X; this is canvas (3, 5).
+        p.touch(PAINT_CANVAS_X + 3, 5);
+        assert!(p.cells[5][3].is_some());
         p.erasing = true;
-        p.touch(3, 5);
-        assert!(p.cells[3][3].is_none());
+        p.touch(PAINT_CANVAS_X + 3, 5);
+        assert!(p.cells[5][3].is_none());
     }
 
     #[test]
@@ -5211,7 +5860,7 @@ mod app_tests {
         assert_eq!(classify("a.png"), FileClass::Image);
         assert_eq!(classify("index.html"), FileClass::Web);
         assert_eq!(classify("main.rs"), FileClass::Code);
-        assert_eq!(classify("report.pdf"), FileClass::Binary);
+        assert_eq!(classify("report.pdf"), FileClass::Pdf);
         assert_eq!(classify("readme"), FileClass::Text);
         // Tags follow the class.
         assert_eq!(type_tag("a.rs", false), "<>");
@@ -5347,5 +5996,138 @@ mod app_tests {
         region_line(&mut g, 1, FILES_LIST_X, "file.txt", true);
         assert_eq!(g.cell(2, 1).ch, 'S', "sidebar glyph survived the fill");
         assert_eq!(g.cell(FILES_LIST_X, 1).ch, 'f');
+    }
+
+    // ─── phase 13: real PNG/GIF/JPEG + PDF/archive/media routing ────
+
+    #[test]
+    fn classify_routes_new_formats() {
+        assert_eq!(classify("a.png"), FileClass::Image);
+        assert_eq!(classify("a.gif"), FileClass::Image);
+        assert_eq!(classify("a.jpg"), FileClass::Image);
+        assert_eq!(classify("report.pdf"), FileClass::Pdf);
+        assert_eq!(classify("notes.docx"), FileClass::Archive);
+        assert_eq!(classify("photos.zip"), FileClass::Archive);
+        assert_eq!(classify("movie.mp4"), FileClass::Media);
+        assert_eq!(classify("clip.mkv"), FileClass::Media);
+        assert_eq!(classify("song.mp3"), FileClass::Media);
+    }
+
+    // A real 3×2 RGBA PNG written by Pillow.
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 2, 8,
+        6, 0, 0, 0, 157, 116, 102, 26, 0, 0, 0, 27, 73, 68, 65, 84, 120, 156, 37, 199, 177, 13, 0,
+        0, 12, 195, 32, 212, 255, 127, 118, 134, 178, 33, 146, 168, 19, 127, 6, 134, 173, 8, 250,
+        147, 205, 134, 116, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[test]
+    fn decode_image_decodes_a_real_png() {
+        let (img, _) = decode_image("t.png", PNG);
+        let img = img.expect("png should decode through drdr-codec");
+        assert_eq!((img.w, img.h), (3, 2));
+        assert_eq!(img.px[0], Px::rgb(255, 0, 0));
+        assert_eq!(img.px[1], Px::rgb(0, 255, 0));
+        assert_eq!(img.px[2], Px::rgb(0, 0, 255));
+        assert_eq!(img.px[3], Px::rgb(255, 255, 0));
+    }
+
+    #[test]
+    fn xml_to_text_surfaces_words_and_breaks() {
+        let docx = "<w:p><w:r><w:t>Hello</w:t></w:r></w:p>\
+                    <w:p><w:r><w:t>world &amp; co</w:t></w:r></w:p>";
+        let text = xml_to_text(docx);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world & co"));
+        assert!(!text.contains('<'));
+        // The two paragraphs should be on separate lines.
+        assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+    }
+
+    #[test]
+    fn alpha_composites_over_white() {
+        // A fully transparent pixel becomes white; opaque keeps its colour.
+        let img = drdr_codec::Image {
+            w: 2,
+            h: 1,
+            rgba: vec![10, 20, 30, 0, 10, 20, 30, 255],
+        };
+        let d = img_from_codec(img);
+        assert_eq!(d.px[0], Px::rgb(255, 255, 255));
+        assert_eq!(d.px[1], Px::rgb(10, 20, 30));
+    }
+
+    // ─── phase 14: web browser + notes/paint menus & palette ────────
+
+    #[test]
+    fn domain_detection_distinguishes_urls_from_paths() {
+        assert!(looks_like_domain("example.com"));
+        assert!(looks_like_domain("sub.example.co.uk"));
+        assert!(!looks_like_domain("/etc/hosts"));
+        assert!(!looks_like_domain("just text"));
+        assert!(!looks_like_domain("README")); // no dot
+    }
+
+    #[test]
+    fn extracts_links_and_resolves_them() {
+        let html = r##"<p>see <a href="/about">About</a> and
+            <a href='https://x.com/y'>X</a> and <a href="#frag">skip</a></p>"##;
+        let links = extract_links(html, "http://example.com/dir/page.html");
+        // The fragment-only link is skipped; the others resolve.
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], ("About".to_string(), "http://example.com:80/about".to_string()));
+        assert_eq!(links[1].1, "https://x.com/y");
+    }
+
+    #[test]
+    fn attr_and_strip_tags_helpers() {
+        assert_eq!(attr_value("<a href=\"/x\" class=y>", "href").as_deref(), Some("/x"));
+        assert_eq!(attr_value("<a href='/q'>", "href").as_deref(), Some("/q"));
+        assert_eq!(strip_tags("a<b>bc</b>d"), "abcd");
+    }
+
+    #[test]
+    fn notes_menu_actions_work() {
+        let mut n = NotesApp::new();
+        n.lines = vec!["keep".into(), "me".into()];
+        n.do_action("new");
+        assert_eq!(n.lines, vec![String::new()], "New clears the note");
+        assert!(matches!(n.do_action("close"), AppControl::Close));
+    }
+
+    #[test]
+    fn paint_sidebar_selects_tools() {
+        let mut p = PaintApp::new();
+        // Row 3 → the 3rd colour (index 2).
+        p.sidebar_action(3);
+        assert_eq!(p.sel, 2);
+        assert!(!p.erasing);
+        // Eraser toggle is the row after the 8 swatches.
+        p.sidebar_action(9);
+        assert!(p.erasing);
+        // Size +/- rows.
+        p.sidebar_action(12);
+        assert_eq!(p.brush, 2);
+        p.sidebar_action(11);
+        assert_eq!(p.brush, 1);
+    }
+
+    #[test]
+    fn paint_brush_paints_a_square_on_the_canvas() {
+        let mut p = PaintApp::new();
+        p.ensure_size(20, 20);
+        p.brush = 2;
+        p.erasing = false;
+        // Click on the canvas (cols >= PAINT_CANVAS_X).
+        p.touch(PAINT_CANVAS_X + 3, 4);
+        // A 2×2 square should be painted at canvas (3,4).
+        assert!(p.cells[4][3].is_some());
+        assert!(p.cells[4][4].is_some());
+        assert!(p.cells[5][3].is_some());
+        assert!(p.cells[5][4].is_some());
+        // A sidebar click must NOT paint.
+        let before = p.cells[10][10];
+        p.touch(1, 1);
+        assert_eq!(p.cells[10][10], before);
     }
 }
