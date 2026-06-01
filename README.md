@@ -17,7 +17,7 @@ and scheduling; everything above it is ours.
 | **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons** (also on the taskbar + title bars), ~20 apps incl. a **real `http://` web browser** (own HTTP/1.1 client, address bar, Back), an **image viewer (real PNG/GIF/JPEG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **media-info panel (MP4/MKV)**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, **menu bars** (editor/notes/browser) + a **Paint tool palette**, and automatic disk persistence |
+| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): a **Windows-11-style Start menu** (a pinned app-tile grid with **live search** + a power button), draggable windows, **anti-aliased text**, **real pictographic app icons** (also on the taskbar + title bars), **~26 apps** incl. a full **communication suite** — **Messages** (WhatsApp-style chat bubbles), **DrDrCord** (Discord-style channels + members), **Mail**, **Calendar** and **Contacts** — plus a **real `http://` web browser** (own HTTP/1.1 client, address bar, Back), an **image viewer (real PNG/GIF/JPEG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **media-info panel (MP4/MKV)**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, **clickable menu bars** on most apps (Files, Editor, Notes, Browser, Calculator, Image, Mail, Calendar, Contacts…) + a **Paint tool palette**, and automatic disk persistence |
 | **File formats** | Opens **txt · md · html · source code (Rust/JS/Java/C/Py/…) · PNG · GIF · JPEG · BMP · PPM · PDF · ZIP · DOCX/XLSX/PPTX**, and reads metadata from **MP4/MOV · MKV/WebM · MP3/FLAC/WAV** — DEFLATE, PNG, GIF (LZW), baseline JPEG (Huffman+IDCT), ZIP, PDF and the MP4/Matroska container probes all written from scratch in our own `drdr-codec` |
 
 ### What you actually get when it boots
@@ -68,6 +68,23 @@ graphical desktop — no login, no shell, no X11:
   and the games
   **DrDrSnake**, **DrDr2048** and **DrDrMines** (Minesweeper), plus
   **Disks**, **Settings**, the DrDrNet panel, About, and the power menu.
+- **A communication suite that actually talks** — **Messages**, a
+  WhatsApp-style two-pane messenger with a conversation rail and real
+  **chat bubbles** (your lines right-aligned in green, others left in
+  grey); **DrDrCord**, a Discord-style **three-pane** client with a
+  channel rail, a colour-per-author message stream and an online-members
+  list; **Mail**, a local Inbox / Sent / Drafts mailbox with a compose
+  form; **Calendar**, a month grid with **persistent events**; and
+  **Contacts**, a saved address book. Messages, DrDrCord and the original
+  DrDrChat all ride the **same DrDrNet LAN bus** (one shared
+  `fanout_chat`), so two DrDrOS boxes interoperate; DrDrCord even tags
+  channels on the wire so they land in the same room on both.
+- **A Windows-11 Start menu** — the Start button now pops a floating
+  rounded card with a **pinned grid of app tiles** (icon + 2-line label),
+  a **search box that filters as you type**, a user chip and a **power
+  button** — and **clickable menu bars** now sit on Files, Calculator and
+  the Image viewer too (joining the editor / notes / browser), so almost
+  everything is mouse-drivable with no shortcuts to memorise.
 - **Smooth, anti-aliased text** — the hand-drawn 8×16 bitmap font is now
   resampled in software: letters stay crisp and full-strength while their
   diagonal staircases get a soft edge, and large logos/icons render as
@@ -184,10 +201,10 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **20825 lines** across **32 files** |
+| Rust source | **22978 lines** across **32 files** |
 | Workspace crates | **13** (every `drdr-*`) |
-| Tests | **137** (`cargo test`, all green) |
-| Git commits | **58** |
+| Tests | **146** (`cargo test`, all green) |
+| Git commits | **60** |
 | Tracked files (excl. `buildroot/`) | **61** |
 | Development window | 2026-05-14
 ? → 2026-06-01 |
@@ -196,8 +213,8 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  7340 | window manager + apps |
-| drdr-ui    |  4186 | GUI framework + WM + shell |
+| drdr-desk  |  9174 | window manager + apps |
+| drdr-ui    |  4505 | GUI framework + WM + shell |
 | drdr-codec |  2446 | — |
 | drdr-net   |  1911 | binary proto + reactor |
 | drdr-fb    |   976 | framebuffer (all bpp) |
@@ -320,6 +337,33 @@ Lines of Rust per crate (largest first):
       **acrylic (translucent) taskbar** and a soft radial **bloom**
       wallpaper. Backed by new anti-aliased `fill_circle`/`draw_line`
       framebuffer primitives.
+- [x] **Phase 15 — A communication suite, a Windows-11 Start menu, and
+      menu bars everywhere** *(this release)*
+      The desktop turns into something you could actually live in. **Five
+      new apps**, all working over the existing LAN bus or local storage,
+      none of it faked: **Messages** — a WhatsApp-style two-pane messenger
+      with a conversation rail and real **chat bubbles** (your lines
+      right-aligned in green, others left in grey, with timestamps);
+      **DrDrCord** — a Discord-style **three-pane** client with a channel
+      rail (`#general` `#random` `#help` `#dev`), a colour-per-author
+      message stream and an online-members list, channels carried over the
+      wire as a `#chan ` tag so two DrDrOS boxes drop into the same rooms;
+      **Mail** — a self-contained mailbox (Inbox / Sent / Drafts, a reading
+      pane and a compose form that also writes a `.eml` into your
+      Documents); **Calendar** — a month grid with **persistent events**
+      saved through DrDrStore; and **Contacts** — a saved address book.
+      All three messengers share one **`fanout_chat`** helper, so DrDrChat,
+      Messages and DrDrCord interoperate on the same protocol · the **Start
+      menu is rebuilt Windows-11-style**: a floating rounded card with a
+      **pinned grid of app tiles** (icon + 2-line label), **live search**
+      that actually filters as you type, a user chip and a **power button**
+      · **clickable menu bars** come to **Files** (File / Go / View),
+      **Calculator** (Edit / Insert / View) and the **Image viewer**
+      (Picture / Details) on top of the editor/notes/browser bars · six new
+      from-scratch pictographic **icons** (messenger, Discord mark,
+      envelope, calendar, contact card, gallery). New unit tests cover the
+      word-wrap, channel routing, calendar arithmetic, mail compose,
+      contact parsing and the Start-menu search.
 
 ---
 
