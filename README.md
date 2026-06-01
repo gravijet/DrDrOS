@@ -17,7 +17,8 @@ and scheduling; everything above it is ours.
 | **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop: taskbar + Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons**, ~20 apps incl. a browser, an image viewer, a Wi-Fi/network panel and games, a **menu bar with text formatting** in the editor, and automatic disk persistence |
+| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons**, ~20 apps incl. a browser, an **image viewer (real PNG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, a **menu bar with text formatting**, and automatic disk persistence |
+| **File formats** | Opens **txt · md · html · source code (Rust/JS/Java/C/Py/…) · PNG · BMP · PPM · PDF · ZIP · DOCX/XLSX/PPTX** — DEFLATE/PNG/ZIP/PDF all decoded by our own `drdr-codec` |
 
 ### What you actually get when it boots
 
@@ -47,10 +48,11 @@ graphical desktop — no login, no shell, no X11:
   plus per-language **syntax highlighting** for Rust/JS/Java/C/Python/…,
   **Notes** (persistent + autosaving), **Tasks** (a persistent to-do
   list), a **Browser** (`DrDrBrowser` — a from-scratch local renderer
-  for HTML and Markdown), an **Image viewer** (decodes PPM and BMP into
-  full-colour cells; reports PNG/JPEG dimensions), a **Network & Wi-Fi**
-  panel (lists the kernel's interfaces, flags wireless radios, shows
-  DrDrNet peers), **Calculator** (our own expression parser), **Clock &
+  for HTML and Markdown), an **Image viewer** (real **PNG** decoding via
+  our own DEFLATE, plus BMP/PPM), a **PDF / ZIP / DOCX reader**, a
+  **Network & Wi-Fi manager** (scans, lists networks with signal +
+  security, takes a password and connects), **Calculator** (our own
+  expression parser), **Clock &
   Calendar**, **System Monitor** (live CPU/RAM/load from `/proc`),
   **System Info** (a neofetch-style card), **DrDrConsole** (a no-PTY
   command interpreter), **DrDrChat** (LAN chat between DrDrOS machines),
@@ -149,6 +151,7 @@ Every pixel and keystroke above is handled by code in this repository.
 | **drdr-font** | library | DrDrFont — hand-drawn 8×16 bitmap glyphs **+ a software anti-aliaser** (crisp strokes, soft edges, smooth scaled logos) |
 | **drdr-ui** | library | DrDrUI — widgets, Theme (light + dark), `TextGrid`/`WindowApp` (now with per-window **text zoom**), the WM **+ taskbar/Start-menu shell**, a **pictographic icon renderer** (`icon.rs`), `InputHub` (kbd + mouse + **touchscreen**), VT takeover |
 | **drdr-store** | library | DrDrStore — block-device discovery, mounting, and a `save`/`load` API so files persist beyond RAM |
+| **drdr-codec** | library | DrDrCodec — from-scratch decoders: a hand-written DEFLATE/zlib ([RFC 1951/1950]), and on top of it a PNG decoder, a ZIP reader (→ DOCX/XLSX/PPTX text) and a PDF text extractor. No external crates |
 | **drdr-tty** | library | DrDrTty — termios raw-mode + key decoder for terminal apps |
 | **drdr-net** | library | DrDrNet — custom binary protocol + a hand-rolled epoll reactor (Tier 3 async) **+ UDP-broadcast peer discovery + a chat sub-protocol** so two DrDrOS machines on a LAN find each other and talk |
 | **buildroot/** | tooling | Buildroot config + BR2_EXTERNAL recipe; `linux-fb.config` (display) + `linux-input.config` (evdev/USB-HID/xHCI for real tablets) + `linux-storage.config` (USB-storage/SCSI/NVMe/MMC + ext4/vfat/exfat/ntfs3 so disks mount + persist) + `linux-wifi.config` (cfg80211/mac80211 + Intel/Broadcom/Atheros/Realtek Wi-Fi + Ethernet so a real radio enumerates) |
@@ -172,21 +175,23 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **16606 lines** across **22 files** |
-| Workspace crates | **12** (every `drdr-*`) |
-| Tests | **97** (`cargo test`, all green) |
-| Git commits | **47** |
-| Tracked files (excl. `buildroot/`) | **50** |
+| Rust source | **18116 lines** across **28 files** |
+| Workspace crates | **0
+0** (every `drdr-*`) |
+| Tests | **111** (`cargo test`, all green) |
+| Git commits | **49** |
+| Tracked files (excl. `buildroot/`) | **57** |
 | Development window | 2026-05-14
-? → 2026-05-31 |
+? → 2026-06-01 |
 
 Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  5620 | window manager + apps |
-| drdr-ui    |  4133 | GUI framework + WM + shell |
+| drdr-desk  |  6091 | window manager + apps |
+| drdr-ui    |  4146 | GUI framework + WM + shell |
 | drdr-net   |  1911 | binary proto + reactor |
+| drdr-codec |  1026 | — |
 | drdr-fb    |   976 | framebuffer (all bpp) |
 | drdr-font  |   886 | 8x16 glyphs |
 | drdr-store |   562 | persistent storage |
@@ -287,6 +292,26 @@ Lines of Rust per crate (largest first):
       **`linux-wifi.config`** kernel fragment brings up the 802.11 stack
       and the Wi-Fi/Ethernet drivers the target machines use · a third,
       maximally-conservative GRUB boot entry for stubborn firmware.
+- [x] **Phase 11 — Real file formats, a working Wi-Fi manager, a rounder
+      Win11 look** *(this release)*
+      A new **`drdr-codec`** crate decodes the formats a desktop must
+      open, all from scratch (no crates): a hand-written **DEFLATE/zlib**
+      (RFC 1951/1950) is the keystone, and on top of it a **PNG** decoder
+      (filters + all colour types), a **ZIP** reader and a **PDF** text
+      extractor — so the image viewer shows **real PNGs** in colour, and
+      the file manager opens **PDF, ZIP and DOCX/XLSX/PPTX** (Office docs
+      are ZIPs of XML; we pull the text out) · the **Network panel
+      becomes a real Wi-Fi manager**: it scans, lists networks with
+      signal + security, takes a password and connects by driving
+      `wpa_supplicant` over `wpa_cli` + `udhcpc` (the WPA2/WPA3 crypto is
+      plumbing we don't hand-roll, like the kernel; the UI is ours), with
+      `wpa_supplicant` + `iw` + Wi-Fi firmware added to the rootfs · the
+      desktop gets a **Windows-11 refresh**: rounded "Mica" title bars
+      that share the window surface (no more heavy coloured strips), a
+      larger corner radius, squircle icon tiles, softer shadows, an
+      **acrylic (translucent) taskbar** and a soft radial **bloom**
+      wallpaper. Backed by new anti-aliased `fill_circle`/`draw_line`
+      framebuffer primitives.
 
 ---
 

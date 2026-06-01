@@ -30,5 +30,8 @@ drdr-net  = { path = "../drdr-net" }
 # Persistent storage: disk discovery + mounting + save/load so the
 # Notes / editor / Disks windows can write to real media, not just RAM.
 drdr-store = { path = "../drdr-store" }
+# From-scratch decoders (DEFLATE/PNG/ZIP/PDF) so the image viewer shows
+# real PNGs and the file manager opens ZIP/DOCX/PDF documents.
+drdr-codec = { path = "../drdr-codec" }
 # reboot(2) / poweroff for the System window's power entries.
 nix = { version = "0.31.3", features = ["reboot"] }
