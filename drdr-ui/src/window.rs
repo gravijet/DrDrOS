@@ -162,8 +162,12 @@ impl TextGrid {
         }
     }
 
-    fn cell(&self, col: u32, row: u32) -> Cell {
-        self.cells[(row * self.cols + col) as usize]
+    /// Read one cell. Used by the window manager to blit and by apps'
+    /// tests to assert what landed where. Out-of-bounds returns a blank.
+    pub fn cell(&self, col: u32, row: u32) -> Cell {
+        self.idx(col, row)
+            .map(|i| self.cells[i])
+            .unwrap_or(Cell { ch: ' ', fg: self.fg, bg: self.bg })
     }
 }
 
@@ -235,6 +239,14 @@ pub trait WindowApp {
     /// cells and draws every glyph at that scale. Clamped to 1..=3.
     fn zoom(&self) -> u32 {
         1
+    }
+
+    /// The pictographic icon for this app, drawn on its taskbar chip and
+    /// beside its title. Defaults to a generic glyph; apps override with
+    /// their own [`IconKind`] so the shell looks like a real desktop
+    /// instead of a row of unlabelled text buttons.
+    fn icon(&self) -> IconKind {
+        IconKind::Generic
     }
 }
 
@@ -1414,10 +1426,16 @@ impl WindowManager {
                 let uw = if focused { slot_w - 4 } else { slot_w / 3 };
                 fb.fill_rect(x + 2, tb.y + tb.h - 3, uw, 2, theme.accent);
             }
+            // The app's pictographic icon, then its title — a real
+            // taskbar button, not a bare text label.
+            let isz = GLYPH_HEIGHT;
+            let iy = tb.y + (tb.h.saturating_sub(isz)) / 2;
+            draw_icon(fb, x + 10, iy, isz, win.app.icon(), fg, bg);
+            let tx = x + 14 + isz;
             let label = win.app.title();
-            let maxc = ((slot_w - 12) / GLYPH_WIDTH) as usize;
+            let maxc = ((slot_w.saturating_sub(18 + isz)) / GLYPH_WIDTH) as usize;
             let label: String = label.chars().take(maxc).collect();
-            draw_text_aa(fb, x + 10, ty, &label, fg, bg);
+            draw_text_aa(fb, tx, ty, &label, fg, bg);
             x += slot_w;
         }
 
@@ -1452,6 +1470,20 @@ impl WindowManager {
             theme.muted,
             theme.surface,
         );
+
+        // ── System tray indicators ──────────────────────────────────────
+        // A small cluster of status glyphs to the LEFT of the clock, the
+        // way Windows 11 / macOS show network + sound in the corner. They
+        // read as muted ink on the bar; the network glyph mirrors the
+        // DrDrNet reactor that the desktop genuinely runs.
+        let isz = GLYPH_HEIGHT;
+        let iy = tb.y + (tb.h.saturating_sub(isz)) / 2;
+        let gap = isz + 8;
+        let mut tix = tray_x.saturating_sub(gap * 2 + 6);
+        for kind in [IconKind::Network, IconKind::Music] {
+            draw_icon(fb, tix, iy, isz, kind, theme.muted, theme.surface);
+            tix += gap;
+        }
     }
 
     fn draw_start_menu(&self, fb: &mut Framebuffer, theme: &Theme) {
@@ -1578,12 +1610,20 @@ fn draw_window(fb: &mut Framebuffer, win: &mut Window, theme: &Theme, focused: b
         sep,
     );
 
-    // ── Title text ──────────────────────────────────────────────────
-    let title = win.app.title();
+    // ── App icon + title text ───────────────────────────────────────
+    // A small pictographic icon sits at the left of the title bar (like
+    // every real window manager), then the title text. The icon box is
+    // the glyph height so it lines up with the text baseline.
     let ty = r.y + (TITLE_H.saturating_sub(GLYPH_HEIGHT)) / 2;
-    let maxc = ((r.w.saturating_sub(BTN_W * 3 + 16)) / GLYPH_WIDTH) as usize;
+    let isz = GLYPH_HEIGHT;
+    let iy = r.y + (TITLE_H.saturating_sub(isz)) / 2;
+    draw_icon(fb, r.x + 10, iy, isz, win.app.icon(), bar_fg, bar_color);
+    let text_x = r.x + 14 + isz;
+    let title = win.app.title();
+    let avail = r.w.saturating_sub(BTN_W * 3 + 18 + isz);
+    let maxc = (avail / GLYPH_WIDTH) as usize;
     let title: String = title.chars().take(maxc.max(1)).collect();
-    draw_text_aa(fb, r.x + 14, ty, &title, bar_fg, bar_color);
+    draw_text_aa(fb, text_x, ty, &title, bar_fg, bar_color);
 
     // ── Window controls: minimise / maximise / close ────────────────
     // Close reddens on hover (Windows convention); maximise toggles
