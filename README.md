@@ -178,11 +178,11 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **18683 lines** across **28 files** |
+| Rust source | **20095 lines** across **31 files** |
 | Workspace crates | **13** (every `drdr-*`) |
-| Tests | **119** (`cargo test`, all green) |
-| Git commits | **51** |
-| Tracked files (excl. `buildroot/`) | **57** |
+| Tests | **126** (`cargo test`, all green) |
+| Git commits | **52** |
+| Tracked files (excl. `buildroot/`) | **60** |
 | Development window | 2026-05-14
 ? → 2026-06-01 |
 
