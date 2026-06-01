@@ -17,8 +17,8 @@ and scheduling; everything above it is ours.
 | **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons**, ~20 apps incl. a browser, an **image viewer (real PNG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, a **menu bar with text formatting**, and automatic disk persistence |
-| **File formats** | Opens **txt · md · html · source code (Rust/JS/Java/C/Py/…) · PNG · BMP · PPM · PDF · ZIP · DOCX/XLSX/PPTX** — DEFLATE/PNG/ZIP/PDF all decoded by our own `drdr-codec` |
+| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons** (also on the taskbar + title bars), ~20 apps incl. a browser, an **image viewer (real PNG/GIF/JPEG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **media-info panel (MP4/MKV)**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, a **menu bar with text formatting**, and automatic disk persistence |
+| **File formats** | Opens **txt · md · html · source code (Rust/JS/Java/C/Py/…) · PNG · GIF · JPEG · BMP · PPM · PDF · ZIP · DOCX/XLSX/PPTX**, and reads metadata from **MP4/MOV · MKV/WebM · MP3/FLAC/WAV** — DEFLATE, PNG, GIF (LZW), baseline JPEG (Huffman+IDCT), ZIP, PDF and the MP4/Matroska container probes all written from scratch in our own `drdr-codec` |
 
 ### What you actually get when it boots
 
@@ -48,8 +48,11 @@ graphical desktop — no login, no shell, no X11:
   plus per-language **syntax highlighting** for Rust/JS/Java/C/Python/…,
   **Notes** (persistent + autosaving), **Tasks** (a persistent to-do
   list), a **Browser** (`DrDrBrowser` — a from-scratch local renderer
-  for HTML and Markdown), an **Image viewer** (real **PNG** decoding via
-  our own DEFLATE, plus BMP/PPM), a **PDF / ZIP / DOCX reader**, a
+  for HTML and Markdown), an **Image viewer** (real **PNG** (DEFLATE),
+  **GIF** (LZW) and **baseline JPEG** (Huffman + IDCT + YCbCr) decoding,
+  plus BMP/PPM), a **PDF / ZIP / DOCX reader**, a **media-info panel**
+  that reads MP4 / Matroska container metadata (codec, duration,
+  resolution — honestly *no* frame decoding), a
   **Network & Wi-Fi manager** (scans, lists networks with signal +
   security, takes a password and connects), **Calculator** (our own
   expression parser), **Clock &
@@ -175,9 +178,9 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **18352 lines** across **28 files** |
+| Rust source | **18683 lines** across **28 files** |
 | Workspace crates | **13** (every `drdr-*`) |
-| Tests | **115** (`cargo test`, all green) |
+| Tests | **119** (`cargo test`, all green) |
 | Git commits | **51** |
 | Tracked files (excl. `buildroot/`) | **57** |
 | Development window | 2026-05-14
@@ -187,10 +190,10 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  6287 | window manager + apps |
+| drdr-desk  |  6610 | window manager + apps |
 | drdr-ui    |  4186 | GUI framework + WM + shell |
+| drdr-codec |  2446 | — |
 | drdr-net   |  1911 | binary proto + reactor |
-| drdr-codec |  1026 | — |
 | drdr-fb    |   976 | framebuffer (all bpp) |
 | drdr-font  |   886 | 8x16 glyphs |
 | drdr-store |   562 | persistent storage |
