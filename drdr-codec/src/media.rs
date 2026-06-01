@@ -48,7 +48,7 @@ impl MediaInfo {
             out.push(format!("Tracks    : {}", self.track_count));
         }
         out.push(String::new());
-        out.push("(container metadata only — DrDrOS does not".into());
+        out.push("(container metadata only - DrDrOS does not".into());
         out.push(" decode compressed video/audio frames)".into());
         out
     }

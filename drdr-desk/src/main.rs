@@ -26,6 +26,7 @@
 //! Keys: Alt-Tab cycles windows; the focused window's app gets the rest.
 
 mod apps;
+mod http;
 mod net;
 mod wifi;
 

@@ -17,7 +17,7 @@ and scheduling; everything above it is ours.
 | **Storage** | Runs from RAM; **automatic persistence** — a removable disk is adopted on boot and apps autosave, so files survive a reboot (or pick a volume yourself in Disks) |
 | **Input** | Keyboard, mouse **and touchscreen** (a Surface-class tablet is usable with no keyboard) |
 | **Target** | x86_64 PCs & tablets from the last ~15 years · VirtualBox · QEMU · **Ventoy USB on real hardware** |
-| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons** (also on the taskbar + title bars), ~20 apps incl. a browser, an **image viewer (real PNG/GIF/JPEG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **media-info panel (MP4/MKV)**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, a **menu bar with text formatting**, and automatic disk persistence |
+| **Status** | Boots to a modern desktop (rounded "Mica" windows, acrylic taskbar): Start menu, draggable windows, **anti-aliased text**, **real pictographic app icons** (also on the taskbar + title bars), ~20 apps incl. a **real `http://` web browser** (own HTTP/1.1 client, address bar, Back), an **image viewer (real PNG/GIF/JPEG/BMP/PPM)**, a **PDF/ZIP/DOCX reader**, a **media-info panel (MP4/MKV)**, a **Wi-Fi manager (scan + connect via wpa_supplicant)**, **menu bars** (editor/notes/browser) + a **Paint tool palette**, and automatic disk persistence |
 | **File formats** | Opens **txt · md · html · source code (Rust/JS/Java/C/Py/…) · PNG · GIF · JPEG · BMP · PPM · PDF · ZIP · DOCX/XLSX/PPTX**, and reads metadata from **MP4/MOV · MKV/WebM · MP3/FLAC/WAV** — DEFLATE, PNG, GIF (LZW), baseline JPEG (Huffman+IDCT), ZIP, PDF and the MP4/Matroska container probes all written from scratch in our own `drdr-codec` |
 
 ### What you actually get when it boots
@@ -46,20 +46,26 @@ graphical desktop — no login, no shell, no X11:
   View) for **colouring text, making it bigger/smaller, and toggling
   syntax highlighting** — all with the mouse, no shortcuts to memorise —
   plus per-language **syntax highlighting** for Rust/JS/Java/C/Python/…,
-  **Notes** (persistent + autosaving), **Tasks** (a persistent to-do
-  list), a **Browser** (`DrDrBrowser` — a from-scratch local renderer
-  for HTML and Markdown), an **Image viewer** (real **PNG** (DEFLATE),
-  **GIF** (LZW) and **baseline JPEG** (Huffman + IDCT + YCbCr) decoding,
-  plus BMP/PPM), a **PDF / ZIP / DOCX reader**, a **media-info panel**
-  that reads MP4 / Matroska container metadata (codec, duration,
-  resolution — honestly *no* frame decoding), a
+  **Notes** (persistent + autosaving, now with its own File/View **menu
+  bar**), **Tasks** (a persistent to-do list), a **Browser**
+  (`DrDrBrowser`) that is now a **real `http://` web browser** — an
+  editable **address bar**, **Back** history, a Go/View **menu bar**, and
+  our own from-scratch **HTTP/1.1 client** (`drdr-desk/src/http.rs`:
+  redirects + chunked transfer-encoding; `https://` is refused honestly
+  since we ship no TLS stack) — plus the local HTML/Markdown rendering it
+  always had, an **Image viewer** (real **PNG** (DEFLATE), **GIF** (LZW)
+  and **baseline JPEG** (Huffman + IDCT + YCbCr) decoding, plus BMP/PPM),
+  a **PDF / ZIP / DOCX reader**, a **media-info panel** that reads MP4 /
+  Matroska container metadata (codec, duration, resolution — honestly
+  *no* frame decoding), **DrDrPaint** with a **left tool palette**
+  (colours, eraser, brush size), a
   **Network & Wi-Fi manager** (scans, lists networks with signal +
   security, takes a password and connects), **Calculator** (our own
   expression parser), **Clock &
   Calendar**, **System Monitor** (live CPU/RAM/load from `/proc`),
   **System Info** (a neofetch-style card), **DrDrConsole** (a no-PTY
   command interpreter), **DrDrChat** (LAN chat between DrDrOS machines),
-  **DrDrPaint** (mouse-driven block drawing), and the games
+  and the games
   **DrDrSnake**, **DrDr2048** and **DrDrMines** (Minesweeper), plus
   **Disks**, **Settings**, the DrDrNet panel, About, and the power menu.
 - **Smooth, anti-aliased text** — the hand-drawn 8×16 bitmap font is now
@@ -178,11 +184,11 @@ never stale — see [Keeping the numbers honest](#keeping-the-numbers-honest).
 
 | Metric | Value |
 |---|---|
-| Rust source | **20095 lines** across **31 files** |
+| Rust source | **20825 lines** across **32 files** |
 | Workspace crates | **13** (every `drdr-*`) |
-| Tests | **126** (`cargo test`, all green) |
-| Git commits | **52** |
-| Tracked files (excl. `buildroot/`) | **60** |
+| Tests | **137** (`cargo test`, all green) |
+| Git commits | **54** |
+| Tracked files (excl. `buildroot/`) | **61** |
 | Development window | 2026-05-14
 ? → 2026-06-01 |
 
@@ -190,7 +196,7 @@ Lines of Rust per crate (largest first):
 
 | Crate | Lines | Purpose |
 |---|--:|---|
-| drdr-desk  |  6610 | window manager + apps |
+| drdr-desk  |  7340 | window manager + apps |
 | drdr-ui    |  4186 | GUI framework + WM + shell |
 | drdr-codec |  2446 | — |
 | drdr-net   |  1911 | binary proto + reactor |
