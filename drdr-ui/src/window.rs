@@ -472,6 +472,26 @@ const ICON_RADIUS: u32 = 20;
 /// Vertical padding above the icon grid (under the screen top).
 const ICON_GRID_TOP: u32 = 64;
 
+// ─── Start-menu layout (Windows-11-style pinned app grid) ────────────
+//
+// The Start menu is no longer a thin vertical list of text rows; it is a
+// floating rounded panel with a grid of app tiles (icon + label) and a
+// footer carrying a user chip and a power button — the iconic Win11 look.
+/// Inner padding of the Start panel.
+const START_PAD: u32 = 18;
+/// One app tile: a rounded hover target with an icon and a 2-line label.
+const START_TILE_W: u32 = 96;
+const START_TILE_H: u32 = 80;
+const START_TILE_GAP: u32 = 10;
+/// Tiles per row in the pinned grid.
+const START_COLS: u32 = 6;
+/// Header strip ("All apps") height.
+const START_HEADER_H: u32 = GLYPH_HEIGHT + 18;
+/// Footer strip (user chip + power) height.
+const START_FOOTER_H: u32 = GLYPH_HEIGHT + 22;
+/// Gap between the panel's bottom edge and the taskbar, so it floats.
+const START_GAP: u32 = 6;
+
 /// One icon on the desktop: a label, the app factory it should launch,
 /// and a real pictographic [`IconKind`] (drawn inside the tile).
 pub struct DesktopIcon {
@@ -509,6 +529,9 @@ pub struct WindowManager {
     /// window.
     start_items: Vec<(String, IconKind, Box<dyn Fn() -> Spawn>)>,
     start_open: bool,
+    /// Live Start-menu search query (typed while the menu is open). Filters
+    /// the pinned grid by label; empty shows everything.
+    start_search: String,
     /// While true, the keyboard-shortcut help overlay is drawn over the
     /// desktop (any key / click dismisses it).
     help_open: bool,
@@ -543,6 +566,7 @@ impl WindowManager {
             launcher: None,
             start_items: Vec::new(),
             start_open: false,
+            start_search: String::new(),
             help_open: false,
             clock,
             date,
@@ -649,6 +673,7 @@ impl WindowManager {
         let y = rect.y.min(wa.h.saturating_sub(h));
         self.windows.push(Window::new(Rect::new(x, y, w, h), app));
         self.start_open = false;
+        self.start_search.clear();
         self.dirty = true;
     }
 
@@ -780,6 +805,7 @@ impl WindowManager {
                 // Tapping Super on its own toggles the Start menu, the
                 // Windows / GNOME convention.
                 self.start_open = !self.start_open;
+                self.start_search.clear();
                 return;
             }
             KeyCode::Help => {
@@ -817,9 +843,30 @@ impl WindowManager {
             _ => {}
         }
         if self.start_open {
-            // The Start menu is keyboard-navigable too (Esc closes it).
-            if key == KeyCode::Escape {
-                self.start_open = false;
+            // The Start menu has a live search box: typing filters the
+            // pinned grid. Esc clears the query, or closes the menu when
+            // it's already empty.
+            match key {
+                KeyCode::Escape => {
+                    if self.start_search.is_empty() {
+                        self.start_open = false;
+                    } else {
+                        self.start_search.clear();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.start_search.pop();
+                }
+                KeyCode::Space => self.start_search.push(' '),
+                KeyCode::Char(c) => self.start_search.push(c),
+                KeyCode::Enter => {
+                    // Enter launches the first match, like Windows.
+                    if let Some(&idx) = self.start_matches().first() {
+                        let s = (self.start_items[idx].2)();
+                        self.open(s.rect, s.app);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -909,18 +956,27 @@ impl WindowManager {
         // menu is open closes it (and doesn't get double-toggled).
         if on_taskbar && hit(self.start_btn_rect(), x, y) {
             self.start_open = !self.start_open;
+            self.start_search.clear();
             return true;
         }
 
-        // With the menu open: a click inside launches that row; a click
-        // anywhere else just dismisses it.
+        // With the menu open: a click on a tile (or the power button)
+        // launches it; a click anywhere else just dismisses it.
         if self.start_open {
             let menu = self.start_menu_rect();
             if hit(menu, x, y) {
-                let row = ((y - menu.y as i32) as u32) / (GLYPH_HEIGHT + 6);
-                if let Some((_, _, factory)) = self.start_items.get(row as usize) {
-                    let s = factory();
-                    self.open(s.rect, s.app); // also clears start_open
+                if hit(self.start_power_rect(), x, y) {
+                    if let Some(i) = self.start_power_index() {
+                        let s = (self.start_items[i].2)();
+                        self.open(s.rect, s.app); // also clears start_open
+                    }
+                    return true;
+                }
+                if let Some(pos) = self.start_tile_at(x, y) {
+                    if let Some(&idx) = self.start_matches().get(pos) {
+                        let s = (self.start_items[idx].2)();
+                        self.open(s.rect, s.app); // also clears start_open
+                    }
                 }
                 return true;
             }
@@ -965,16 +1021,76 @@ impl WindowManager {
         (avail / n).clamp(GLYPH_WIDTH * 6, GLYPH_WIDTH * 22)
     }
 
+    /// The floating Start panel rect (a pinned-grid card above the taskbar).
     fn start_menu_rect(&self) -> Rect {
-        let rows = self.start_items.len().max(1) as u32;
-        let h = rows * (GLYPH_HEIGHT + 6) + 12;
-        let w = GLYPH_WIDTH * 28 + GLYPH_HEIGHT;
+        let n = self.start_items.len().max(1) as u32;
+        let grid_rows = n.div_ceil(START_COLS);
+        let inner_w = START_COLS * START_TILE_W + (START_COLS - 1) * START_TILE_GAP;
+        let grid_h = grid_rows * START_TILE_H + grid_rows.saturating_sub(1) * START_TILE_GAP;
+        let w = (inner_w + START_PAD * 2).min(self.screen_w);
+        let h = (START_HEADER_H + grid_h + START_FOOTER_H + START_PAD * 2)
+            .min(self.screen_h.saturating_sub(TASKBAR_H + START_GAP));
+        let x = 8.min(self.screen_w.saturating_sub(w));
+        let y = self.screen_h.saturating_sub(TASKBAR_H + START_GAP + h);
+        Rect::new(x, y, w, h)
+    }
+
+    /// Top-left of the tile grid (below the header).
+    fn start_grid_origin(&self) -> (u32, u32) {
+        let m = self.start_menu_rect();
+        (m.x + START_PAD, m.y + START_PAD + START_HEADER_H)
+    }
+
+    /// Pixel rect of pinned tile `i`.
+    fn start_tile_rect(&self, i: usize) -> Rect {
+        let (ox, oy) = self.start_grid_origin();
+        let col = (i as u32) % START_COLS;
+        let row = (i as u32) / START_COLS;
         Rect::new(
-            0,
-            self.screen_h.saturating_sub(TASKBAR_H + h),
-            w.min(self.screen_w),
-            h,
+            ox + col * (START_TILE_W + START_TILE_GAP),
+            oy + row * (START_TILE_H + START_TILE_GAP),
+            START_TILE_W,
+            START_TILE_H,
         )
+    }
+
+    /// Catalogue indices that match the live search query, in catalogue
+    /// order. Empty query → every app. Drives both the grid and the
+    /// hit-test so they can never disagree.
+    fn start_matches(&self) -> Vec<usize> {
+        let q = self.start_search.trim().to_lowercase();
+        if q.is_empty() {
+            return (0..self.start_items.len()).collect();
+        }
+        (0..self.start_items.len())
+            .filter(|&i| self.start_items[i].0.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Grid *position* (not catalogue index) of the Start tile under
+    /// `(x, y)`, if any — positions follow the filtered match list.
+    fn start_tile_at(&self, x: i32, y: i32) -> Option<usize> {
+        let n = self.start_matches().len();
+        (0..n).find(|&pos| hit(self.start_tile_rect(pos), x, y))
+    }
+
+    /// The footer power button rect.
+    fn start_power_rect(&self) -> Rect {
+        let m = self.start_menu_rect();
+        let w = GLYPH_WIDTH * 6 + GLYPH_HEIGHT + 18;
+        let bh = GLYPH_HEIGHT + 10;
+        Rect::new(
+            m.x + m.w - START_PAD - w,
+            m.y + m.h - START_FOOTER_H + (START_FOOTER_H - bh) / 2,
+            w,
+            bh,
+        )
+    }
+
+    /// Index of the catalogue entry that opens the power menu (icon ==
+    /// Power), wired to the footer power button.
+    fn start_power_index(&self) -> Option<usize> {
+        self.start_items.iter().position(|(_, k, _)| *k == IconKind::Power)
     }
 
     /// Feed a pointer event.
@@ -1488,44 +1604,121 @@ impl WindowManager {
 
     fn draw_start_menu(&self, fb: &mut Framebuffer, theme: &Theme) {
         let m = self.start_menu_rect();
-        // The Start menu sits ABOVE the taskbar — only the TOP corners
-        // are rounded; its bottom edge meets the taskbar flush.
+        // A floating, fully-rounded acrylic card — the Windows-11 Start.
         draw_shadow(fb, m);
-        fb.fill_round_rect_corners(
-            m.x, m.y, m.w, m.h,
-            RADIUS, RADIUS, 0, 0,
-            theme.surface,
-        );
-        // 1-px accent hairline at the very top edge to lift the menu.
+        fb.fill_round_rect(m.x, m.y, m.w, m.h, RADIUS, theme.surface);
         fb.fill_rect(m.x + RADIUS / 2, m.y, m.w.saturating_sub(RADIUS), 1, theme.accent);
 
-        let row_h = GLYPH_HEIGHT + 6;
-        let isz = GLYPH_HEIGHT; // small icon fits the row height
-        for (i, (label, kind, _)) in self.start_items.iter().enumerate() {
-            let ry = m.y + 6 + i as u32 * row_h;
-            let hot = self.pointer_y >= ry as i32
-                && self.pointer_y < (ry + row_h) as i32
-                && hit(m, self.pointer_x, self.pointer_y);
-            let (bg, fg) = if hot {
-                (theme.accent, theme.accent_fg)
-            } else {
-                (theme.surface, theme.fg)
-            };
-            if hot {
-                fb.fill_round_rect(
-                    m.x + 4,
-                    ry,
-                    m.w - 8,
-                    row_h - 2,
-                    4,
-                    bg,
-                );
-            }
-            // A small real icon to the left of every Start-menu label.
-            draw_icon(fb, m.x + 10, ry + (row_h - isz) / 2, isz, *kind, fg, bg);
-            draw_text_aa(fb, m.x + 16 + isz, ry + 3, label, fg, bg);
+        // ── Header: an "All apps" label + a live search pill on the right.
+        let head_y = m.y + START_PAD;
+        let matches = self.start_matches();
+        let head = if self.start_search.is_empty() {
+            "All apps".to_string()
+        } else {
+            format!("{} result(s)", matches.len())
+        };
+        draw_text_aa(fb, m.x + START_PAD, head_y, &head, theme.muted, theme.surface);
+        let pill_w = (m.w / 3).max(GLYPH_WIDTH * 10);
+        let pill_x = m.x + m.w - START_PAD - pill_w;
+        let pill_h = GLYPH_HEIGHT + 6;
+        fb.fill_round_rect(pill_x, head_y.saturating_sub(3), pill_w, pill_h, pill_h / 2, theme.bg);
+        draw_icon(fb, pill_x + 6, head_y, GLYPH_HEIGHT, IconKind::Browser, theme.muted, theme.bg);
+        let (query, qfg) = if self.start_search.is_empty() {
+            ("Search apps".to_string(), theme.muted)
+        } else {
+            (format!("{}_", self.start_search), theme.fg)
+        };
+        let qmax = ((pill_w - GLYPH_HEIGHT - 16) / GLYPH_WIDTH).max(1) as usize;
+        let qshown: String = query.chars().take(qmax).collect();
+        draw_text_aa(fb, pill_x + 8 + GLYPH_HEIGHT, head_y, &qshown, qfg, theme.bg);
+
+        // ── Pinned grid: an icon tile per matching app, hover-highlighted.
+        let grid_bottom = m.y + m.h - START_FOOTER_H;
+        let hovered = self.start_tile_at(self.pointer_x, self.pointer_y);
+        if matches.is_empty() {
+            draw_text_aa(
+                fb,
+                m.x + START_PAD,
+                m.y + START_PAD + START_HEADER_H + 8,
+                "No apps match your search.",
+                theme.muted,
+                theme.surface,
+            );
         }
+        for (pos, &idx) in matches.iter().enumerate() {
+            let r = self.start_tile_rect(pos);
+            if r.y + r.h > grid_bottom {
+                break; // never paint a tile into the footer
+            }
+            let (label, kind, _) = &self.start_items[idx];
+            let hot = hovered == Some(pos);
+            let tbg = if hot {
+                fb.fill_round_rect(r.x, r.y, r.w, r.h, 8, theme.hover());
+                theme.hover()
+            } else {
+                theme.surface
+            };
+            // Icon, centred in the upper portion.
+            let isz = 40u32;
+            let ix = r.x + (r.w - isz) / 2;
+            let iy = r.y + 8;
+            draw_icon(fb, ix, iy, isz, *kind, theme.accent, tbg);
+            // Up-to-two-line centred label below the icon.
+            let maxc = ((r.w - 6) / GLYPH_WIDTH).max(1) as usize;
+            let (l1, l2) = wrap_two(label, maxc);
+            let ly = iy + isz + 4;
+            let l1w = GLYPH_WIDTH * l1.chars().count() as u32;
+            draw_text_aa(fb, r.x + (r.w.saturating_sub(l1w)) / 2, ly, &l1, theme.fg, tbg);
+            if !l2.is_empty() {
+                let l2w = GLYPH_WIDTH * l2.chars().count() as u32;
+                draw_text_aa(fb, r.x + (r.w.saturating_sub(l2w)) / 2, ly + GLYPH_HEIGHT, &l2, theme.fg, tbg);
+            }
+        }
+
+        // ── Footer: a divider, a user chip (left) and a power button.
+        let fy = m.y + m.h - START_FOOTER_H;
+        fb.fill_rect(m.x + START_PAD, fy, m.w - START_PAD * 2, 1, theme.border);
+        let chip_y = fy + (START_FOOTER_H - GLYPH_HEIGHT) / 2;
+        draw_icon(fb, m.x + START_PAD, chip_y, GLYPH_HEIGHT, IconKind::Info, theme.accent, theme.surface);
+        draw_text_aa(fb, m.x + START_PAD + GLYPH_HEIGHT + 6, chip_y, "DrDrOS", theme.fg, theme.surface);
+
+        let pr = self.start_power_rect();
+        let phot = hit(pr, self.pointer_x, self.pointer_y);
+        let pbg = if phot {
+            fb.fill_round_rect(pr.x, pr.y, pr.w, pr.h, pr.h / 2, theme.hover());
+            theme.hover()
+        } else {
+            theme.surface
+        };
+        draw_icon(fb, pr.x + 8, pr.y + (pr.h - GLYPH_HEIGHT) / 2, GLYPH_HEIGHT, IconKind::Power, theme.fg, pbg);
+        draw_text_aa(fb, pr.x + 10 + GLYPH_HEIGHT, pr.y + (pr.h - GLYPH_HEIGHT) / 2, "Power", theme.fg, pbg);
     }
+}
+
+/// Split `label` into up to two lines that each fit `maxc` columns, for the
+/// Start-menu tiles. Greedy word wrap; a single over-long word is hard-cut.
+fn wrap_two(label: &str, maxc: usize) -> (String, String) {
+    if label.chars().count() <= maxc {
+        return (label.to_string(), String::new());
+    }
+    let mut l1 = String::new();
+    let mut l2 = String::new();
+    for w in label.split(' ') {
+        let target = if !l1.is_empty()
+            && l1.chars().count() + 1 + w.chars().count() > maxc
+        {
+            &mut l2
+        } else {
+            &mut l1
+        };
+        if !target.is_empty() {
+            target.push(' ');
+        }
+        target.push_str(w);
+    }
+    // Hard-clip each line so an over-long single word can't overflow.
+    let clip = |s: &str| -> String { s.chars().take(maxc).collect() };
+    (clip(&l1), clip(&l2))
 }
 
 /// A soft, blurred drop shadow — proper per-pixel quadratic falloff,
@@ -1956,5 +2149,53 @@ mod tests {
         assert!(m.start_open);
         m.handle_mouse(MouseEvent::Button { button: MouseButton::Left, pressed: true });
         assert!(!m.start_open);
+    }
+
+    fn menu_item(label: &'static str) -> (String, IconKind, Box<dyn Fn() -> Spawn>) {
+        (
+            label.into(),
+            IconKind::Generic,
+            Box::new(|| Spawn { rect: Rect::new(0, 0, 100, 100), app: Box::new(Dummy("x")) }),
+        )
+    }
+
+    #[test]
+    fn start_search_filters_the_grid_and_esc_clears_then_closes() {
+        let mut m = WindowManager::new(1000, 800);
+        m.set_start_menu(vec![menu_item("Files"), menu_item("Calculator"), menu_item("Calendar")]);
+        assert_eq!(m.start_matches().len(), 3); // empty query → everything
+        m.handle_key(KeyCode::Super); // open the menu (clears any query)
+        for c in ['c', 'a', 'l'] {
+            m.handle_key(KeyCode::Char(c));
+        }
+        // "cal" matches Calculator + Calendar, not Files.
+        assert_eq!(m.start_matches().len(), 2);
+        // First Esc clears the query but keeps the menu open…
+        m.handle_key(KeyCode::Escape);
+        assert_eq!(m.start_matches().len(), 3);
+        assert!(m.start_open);
+        // …a second Esc closes it.
+        m.handle_key(KeyCode::Escape);
+        assert!(!m.start_open);
+    }
+
+    #[test]
+    fn opening_an_app_resets_the_start_search() {
+        let mut m = WindowManager::new(1000, 800);
+        m.set_start_menu(vec![menu_item("Files"), menu_item("Calculator")]);
+        m.handle_key(KeyCode::Super);
+        m.handle_key(KeyCode::Char('z')); // a query with no matches
+        assert!(m.start_matches().is_empty());
+        m.open(Rect::new(0, 0, 100, 100), Box::new(Dummy("w")));
+        // The query is cleared so the next Start open shows everything.
+        assert_eq!(m.start_matches().len(), 2);
+    }
+
+    #[test]
+    fn wrap_two_wraps_long_labels_and_clips() {
+        assert_eq!(wrap_two("Files", 12), ("Files".to_string(), String::new()));
+        let (a, b) = wrap_two("Network & Wi-Fi", 8);
+        assert!(a.chars().count() <= 8 && b.chars().count() <= 8);
+        assert!(!b.is_empty(), "a label past the width must spill to line two");
     }
 }

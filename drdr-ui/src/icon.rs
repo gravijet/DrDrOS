@@ -43,6 +43,18 @@ pub enum IconKind {
     Network,
     Power,
     Music,
+    /// WhatsApp-style messenger — a speech bubble with a phone handset.
+    Messages,
+    /// Discord-style community chat — the rounded "face" mark.
+    Discord,
+    /// E-mail client — an envelope.
+    Mail,
+    /// Month-view calendar — a bound page with a day grid.
+    Calendar,
+    /// Address book — a contact card with an avatar.
+    Contacts,
+    /// Photo gallery — two stacked picture frames.
+    Gallery,
     Generic,
 }
 
@@ -72,6 +84,12 @@ impl IconKind {
             "network" | "wifi" | "net" => IconKind::Network,
             "power" => IconKind::Power,
             "music" | "audio" => IconKind::Music,
+            "messages" | "whatsapp" | "messenger" => IconKind::Messages,
+            "discord" => IconKind::Discord,
+            "mail" | "email" | "e-mail" => IconKind::Mail,
+            "calendar" | "events" => IconKind::Calendar,
+            "contacts" | "people" | "addressbook" => IconKind::Contacts,
+            "gallery" | "photos" | "pictures" => IconKind::Gallery,
             _ => IconKind::Generic,
         }
     }
@@ -316,6 +334,65 @@ pub fn draw_icon(fb: &mut Framebuffer, x: u32, y: u32, size: u32, kind: IconKind
             p.rect(0.73, 0.16, 0.05, 0.50, p.main);
             p.rect(0.41, 0.22, 0.37, 0.07, p.main); // beam
         }
+        IconKind::Messages => {
+            // WhatsApp-style: a rounded speech bubble with a down-left tail
+            // and a carved phone handset.
+            p.round(0.12, 0.14, 0.76, 0.56, 0.16, p.main);
+            p.line(0.28, 0.62, 0.20, 0.86, 0.13, p.main); // tail
+            p.line(0.20, 0.86, 0.46, 0.62, 0.13, p.main);
+            p.disc(0.37, 0.36, 0.07, p.carve); // earpiece
+            p.disc(0.60, 0.52, 0.07, p.carve); // mouthpiece
+            p.line(0.37, 0.36, 0.60, 0.52, 0.075, p.carve); // handset body
+        }
+        IconKind::Discord => {
+            // Discord-style "face": a rounded gamepad-ish body, two pulled
+            // bottom corners, and two carved eyes.
+            p.round(0.10, 0.24, 0.80, 0.50, 0.22, p.main);
+            p.line(0.24, 0.70, 0.32, 0.84, 0.11, p.main); // left foot
+            p.line(0.76, 0.70, 0.68, 0.84, 0.11, p.main); // right foot
+            p.disc(0.37, 0.47, 0.085, p.carve); // left eye
+            p.disc(0.63, 0.47, 0.085, p.carve); // right eye
+        }
+        IconKind::Mail => {
+            // Envelope: a body with a carved V flap and a 1px seam.
+            p.round(0.12, 0.24, 0.76, 0.52, 0.05, p.main);
+            p.line(0.13, 0.27, 0.50, 0.53, 0.05, p.carve); // flap left
+            p.line(0.50, 0.53, 0.87, 0.27, 0.05, p.carve); // flap right
+            p.line(0.13, 0.73, 0.37, 0.52, 0.035, p.carve); // lower folds
+            p.line(0.87, 0.73, 0.63, 0.52, 0.035, p.carve);
+        }
+        IconKind::Calendar => {
+            p.round(0.14, 0.18, 0.72, 0.68, 0.06, p.main);
+            p.rect(0.14, 0.20, 0.72, 0.14, p.soft);   // header band
+            p.rect(0.14, 0.34, 0.72, 0.02, p.carve);  // seam under header
+            p.rect(0.30, 0.10, 0.05, 0.16, p.main);   // binding ring (left)
+            p.rect(0.65, 0.10, 0.05, 0.16, p.main);   // binding ring (right)
+            for r in 0..2 {
+                for c in 0..3 {
+                    let bx = 0.25 + c as f32 * 0.18;
+                    let by = 0.44 + r as f32 * 0.20;
+                    p.rect(bx, by, 0.10, 0.10, p.carve); // day cells (cut)
+                }
+            }
+        }
+        IconKind::Contacts => {
+            p.round(0.12, 0.16, 0.76, 0.68, 0.07, p.main); // card
+            p.disc(0.34, 0.40, 0.10, p.carve);             // avatar head
+            p.round(0.21, 0.55, 0.26, 0.20, 0.09, p.carve);// avatar shoulders
+            p.rect(0.55, 0.36, 0.26, 0.05, p.carve);       // name line
+            p.rect(0.55, 0.48, 0.26, 0.05, p.carve);       // detail line
+            p.rect(0.55, 0.60, 0.17, 0.05, p.carve);       // detail line
+        }
+        IconKind::Gallery => {
+            p.round(0.22, 0.16, 0.60, 0.46, 0.04, p.soft); // back photo
+            p.round(0.14, 0.32, 0.62, 0.50, 0.04, p.main); // front photo
+            p.disc(0.30, 0.46, 0.06, p.carve);             // sun (cut)
+            p.line(0.18, 0.74, 0.36, 0.54, 0.08, p.carve); // peak 1
+            p.line(0.36, 0.54, 0.52, 0.76, 0.08, p.carve);
+            p.line(0.48, 0.72, 0.60, 0.58, 0.07, p.carve); // peak 2
+            p.line(0.60, 0.58, 0.72, 0.74, 0.07, p.carve);
+            p.rect(0.14, 0.74, 0.62, 0.08, p.carve);       // ground band
+        }
         IconKind::Generic => {
             p.round(0.18, 0.18, 0.64, 0.64, 0.10, p.main);
             p.round(0.34, 0.34, 0.32, 0.32, 0.05, p.carve);
@@ -344,7 +421,8 @@ mod tests {
             IconKind::Info, IconKind::Chat, IconKind::Paint, IconKind::Snake,
             IconKind::Dice2048, IconKind::Mine, IconKind::Disk, IconKind::Settings,
             IconKind::Browser, IconKind::Image, IconKind::Network, IconKind::Power,
-            IconKind::Music, IconKind::Generic,
+            IconKind::Music, IconKind::Messages, IconKind::Discord, IconKind::Mail,
+            IconKind::Calendar, IconKind::Contacts, IconKind::Gallery, IconKind::Generic,
         ];
         for k in kinds {
             let mut fb = Framebuffer::in_memory(48, 48);
