@@ -26,3 +26,20 @@ iso/*.iso
 # OS noise.
 .DS_Store
 Thumbs.db
+
+**/node_modules/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+.codex/
+*.jks
+*.keystore
+key.properties
+google-services.json
+firebase-service-account.json
+auth_cache/
